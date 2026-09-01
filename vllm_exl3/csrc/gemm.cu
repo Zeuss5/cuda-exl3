@@ -592,13 +592,16 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
 // timing them on the real operands is safe -- the winner is simply run last.
 // ---------------------------------------------------------------------------
 
-uint64_t tune_key(int bits, int64_t cb, int m, int k, int n, bool bf16)
+uint64_t tune_key(int bits, int64_t cb, int m, int k, int n, bool bf16, bool can_split)
 {
     uint64_t mb = 1;                       // bucket m by power of two
     while (mb < (uint64_t) m && mb < 4096) mb <<= 1;
     uint64_t h = 1469598103934665603ull;
+    // can_split belongs in the key: the cached choice carries a split factor,
+    // and replaying a split entry when no accumulator was allocated (the
+    // deterministic path) sends the kernel through a null pointer.
     for (uint64_t v : {(uint64_t) bits, (uint64_t) cb, mb, (uint64_t) k, (uint64_t) n,
-                       (uint64_t) bf16})
+                       (uint64_t) bf16, (uint64_t) can_split})
     {
         h ^= v;
         h *= 1099511628211ull;
@@ -624,37 +627,71 @@ bool tuning_enabled()
 // Runs `run(bm)` for each candidate, returns the fastest. `run` must leave the
 // output correct for whichever bm it was last called with.
 template <typename F>
-int autotune_bm(uint64_t key, int heuristic, const F& run, cudaStream_t stream)
+int autotune_cfg(uint64_t key, int m, int k, int n, int bits, bool split_k,
+                 bool can_split, int split_fixed, const F& run, cudaStream_t stream,
+                 int heuristic_bm)
 {
+    auto pack = [](int bm, int sp) { return bm | (sp << 16); };
     auto& cache = tune_cache();
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
+
+    auto split_for = [&](int bm) {
+        if (split_fixed) return split_fixed;
+        return can_split ? pick_split(m, k, n, bits, bm, split_k) : 1;
+    };
 
     // Never time inside graph capture: it needs syncs, and the capture would
     // record whichever candidate ran last.
     if (!tuning_enabled() ||
         at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None)
-        return heuristic;
+        return pack(heuristic_bm, split_for(heuristic_bm));
 
-    const int cands[4] = {16, 32, 64, 128};
+    // Search the split alongside the block size. pick_split is a cost model, and
+    // in the m=64..256 band -- where the grid is block-starved but the extra
+    // accumulator traffic is not yet free -- the model is guessing. Measuring
+    // one step either side of its answer costs a few hundred microseconds once
+    // per shape and lets the tuner correct it.
+    const int bms[4] = {16, 32, 64, 128};
+    // Doubling the heuristic's split can push past what pick_split would ever
+    // return, so bound it by the *actual* k-tile count for the BK this shape
+    // runs with -- BK=64 when k allows it, otherwise the BK=32 fallback.
+    // Overshooting hands some splits an empty k range.
+    int cap = k / (k % 64 == 0 ? 64 : BK_);
+    if (cap > 16) cap = 16;
+    if (cap < 1) cap = 1;
+
     cudaEvent_t beg, end;
     cudaEventCreate(&beg);
     cudaEventCreate(&end);
-    int best = heuristic;
+    int best = pack(heuristic_bm, split_for(heuristic_bm));
     float best_ms = 1e30f;
-    for (int c : cands)
+    for (int bm : bms)
     {
-        run(c);                                  // warm
-        cudaEventRecord(beg, stream);
-        for (int r = 0; r < 3; ++r) run(c);
-        cudaEventRecord(end, stream);
-        cudaEventSynchronize(end);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, beg, end);
-        if (ms < best_ms)
+        int base = split_for(bm);
+        int sps[3] = {base, 0, 0};
+        int nsp = 1;
+        if (!split_fixed && can_split)
         {
-            best_ms = ms;
-            best = c;
+            if (base > 1) sps[nsp++] = base / 2;
+            if (base * 2 <= cap) sps[nsp++] = base * 2;
+        }
+        for (int i = 0; i < nsp; ++i)
+        {
+            int sp = sps[i];
+            if (sp < 1 || sp > cap) continue;
+            run(bm, sp);                                  // warm
+            cudaEventRecord(beg, stream);
+            for (int r = 0; r < 3; ++r) run(bm, sp);
+            cudaEventRecord(end, stream);
+            cudaEventSynchronize(end);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, beg, end);
+            if (ms < best_ms)
+            {
+                best_ms = ms;
+                best = pack(bm, sp);
+            }
         }
     }
     cudaEventDestroy(beg);
@@ -727,30 +764,46 @@ void launch_epilogue(float* acc, OUT_T* C, const half* svh, int m, int ldc, int 
 template <typename OUT_T>
 void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T* C,
                    const half* S, int m, int k, int n, int ldc, int n_off,
-                   int n_tiles_full, float* acc, int split, ShardMap smap,
+                   int n_tiles_full, float* acc, int split_fixed, ShardMap smap,
                    cudaStream_t stream, const int* expert_ids = nullptr,
                    int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
-                   int force_bm = 0, const int* n_rows = nullptr)
+                   int force_bm = 0, const int* n_rows = nullptr,
+                   bool split_k = false, int bits_for_split = 0)
 {
 #define VE3_CASE(B_, C_)                                                        \
     if (bits == B_ && cb == C_)                                                 \
     {                                                                           \
         {                                                                       \
-            auto run = [&](int bm_) {                                           \
+            /* Both the block size and the split are tuned, and they interact: \
+               a bigger tile means fewer blocks, which means more splitting.  */\
+            auto run = [&](int bm_, int sp_) {                                  \
                 launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off,       \
-                                 n_tiles_full, acc, split, smap, stream, bm_,   \
+                                 n_tiles_full, acc, sp_, smap, stream, bm_,     \
                                  expert_ids, b_expert_stride, svh_expert_stride, \
                                  n_rows);                                        \
-                if (split > 1)                                                  \
+                if (sp_ > 1)                                                    \
                     launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);\
             };                                                                  \
             /* MoE pins BM: the caller padded each expert's rows to that block, \
                so the grid's row tiling has to match it exactly. */             \
-            int bm = force_bm ? force_bm                                        \
-                   : autotune_bm(tune_key(B_, C_, m, k, n,                      \
-                                          sizeof(OUT_T) == 2 && !std::is_same<OUT_T, half>::value), \
-                                 pick_bm(m), run, stream);                      \
-            run(bm);                                                            \
+            int bm, sp;                                                         \
+            if (force_bm)                                                       \
+            {                                                                   \
+                bm = force_bm;                                                  \
+                sp = split_fixed ? split_fixed : 1;                             \
+            }                                                                   \
+            else                                                                \
+            {                                                                   \
+                int c = autotune_cfg(tune_key(B_, C_, m, k, n,                  \
+                                          sizeof(OUT_T) == 2 && !std::is_same<OUT_T, half>::value, \
+                                          acc != nullptr),                       \
+                                     m, k, n, bits_for_split, split_k,          \
+                                     acc != nullptr, split_fixed, run, stream,  \
+                                     pick_bm(m));                               \
+                bm = c & 0xffff;                                                \
+                sp = c >> 16;                                                   \
+            }                                                                   \
+            run(bm, sp);                                                        \
         }                                                                       \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
         return;                                                                 \
@@ -826,7 +879,7 @@ void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t
     const int bits_ub = 8;  // more bits -> more weight bytes -> larger split cap
     int64_t acc_elems = 0;
     for (int64_t m = 1; m <= max_tokens; m = (m < 8 ? m + 1 : m * 2))
-        if (pick_split((int) m, (int) k, (int) n, bits_ub, pick_bm((int) m), true) > 1)
+        if (pick_split((int) m, (int) k, (int) n, bits_ub, 128, true) > 1)
             acc_elems = std::max<int64_t>(acc_elems, m * n);
     if (acc_elems) get_ws(g_acc, acc_elems, at::kFloat, like.device(), true);
 }
@@ -889,9 +942,8 @@ at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
         at::Tensor ahad_view = ahad.narrow(0, 0, (int64_t) smap.n_groups * m * k);
         exl3_had_in(x2, ahad_view, suh_rows);
 
-        int split = pick_split(m, k, n_size, bits, pick_bm(m), split_k);
         float* acc = nullptr;
-        if (split > 1)
+        if (pick_split(m, k, n_size, bits, 128, split_k) > 1)
         {
             at::Tensor& a = get_ws(g_acc, (int64_t) m * n_total, at::kFloat, x.device(), true);
             acc = (float*) a.data_ptr();
@@ -899,11 +951,13 @@ at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
         const half* A = (const half*) ahad.data_ptr();
         if (x.scalar_type() == at::kHalf)
             dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, m, k, n_size,
-                                n_total, n_off, n_tiles_full, acc, split, smap, stream);
+                                n_total, n_off, n_tiles_full, acc, 0, smap, stream,
+                                nullptr, 0, 0, 0, nullptr, split_k, bits);
         else
             dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
                                          m, k, n_size, n_total, n_off, n_tiles_full, acc,
-                                         split, smap, stream);
+                                         0, smap, stream, nullptr, 0, 0, 0, nullptr,
+                                         split_k, bits);
     };
 
     if (fuse)
