@@ -9,6 +9,9 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
                      const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                      const at::Tensor& n_rows, int64_t block_m, int64_t top_k,
                      int64_t m_valid);
+void exl3_reserve_acc(const at::Tensor& like, int64_t elems);
+void exl3_set_moe_acc_cap(int64_t elems);
+int64_t exl3_get_moe_acc_cap();
 void exl3_moe_glu_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh,
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
                          int64_t block_m);
@@ -35,6 +38,9 @@ TORCH_LIBRARY(vllm_exl3_C, m)
         "int[] group_n, int cb, bool split_k) -> Tensor");
     m.def("exl3_had_in(Tensor x, Tensor(a!) out, Tensor suh) -> ()");
     m.def("exl3_reserve(Tensor like, int max_tokens, int k, int n, int groups) -> ()");
+    m.def("exl3_reserve_acc(Tensor like, int elems) -> ()");
+    m.def("exl3_set_moe_acc_cap(int elems) -> ()");
+    m.def("exl3_get_moe_acc_cap() -> int");
     m.def(
         "exl3_moe_had_in(Tensor x, Tensor(a!) out, Tensor suh, Tensor sorted_ids, "
         "Tensor expert_ids, Tensor n_rows, int block_m, int top_k, int m_valid) -> ()");
@@ -55,10 +61,17 @@ TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
     m.impl("exl3_linear", &vllm_exl3::exl3_linear);
     m.impl("exl3_had_in", &vllm_exl3::exl3_had_in);
     m.impl("exl3_reserve", &vllm_exl3::exl3_reserve);
+    m.impl("exl3_reserve_acc", &vllm_exl3::exl3_reserve_acc);
     m.impl("exl3_moe_had_in", &vllm_exl3::exl3_moe_had_in);
     m.impl("exl3_moe_glu_had_in", &vllm_exl3::exl3_moe_glu_had_in);
     m.impl("exl3_moe_gemm", &vllm_exl3::exl3_moe_gemm);
     m.impl("exl3_moe_combine", &vllm_exl3::exl3_moe_combine);
+}
+
+TORCH_LIBRARY_IMPL(vllm_exl3_C, CompositeExplicitAutograd, m)
+{
+    m.impl("exl3_set_moe_acc_cap", &vllm_exl3::exl3_set_moe_acc_cap);
+    m.impl("exl3_get_moe_acc_cap", &vllm_exl3::exl3_get_moe_acc_cap);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)

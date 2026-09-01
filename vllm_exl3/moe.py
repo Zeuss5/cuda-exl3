@@ -14,6 +14,7 @@ each routed row is transformed with its own expert's scales. That is what
 
 from __future__ import annotations
 
+import os
 import torch
 
 from vllm.logger import init_logger
@@ -209,6 +210,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
             return 0
         return int(r)
+
+    def process_weights_after_loading(self, layer):
+        # The expert gemm splits k when its grid is too small to fill the GPU,
+        # which needs an fp32 accumulator sized from the routed row count -- and
+        # that is not known until the forward runs. The workspace refuses to grow
+        # once CUDA graphs are being captured, so claim the ceiling now. The gemm
+        # caps its own split at this many elements and runs unsplit above it, so
+        # reserving the cap makes growth impossible rather than merely unlikely.
+        try:
+            cap = int(torch.ops.vllm_exl3_C.exl3_get_moe_acc_cap())
+            if cap <= 0:
+                return          # split-k off: no accumulator will ever be needed
+            torch.ops.vllm_exl3_C.exl3_reserve_acc(layer.w13_svh.data, cap)
+        except Exception as e:  # pragma: no cover - lazy sizing is still correct
+            logger.debug("EXL3 %s: MoE accumulator pre-reserve skipped (%s)",
+                         self.prefix, e)
 
     def get_fused_moe_quant_config(self, layer):
         # Not using vLLM's modular kernel framework; apply() runs the whole thing.

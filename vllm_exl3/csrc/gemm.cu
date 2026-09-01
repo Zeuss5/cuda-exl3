@@ -427,7 +427,10 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
 template <typename OUT_T>
 __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict__ C,
                                      const half* __restrict__ svh, int m, int ldc,
-                                     int n_off, int n_size)
+                                     int n_off, int n_size,
+                                     const int* __restrict__ expert_ids,
+                                     const int* __restrict__ n_rows, int block_m,
+                                     int64_t svh_expert_stride)
 {
     int blocks_per_row = n_size / HAD_N;
     long long total = (long long) m * blocks_per_row;
@@ -437,6 +440,21 @@ __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict_
 
     int row = (int) (w / blocks_per_row);
     int blk = (int) (w % blocks_per_row);
+
+    // MoE: svh is per expert, and the accumulator invariant requires this to
+    // retire exactly the blocks the gemm retired -- had128_warp_acc re-zeroes
+    // what it reads, so skipping a block the gemm wrote (or touching one it did
+    // not) leaves stale partials behind for the next call. Hence the same
+    // block-granular predicate the gemm uses, not a per-row one.
+    if (expert_ids)
+    {
+        int blk_m = row / block_m;
+        if (n_rows && blk_m * block_m >= *n_rows) return;
+        int e = expert_ids[blk_m];
+        if (e < 0) return;
+        svh += (size_t) e * svh_expert_stride;
+    }
+
     size_t off = (size_t) row * ldc + n_off + blk * HAD_N;
     had128_warp_acc<OUT_T>(acc + off, C + off, svh + n_off + blk * HAD_N, threadIdx.x & 31);
 }
@@ -508,7 +526,7 @@ int pick_bm(int m)
 // How many ways to split k. Enough blocks to fill the machine, but split-k costs
 // an extra ~8*(S-1)*m*n bytes of accumulator traffic, so it is capped at a
 // fraction of the weight bytes it is trying to stream faster.
-int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
+int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_mult = 1)
 {
     if (!allowed) return 1;
     int sms = 0;
@@ -548,7 +566,12 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
         const char* e = getenv("VLLM_EXL3_L2_GAIN");
         return e && *e ? atof(e) : 2.0;
     }();
-    double weight_bytes = (double) k * n * bits / 8.0;
+    // Split-k is charged against the weight bytes it is trying to stream
+    // faster. A dense gemm reads one k*n matrix however many row-blocks it has,
+    // but an MoE grid reads a whole expert slice per row-block, so its weight
+    // traffic is weight_mult times larger. Without that the budget caps the
+    // split at 1 and the MoE path never splits at all.
+    double weight_bytes = (double) k * n * bits / 8.0 * (double) weight_mult;
     double per_extra = 8.0 * (double) m * n;            // one extra RMW of acc
     double b_eff = budget * (acc_bytes < 0.25 * l2_bytes ? l2_gain : 1.0);
     by_traffic = 1 + (int) (b_eff * weight_bytes / per_extra);
@@ -752,13 +775,16 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
 
 template <typename OUT_T>
 void launch_epilogue(float* acc, OUT_T* C, const half* svh, int m, int ldc, int n_off,
-                     int n_size, cudaStream_t stream)
+                     int n_size, cudaStream_t stream,
+                     const int* expert_ids = nullptr, const int* n_rows = nullptr,
+                     int block_m = 0, int64_t svh_expert_stride = 0)
 {
     long long warps = (long long) m * (n_size / HAD_N);
     const int threads = 256;
     long long blocks = (warps + threads / 32 - 1) / (threads / 32);
     vllm_exl3::exl3_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0, stream>>>(
-        acc, C, svh, m, ldc, n_off, n_size);
+        acc, C, svh, m, ldc, n_off, n_size, expert_ids, n_rows, block_m,
+        svh_expert_stride);
 }
 
 template <typename OUT_T>
@@ -782,7 +808,9 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                                  expert_ids, b_expert_stride, svh_expert_stride, \
                                  n_rows);                                        \
                 if (sp_ > 1)                                                    \
-                    launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);\
+                    launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream,  \
+                                           expert_ids, n_rows, bm_,              \
+                                           svh_expert_stride);                   \
             };                                                                  \
             /* MoE pins BM: the caller padded each expert's rows to that block, \
                so the grid's row tiling has to match it exactly. */             \
@@ -882,6 +910,35 @@ void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t
         if (pick_split((int) m, (int) k, (int) n, bits_ub, 128, true) > 1)
             acc_elems = std::max<int64_t>(acc_elems, m * n);
     if (acc_elems) get_ws(g_acc, acc_elems, at::kFloat, like.device(), true);
+}
+
+// Cap on the MoE split-k accumulator, in fp32 elements. Zero disables MoE
+// split-k entirely, which is the default -- see exl3_moe_gemm for the numbers.
+// Mutable so tests can exercise the split path in-process; the environment only
+// supplies the initial value.
+int64_t& moe_acc_cap_ref()
+{
+    static int64_t v = [] {
+        const char* e = getenv("VLLM_EXL3_MOE_ACC_MAX_ELEMS");
+        return e && *e ? (int64_t) atoll(e) : 0ll;
+    }();
+    return v;
+}
+
+int64_t moe_acc_cap_elems() { return moe_acc_cap_ref(); }
+
+void exl3_set_moe_acc_cap(int64_t elems) { moe_acc_cap_ref() = elems; }
+
+int64_t exl3_get_moe_acc_cap() { return moe_acc_cap_ref(); }
+
+// The MoE gemm sizes its accumulator from the routed row count, which is not
+// known until the forward runs. Reserve the ceiling now: get_ws hard-errors if
+// it has to grow once graphs are being captured, and the MoE path caps its own
+// split at this many elements, so reserving the cap makes growth impossible.
+void exl3_reserve_acc(const at::Tensor& like, int64_t elems)
+{
+    const at::cuda::OptionalCUDAGuard guard(like.device());
+    if (elems > 0) get_ws(g_acc, elems, at::kFloat, like.device(), true);
 }
 
 at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
@@ -1038,6 +1095,31 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     TORCH_CHECK(sum == n_total, "exl3_moe_gemm: shard widths sum to ", sum, ", expected ",
                 n_total);
 
+    // At low concurrency the expert gemm is badly block-starved: c=1 with
+    // top_k=8 gives 8 padded rows, so w13 (n=2*inter) is ~96 blocks against 188
+    // SMs. Splitting k fills the machine. The accumulator is rows*n floats,
+    // which is only affordable while rows is small -- but rows is small exactly
+    // when splitting helps, so cap it and let prefill run unsplit.
+    // Off by default: measured, and the kernel does get faster (rows=512,
+    // block_m=32: 33.0 -> 27.5 us) but it does not reach end to end. Splitting
+    // adds an epilogue launch per gemm per layer -- ~96 extra kernels per decode
+    // step -- and at decode batch sizes that costs more than the parallelism
+    // buys (MoE 8k/1k, tok/s: c=8 742.9 -> 712.8, c=32 1211.6 -> 1196.2, c=1
+    // and c=64 a wash). Kept behind the knob so the result is re-testable on
+    // hardware with a different SM count / launch cost.
+    int64_t moe_acc_cap = moe_acc_cap_elems();
+    int split = 1;
+    float* acc = nullptr;
+    int64_t acc_elems = (int64_t) rows * n_total;
+    if (acc_elems <= moe_acc_cap)
+        split = pick_split(rows, k, n_total, bits, (int) block_m, true,
+                           (int) expert_ids.size(0));
+    if (split > 1)
+    {
+        at::Tensor& a = get_ws(g_acc, acc_elems, at::kFloat, a_had.device(), true);
+        acc = (float*) a.data_ptr();
+    }
+
     const int64_t b_stride = (int64_t) trellis.size(1) * n_tiles_full * trellis.size(3);
     auto stream = at::cuda::getCurrentCUDAStream();
     const half* A = (const half*) a_had.data_ptr();
@@ -1048,12 +1130,12 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
 
     if (out_dtype == at::kHalf)
         dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, rows, k, n_total,
-                            n_total, 0, n_tiles_full, nullptr, 1, smap, stream, eids,
+                            n_total, 0, n_tiles_full, acc, split, smap, stream, eids,
                             b_stride, n_total, (int) block_m, nrows);
     else
         dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
-                                     rows, k, n_total, n_total, 0, n_tiles_full, nullptr,
-                                     1, smap, stream, eids, b_stride, n_total,
+                                     rows, k, n_total, n_total, 0, n_tiles_full, acc,
+                                     split, smap, stream, eids, b_stride, n_total,
                                      (int) block_m, nrows);
     return out;
 }
