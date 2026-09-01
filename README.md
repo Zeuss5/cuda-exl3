@@ -266,6 +266,18 @@ the expert GEMMs proper are 16%), 8% gated-delta-net, 8% assorted elementwise,
 5% the dense activation transform, 4% the split-k epilogue, 4% the MoE activation
 transform, and 1.5% the combine.
 
+Folding SwiGLU into the down-projection's input transform took a chunk out of
+that elementwise slice. Online, 8k in / 1k out, prefix caching off, one GPU:
+
+| | prefill (tok/s) | c=1 | c=8 | c=32 | c=64 |
+|---|---|---|---|---|---|
+| before | 21,825 | 191.5 | 705.8 | 1141.5 | 1268.5 |
+| after | 23,791 | 200.8 | 742.9 | 1211.6 | 1313.4 |
+| | +9.0% | +4.9% | +5.3% | +6.1% | +3.5% |
+
+(Decode columns are output tok/s. These are far below the short-prompt table
+above because every request carries 8k of context.)
+
 ## MoE notes
 
 Two things worth knowing if you touch this path:
@@ -348,7 +360,7 @@ block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
 m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
 free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
 
-Five things were tried and rejected against measurement:
+Six things were tried and rejected against measurement:
 
 * **Hoisting the dequant's index arithmetic** out of the inner loop. `dq4`
   recomputes bit indices per call including a `% 48` (non-power-of-two, so a
@@ -386,6 +398,17 @@ Five things were tried and rejected against measurement:
   every split block plus the scattered, poorly-parallelised finalisation cost
   more than the launch they save. A kernel boundary is simply a cheaper
   grid-wide barrier than one built by hand.
+
+* **Split-k for the MoE expert gemm** (`VLLM_EXL3_MOE_ACC_MAX_ELEMS`, off by
+  default). The expert gemm is block-starved at low concurrency -- c=1 with
+  top_k=8 gives 8 padded row-blocks, so w13 launches ~96 blocks against 188 SMs
+  -- and splitting k is a real kernel win (rows=512, block_m=32: 33.0 -> 27.5 us,
+  -17%). It does not survive end to end: splitting adds an epilogue launch per
+  gemm per layer, ~96 extra kernels per decode step, which costs more than the
+  parallelism buys (8k in / 1k out, tok/s: c=8 742.9 -> 712.8, c=32
+  1211.6 -> 1196.2, c=1 and c=64 a wash). This is the same wall the fused
+  epilogue hit from the other side. Kept behind the knob, and covered by tests
+  so it cannot rot, because the trade-off is hardware-dependent.
 
 At large batch the kernel now runs at **81% of peak MMA throughput**, issuing 6.5
 non-MMA instructions per MMA -- 827M ALU+FMA against 178M tensor instructions at
