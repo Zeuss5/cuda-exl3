@@ -9,6 +9,9 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
                      const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                      const at::Tensor& n_rows, int64_t block_m, int64_t top_k,
                      int64_t m_valid);
+void exl3_moe_glu_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh,
+                         const at::Tensor& expert_ids, const at::Tensor& n_rows,
+                         int64_t block_m);
 at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
                             const at::Tensor& topk_weights, int64_t num_tokens);
 at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
@@ -36,6 +39,9 @@ TORCH_LIBRARY(vllm_exl3_C, m)
         "exl3_moe_had_in(Tensor x, Tensor(a!) out, Tensor suh, Tensor sorted_ids, "
         "Tensor expert_ids, Tensor n_rows, int block_m, int top_k, int m_valid) -> ()");
     m.def(
+        "exl3_moe_glu_had_in(Tensor x, Tensor(a!) out, Tensor suh, Tensor expert_ids, "
+        "Tensor n_rows, int block_m) -> ()");
+    m.def(
         "exl3_moe_gemm(Tensor a_had, Tensor trellis, Tensor suh, Tensor svh, "
         "Tensor expert_ids, Tensor n_rows, int[] group_n, int cb, int block_m, "
         "ScalarType out_dtype) -> Tensor");
@@ -50,6 +56,7 @@ TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
     m.impl("exl3_had_in", &vllm_exl3::exl3_had_in);
     m.impl("exl3_reserve", &vllm_exl3::exl3_reserve);
     m.impl("exl3_moe_had_in", &vllm_exl3::exl3_moe_had_in);
+    m.impl("exl3_moe_glu_had_in", &vllm_exl3::exl3_moe_glu_had_in);
     m.impl("exl3_moe_gemm", &vllm_exl3::exl3_moe_gemm);
     m.impl("exl3_moe_combine", &vllm_exl3::exl3_moe_combine);
 }

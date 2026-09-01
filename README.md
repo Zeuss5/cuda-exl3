@@ -348,7 +348,7 @@ block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
 m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
 free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
 
-Four things were tried and rejected against measurement:
+Five things were tried and rejected against measurement:
 
 * **Hoisting the dequant's index arithmetic** out of the inner loop. `dq4`
   recomputes bit indices per call including a `% 48` (non-power-of-two, so a
@@ -374,6 +374,19 @@ Four things were tried and rejected against measurement:
   re-derived. Note there is no bf16 accumulator to try instead -- bf16 mma inputs
   always accumulate to fp32.
 
+* **Fusing the split-k epilogue into the GEMM.** With split-k on, the Hadamard
+  epilogue is a second kernel launch, and at low concurrency turning split-k off
+  entirely is roughly a wash (MoE decode, tok/s: c=1 205.2 vs 202.8, c=8 1240.5
+  vs 1245.6, c=32 3244.7 vs 3182.8) -- the launch was eating the parallelism the
+  split buys. The obvious fix is a counter-based epilogue: each block bumps a
+  per-tile atomic after its partials land, and the last split to arrive owns the
+  Hadamard. Implemented (`__threadfence()`, `atomicAdd` on a tile counter,
+  partials re-read through L2 with `__ldcg`) and clearly worse: `q_proj` m=32
+  33.6 -> 46.4 us, m=64 49.3 -> 69.8, `up_proj` m=16 36.3 -> 51.4. The fence on
+  every split block plus the scattered, poorly-parallelised finalisation cost
+  more than the launch they save. A kernel boundary is simply a cheaper
+  grid-wide barrier than one built by hand.
+
 At large batch the kernel now runs at **81% of peak MMA throughput**, issuing 6.5
 non-MMA instructions per MMA -- 827M ALU+FMA against 178M tensor instructions at
 m=4096. That ratio is set by the format: a procedural trellis codebook costs
@@ -384,9 +397,26 @@ not instruction bandwidth.
 One thing tuning *did* still find: the best block-M is shape-dependent, not just
 batch-dependent. At m=128, `up_proj` (n=17408) is 16% faster with BM=64 while
 `q_proj` (n=12288) prefers BM=128 -- no static rule captures both. The kernel now
-times the three BM tiers once per distinct shape and caches the winner (skipped
-during CUDA graph capture, which cannot tolerate the syncs). That is worth
-~7-10% in the m=128..256 range.
+times the BM tiers once per distinct shape and caches the winner (skipped during
+CUDA graph capture, which cannot tolerate the syncs). That is worth ~7-10% in the
+m=128..256 range.
+
+The same argument then applies to the split factor, which `pick_split` picks from
+a cost model. Block size and split interact -- a bigger tile means fewer blocks,
+so more splitting is needed to fill the machine -- yet the split used to be
+computed once from the *heuristic* BM and then paired with whatever BM the tuner
+chose. Recomputing it per candidate, and letting the tuner also try one step
+either side of the model's answer (`base/2`, `base`, `base*2`), is worth a
+further 5-14% in the same band, with no shape regressing:
+
+| shape | m=32 | m=128 | m=256 | m=512 |
+|---|---|---|---|---|
+| `q_proj` | 35.0 -> 33.0 | 95.1 -> 88.2 | 166.1 -> 152.2 | -- |
+| `up_proj` | 41.1 -> 39.3 | 113.5 -> 106.7 | 184.7 -> 168.8 | -- |
+| `down_proj` | 39.1 -> 37.1 | 114.9 -> 98.4 | 198.1 -> 179.2 | 371.3 -> 339.4 |
+
+The cost model is still what graph capture falls back on, so the tuner's answer
+has to be cached during eager warm-up to reach captured decode.
 
 Beating it further needs a different structure, not tuning. The honest options
 are: decode the trellis into shared once per block and stream several M tiles

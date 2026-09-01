@@ -276,15 +276,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                                   layer.w13_svh.data, expert_ids, n_rows, [I, I],
                                   layer.exl3_cb, block_m, out_dtype)
 
-        act = torch.nn.functional.silu(inter[:, :I]) * inter[:, I:]
-
-        # down: one transform, this time of the activation
+        # down: SwiGLU folded into the input transform. Doing it separately
+        # materialised a (rows, I) tensor that the transform then read straight
+        # back -- a full round trip through memory for no reuse. The rows are
+        # already in routed order here, so the gather is the identity.
         a2 = torch.empty((1, rows, I), dtype=torch.half, device=x.device)
-        # Empty sorted_ids: rows are already in routed order here, so the
-        # gather is the identity and no index array is needed.
-        ops.exl3_moe_had_in(act.contiguous(), a2, layer.w2_suh.data,
-                            torch.empty(0, dtype=torch.int32, device=x.device),
-                            expert_ids, n_rows, block_m, 1, rows)
+        ops.exl3_moe_glu_had_in(inter, a2, layer.w2_suh.data, expert_ids, n_rows,
+                                block_m)
         rows_out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data, layer.w2_suh.data,
                                      layer.w2_svh.data, expert_ids, n_rows, [H],
                                      layer.exl3_cb, block_m, out_dtype)

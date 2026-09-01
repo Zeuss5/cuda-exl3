@@ -130,6 +130,43 @@ __device__ __forceinline__ void had128_warp_in(const IN_T* __restrict__ in,
     ((half4*) out)[lane] = v;
 }
 
+// SwiGLU folded into the input transform. The MoE down-projection's activation
+// is silu(gate) * up over the first GEMM's two output halves; computing it here
+// saves materialising that (rows x inter) tensor only to read it straight back.
+// The product is formed in fp32, where the separate elementwise kernel used the
+// GEMM's output dtype, so this is if anything slightly more accurate.
+template <typename IN_T>
+__device__ __forceinline__ void had128_warp_glu_in(const IN_T* __restrict__ gate,
+                                                   const IN_T* __restrict__ up,
+                                                   half* __restrict__ out,
+                                                   const half* __restrict__ scale_pre,
+                                                   int lane)
+{
+    half4 g = ActVec<IN_T>::load(gate, lane);
+    half4 u = ActVec<IN_T>::load(up, lane);
+    half4 s = ((const half4*) scale_pre)[lane];
+
+    // silu(x) = x / (1 + exp(-x)). __expf is ~2^-21 accurate, far below the
+    // quantization error it feeds into.
+    auto glu = [] (half hg, half hu, half hs) {
+        float x = __half2float(hg);
+        return x * __frcp_rn(1.0f + __expf(-x)) * __half2float(hu) * __half2float(hs);
+    };
+    float v0 = glu(__low2half(g.x),  __low2half(u.x),  __low2half(s.x));
+    float v1 = glu(__high2half(g.x), __high2half(u.x), __high2half(s.x));
+    float v2 = glu(__low2half(g.y),  __low2half(u.y),  __low2half(s.y));
+    float v3 = glu(__high2half(g.y), __high2half(u.y), __high2half(s.y));
+
+    float s0 = v0 + v1, d0 = v0 - v1;
+    float s1 = v2 + v3, d1 = v2 - v3;
+    float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
+    shuffle_had_f4x32(h0, h1, h2, h3, lane);
+    half4 v;
+    v.x = __floats2half2_rn(h0 * EXL3_HAD128_RSCALE, h1 * EXL3_HAD128_RSCALE);
+    v.y = __floats2half2_rn(h2 * EXL3_HAD128_RSCALE, h3 * EXL3_HAD128_RSCALE);
+    ((half4*) out)[lane] = v;
+}
+
 template <bool pre_scale, bool post_scale>
 __device__ __forceinline__ void had128_warp(const half* __restrict__ in,
                                             half* __restrict__ out,

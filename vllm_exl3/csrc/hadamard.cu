@@ -245,4 +245,85 @@ at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted
     return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// Fused SwiGLU + input transform for the MoE down-projection.
+//
+// The rows here are already in routed order (they are the first GEMM's output),
+// so the gather is the identity and there is no sorted_ids, no top_k and only
+// one group. Padding rows carry zeros through from the first transform, so
+// silu(0)*0 = 0 needs no special case.
+// ---------------------------------------------------------------------------
+template <typename IN_T>
+__global__ void exl3_moe_glu_had_in_kernel(const IN_T* __restrict__ x,
+                                           half* __restrict__ a_had,
+                                           const half* __restrict__ suh,
+                                           const int* __restrict__ expert_ids,
+                                           const int* __restrict__ n_rows,
+                                           int rows, int k, int block_m)
+{
+    int blocks_per_row = k / 128;
+    long long total = (long long) rows * blocks_per_row;
+    int warps_per_block = blockDim.x / 32;
+    long long w = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    if (w >= total) return;
+
+    int row = (int) (w / blocks_per_row);
+    if (n_rows && row >= *n_rows) return;
+    int blk = (int) (w % blocks_per_row);
+    int lane = threadIdx.x & 31;
+
+    int e = expert_ids[row / block_m];
+    if (e < 0) return;                  // block belongs to no expert
+
+    // x is (rows, 2k): gate in the first half of the row, up in the second.
+    const IN_T* gate = x + (long long) row * 2 * k + blk * 128;
+    had128_warp_glu_in<IN_T>(gate, gate + k,
+                             a_had + (long long) row * k + blk * 128,
+                             suh + (long long) e * k + blk * 128, lane);
+}
+
+void exl3_moe_glu_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh,
+                         const at::Tensor& expert_ids, const at::Tensor& n_rows,
+                         int64_t block_m)
+{
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    TORCH_CHECK(out.scalar_type() == at::kHalf, "exl3_moe_glu_had_in: out must be float16");
+    TORCH_CHECK(suh.dim() == 3 && suh.size(1) == 1,
+                "exl3_moe_glu_had_in: suh must be (experts, 1, k)");
+    TORCH_CHECK(expert_ids.scalar_type() == at::kInt,
+                "exl3_moe_glu_had_in: expert_ids must be int32");
+    TORCH_CHECK(x.dim() == 2, "exl3_moe_glu_had_in: x must be 2-D (rows, 2k)");
+
+    int rows = (int) x.size(0);
+    TORCH_CHECK(x.size(1) % 2 == 0, "exl3_moe_glu_had_in: x must have an even width");
+    int k = (int) (x.size(1) / 2);
+    TORCH_CHECK(k % 128 == 0, "exl3_moe_glu_had_in: k must be a multiple of 128");
+    TORCH_CHECK((int) suh.size(2) == k, "exl3_moe_glu_had_in: suh k mismatch");
+    TORCH_CHECK(out.numel() >= (long long) rows * k, "exl3_moe_glu_had_in: out too small");
+    TORCH_CHECK((long long) expert_ids.numel() * block_m >= rows,
+                "exl3_moe_glu_had_in: expert_ids covers ", expert_ids.numel() * block_m,
+                " rows but x has ", rows);
+
+    long long total_warps = (long long) rows * (k / 128);
+    const int threads = 256;
+    long long blocks = (total_warps + threads / 32 - 1) / (threads / 32);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int* nr = n_rows.numel() ? n_rows.data_ptr<int>() : nullptr;
+
+    if (x.scalar_type() == at::kHalf)
+        exl3_moe_glu_had_in_kernel<half><<<(unsigned) blocks, threads, 0, stream>>>(
+            (const half*) x.data_ptr(), (half*) out.data_ptr(),
+            (const half*) suh.data_ptr(), expert_ids.data_ptr<int>(), nr,
+            rows, k, (int) block_m);
+    else if (x.scalar_type() == at::kBFloat16)
+        exl3_moe_glu_had_in_kernel<__nv_bfloat16><<<(unsigned) blocks, threads, 0, stream>>>(
+            (const __nv_bfloat16*) x.data_ptr(), (half*) out.data_ptr(),
+            (const half*) suh.data_ptr(), expert_ids.data_ptr<int>(), nr,
+            rows, k, (int) block_m);
+    else
+        TORCH_CHECK(false, "exl3_moe_glu_had_in: x must be float16 or bfloat16");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace vllm_exl3
