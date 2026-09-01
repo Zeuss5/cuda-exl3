@@ -218,3 +218,30 @@ The trellis bit packing, the procedural codebook and the mma fragment layout are
 part of the EXL3 on-disk format and follow ExLlamaV3 (MIT, (c) turboderp); those
 headers are vendored with attribution in `vllm_exl3/csrc/`. The GEMM tiling,
 split-k, fused epilogue, shard map and vLLM integration are new.
+
+## Where the time goes
+
+Profiled with the torch profiler and `ncu` (`bench/profile_workload.py`), 8k
+context on one GPU:
+
+* **Prefill is 82% this GEMM**, running at ~292 TFLOPS -- about 71% of the fp16
+  compute peak. That is roughly what cuBLAS achieves on the same shapes, while
+  reading 2.9x fewer bytes.
+* **Decode at 8k context** (c=16) splits ~60% GEMM, ~25% attention, ~8% GDN. The
+  GEMM there is at 84-98% of the memory-bandwidth limit.
+
+`ncu` at prefill sizes: tensor pipe 70.4% active, occupancy 2 blocks/SM
+(register-bound at 99 registers), and the dominant stall is `math_pipe_throttle`
+-- the trellis dequant competes with MMA for issue slots. Two things were tried
+and rejected against measurement:
+
+* A wider warp tile (WARP_N=32) at BM=128, re-evaluated after the bank-conflict
+  fix changed the ldsm/dequant balance. Consistently ~3% slower; reverted.
+* The cheaper 8-wide decode path for 6-bit. It does not apply: at the lane*8
+  alignment the 58-bit window crosses three 32-bit words, so two loads cannot
+  cover it. ExLlamaV3's `dq4` x2 for 6 bits is correct.
+
+The remaining idea with real headroom is fp16 accumulation, which would halve the
+accumulator registers and allow BM=256, so each dequantized weight feeds twice
+the MMA work. It costs accuracy (the current relative error is ~3e-4) and drops
+to 1 block/SM, so it needs measuring before adoption.
