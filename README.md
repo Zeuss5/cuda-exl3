@@ -258,7 +258,14 @@ block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
 m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
 free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
 
-Three things were tried and rejected against measurement:
+Four things were tried and rejected against measurement:
+
+* **Hoisting the dequant's index arithmetic** out of the inner loop. `dq4`
+  recomputes bit indices per call including a `% 48` (non-power-of-two, so a
+  magic-multiply sequence), and those depend only on the lane. Precomputing them
+  changed `smsp__inst_executed` by exactly zero instructions -- ptxas was already
+  hoisting all of it. The ~74 instructions per 8 weights are real dequant work,
+  not addressing overhead.
 
 * A wider warp tile (WARP_N=32) at BM=128, re-evaluated after the bank-conflict
   fix changed the ldsm/dequant balance. Consistently ~3% slower; reverted.
@@ -277,8 +284,16 @@ Three things were tried and rejected against measurement:
   re-derived. Note there is no bf16 accumulator to try instead -- bf16 mma inputs
   always accumulate to fp32.
 
-So the kernel is at the practical ceiling of this design. Beating it further
-means a different structure -- e.g. decoding the trellis into shared memory once
-per block and feeding several M tiles from it, or the low-precision tensor cores
-(fp8 / nvfp4), which would need the dequant to target those formats rather than
-fp16.
+At large batch the kernel now runs at **81% of peak MMA throughput**, issuing 6.5
+non-MMA instructions per MMA -- 827M ALU+FMA against 178M tensor instructions at
+m=4096. That ratio is set by the format: a procedural trellis codebook costs
+~74 instructions per 8 weights where an int4 LUT costs 4. Issue slots are only
+~33% occupied, so the limit is the math pipes competing with the tensor pipe,
+not instruction bandwidth.
+
+Beating it further needs a different structure, not tuning. The honest options
+are: decode the trellis into shared once per block and stream several M tiles
+past it (needs the accumulators for those tiles to live somewhere, which is the
+same register wall fp16 accumulation hit); or low-precision tensor cores, which
+as measured above would need a codebook designed to decode into fp8/nvfp4 -- a
+format change, not a kernel change.
