@@ -247,6 +247,25 @@ because the EXL3 input transform is a *block-diagonal* Hadamard over 128-element
 blocks and every split dim here is 128-divisible; `svh` and the output Hadamard
 are linear, so they commute with the all-reduce. Weights land at ~7 GiB/GPU.
 
+### MoE throughput
+
+Qwen3.5-35B-A3B (256 experts, top-8, 4-bit, `mcg`), one GPU, greedy decode:
+
+| concurrency | tok/s | ms/token |
+|---|---|---|
+| 1 | 204 | 4.91 |
+| 4 | 661 | 6.05 |
+| 8 | 1244 | 6.43 |
+| 16 | 2252 | 7.11 |
+| 32 | 3160 | 10.13 |
+| 64 | 4611 | 13.88 |
+
+At c=8 the decode is GPU-bound and splits roughly: **38% EXL3 GEMMs** (of which
+the expert GEMMs proper are 16%), 8% gated-delta-net, 8% assorted elementwise,
+8% an unquantized bf16 GEMM (the router), 6% vLLM's routing/alignment kernels,
+5% the dense activation transform, 4% the split-k epilogue, 4% the MoE activation
+transform, and 1.5% the combine.
+
 ## MoE notes
 
 Two things worth knowing if you touch this path:
