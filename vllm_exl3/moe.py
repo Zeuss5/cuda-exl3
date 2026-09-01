@@ -280,16 +280,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         # down: one transform, this time of the activation
         a2 = torch.empty((1, rows, I), dtype=torch.half, device=x.device)
+        # Empty sorted_ids: rows are already in routed order here, so the
+        # gather is the identity and no index array is needed.
         ops.exl3_moe_had_in(act.contiguous(), a2, layer.w2_suh.data,
-                            torch.arange(rows, device=x.device, dtype=torch.int32),
+                            torch.empty(0, dtype=torch.int32, device=x.device),
                             expert_ids, n_rows, block_m, 1, rows)
         rows_out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data, layer.w2_suh.data,
                                      layer.w2_svh.data, expert_ids, n_rows, [H],
                                      layer.exl3_cb, block_m, out_dtype)
 
-        # Scatter back to (token, k) order and combine. Padded rows are sent to a
-        # scratch slot rather than masked, so nothing here needs a device sync
-        # (which would break CUDA graph capture).
-        buf = torch.zeros((M * T + 1, H), dtype=out_dtype, device=x.device)
-        buf.index_copy_(0, sorted_ids.clamp(max=M * T).long(), rows_out)
-        return (buf[: M * T].view(M, T, H) * topk_weights.to(out_dtype).unsqueeze(-1)).sum(1)
+        # Combine the routed rows back into per-token outputs. Fused: each
+        # (token, k) pair appears exactly once among the live rows, so inverting
+        # sorted_ids gives a direct gather -- no atomics, no (M*top_k, H) scratch,
+        # and no device sync, so it stays CUDA-graph safe.
+        return ops.exl3_moe_combine(rows_out, sorted_ids, topk_weights, M)

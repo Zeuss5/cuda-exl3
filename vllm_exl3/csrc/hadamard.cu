@@ -108,7 +108,10 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
     int lane = threadIdx.x & 31;
     long long dst = (long long) row * k + blk * 128;
 
-    int idx = sorted_ids[row];
+    // An empty sorted_ids means the rows are already in place (the second
+    // projection consumes the first one's output), so the gather is the
+    // identity and no index array needs building.
+    int idx = sorted_ids ? sorted_ids[row] : row;
     if (idx >= m_valid)
     {
         // Padding row: emit zeros so the matmul result is zero too.
@@ -136,12 +139,15 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
     const at::cuda::OptionalCUDAGuard guard(x.device());
     TORCH_CHECK(out.scalar_type() == at::kHalf, "exl3_moe_had_in: out must be float16");
     TORCH_CHECK(suh.dim() == 3, "exl3_moe_had_in: suh must be (experts, groups, k)");
-    TORCH_CHECK(sorted_ids.scalar_type() == at::kInt && expert_ids.scalar_type() == at::kInt,
-                "exl3_moe_had_in: sorted_ids/expert_ids must be int32");
+    TORCH_CHECK(expert_ids.scalar_type() == at::kInt,
+                "exl3_moe_had_in: expert_ids must be int32");
+    TORCH_CHECK(!sorted_ids.numel() || sorted_ids.scalar_type() == at::kInt,
+                "exl3_moe_had_in: sorted_ids must be int32");
 
     int k = (int) x.size(-1);
     int groups = (int) suh.size(1);
-    int rows = (int) sorted_ids.numel();
+    int rows = (int) (sorted_ids.numel() ? sorted_ids.numel()
+                                          : expert_ids.numel() * block_m);
     TORCH_CHECK(k % 128 == 0, "exl3_moe_had_in: k must be a multiple of 128");
     TORCH_CHECK((int) suh.size(2) == k, "exl3_moe_had_in: suh k mismatch");
     TORCH_CHECK(out.numel() >= (long long) groups * rows * k, "exl3_moe_had_in: out too small");
@@ -154,21 +160,89 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
     long long blocks = (total_warps + threads / 32 - 1) / (threads / 32);
     auto stream = at::cuda::getCurrentCUDAStream();
     const int* nr = n_rows.numel() ? n_rows.data_ptr<int>() : nullptr;
+    const int* sids = sorted_ids.numel() ? sorted_ids.data_ptr<int>() : nullptr;
 
     if (x.scalar_type() == at::kHalf)
         exl3_moe_had_in_kernel<half><<<(unsigned) blocks, threads, 0, stream>>>(
             (const half*) x.data_ptr(), (half*) out.data_ptr(), (const half*) suh.data_ptr(),
-            sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(), nr, rows, k, groups,
+            sids, expert_ids.data_ptr<int>(), nr, rows, k, groups,
             (int) block_m, (int) top_k, (int) m_valid);
     else if (x.scalar_type() == at::kBFloat16)
         exl3_moe_had_in_kernel<__nv_bfloat16><<<(unsigned) blocks, threads, 0, stream>>>(
             (const __nv_bfloat16*) x.data_ptr(), (half*) out.data_ptr(),
-            (const half*) suh.data_ptr(), sorted_ids.data_ptr<int>(),
-            expert_ids.data_ptr<int>(), nr, rows, k, groups, (int) block_m, (int) top_k,
-            (int) m_valid);
+            (const half*) suh.data_ptr(), sids, expert_ids.data_ptr<int>(), nr, rows, k,
+            groups, (int) block_m, (int) top_k, (int) m_valid);
     else
         TORCH_CHECK(false, "exl3_moe_had_in: x must be float16 or bfloat16");
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// Combine routed rows back into per-token outputs.
+//
+// Replaces a python index_copy + broadcast-multiply + sum, which together cost
+// ~9% of MoE decode GPU time and needed an (M*top_k+1, H) scratch buffer. Each
+// (token, k) pair appears exactly once among the live rows, so inverting
+// sorted_ids gives a direct gather -- no atomics, no scratch, deterministic.
+// ---------------------------------------------------------------------------
+
+__global__ void exl3_moe_build_inv_kernel(const int* __restrict__ sorted_ids,
+                                          int* __restrict__ inv, int rows, int m_valid)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    int idx = sorted_ids[r];
+    if (idx < m_valid) inv[idx] = r;
+}
+
+template <typename T_>
+__global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
+                                        const int* __restrict__ inv,
+                                        const float* __restrict__ w,
+                                        T_* __restrict__ out, int top_k, int H)
+{
+    int token = blockIdx.x;
+    for (int h = threadIdx.x; h < H; h += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k = 0; k < top_k; ++k)
+        {
+            int r = inv[token * top_k + k];
+            acc += w[token * top_k + k] * (float) rows_out[(size_t) r * H + h];
+        }
+        out[(size_t) token * H + h] = (T_) acc;
+    }
+}
+
+at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
+                            const at::Tensor& topk_weights, int64_t num_tokens)
+{
+    const at::cuda::OptionalCUDAGuard guard(rows_out.device());
+    TORCH_CHECK(sorted_ids.scalar_type() == at::kInt, "exl3_moe_combine: sorted_ids int32");
+    int H = (int) rows_out.size(1);
+    int rows = (int) sorted_ids.numel();
+    int M = (int) num_tokens;
+    int top_k = (int) topk_weights.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto w = topk_weights.to(at::kFloat).contiguous();
+    auto inv = at::empty({(long long) M * top_k},
+                         at::TensorOptions().dtype(at::kInt).device(rows_out.device()));
+    exl3_moe_build_inv_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(
+        sorted_ids.data_ptr<int>(), inv.data_ptr<int>(), rows, M * top_k);
+
+    at::Tensor out = at::empty({M, H}, rows_out.options());
+    int threads = H < 1024 ? ((H + 31) / 32) * 32 : 1024;
+    if (rows_out.scalar_type() == at::kHalf)
+        exl3_moe_combine_kernel<half><<<M, threads, 0, stream>>>(
+            (const half*) rows_out.data_ptr(), inv.data_ptr<int>(), w.data_ptr<float>(),
+            (half*) out.data_ptr(), top_k, H);
+    else
+        exl3_moe_combine_kernel<__nv_bfloat16><<<M, threads, 0, stream>>>(
+            (const __nv_bfloat16*) rows_out.data_ptr(), inv.data_ptr<int>(),
+            w.data_ptr<float>(), (__nv_bfloat16*) out.data_ptr(), top_k, H);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }
 
 }  // namespace vllm_exl3

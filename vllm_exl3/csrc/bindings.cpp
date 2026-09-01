@@ -9,6 +9,8 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
                      const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                      const at::Tensor& n_rows, int64_t block_m, int64_t top_k,
                      int64_t m_valid);
+at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
+                            const at::Tensor& topk_weights, int64_t num_tokens);
 at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          const at::Tensor& suh_unused, const at::Tensor& svh,
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
@@ -37,6 +39,9 @@ TORCH_LIBRARY(vllm_exl3_C, m)
         "exl3_moe_gemm(Tensor a_had, Tensor trellis, Tensor suh, Tensor svh, "
         "Tensor expert_ids, Tensor n_rows, int[] group_n, int cb, int block_m, "
         "ScalarType out_dtype) -> Tensor");
+    m.def(
+        "exl3_moe_combine(Tensor rows_out, Tensor sorted_ids, Tensor topk_weights, "
+        "int num_tokens) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
@@ -46,6 +51,7 @@ TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
     m.impl("exl3_reserve", &vllm_exl3::exl3_reserve);
     m.impl("exl3_moe_had_in", &vllm_exl3::exl3_moe_had_in);
     m.impl("exl3_moe_gemm", &vllm_exl3::exl3_moe_gemm);
+    m.impl("exl3_moe_combine", &vllm_exl3::exl3_moe_combine);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
