@@ -1,0 +1,666 @@
+// EXL3 GEMM with M-tiling.
+//
+// ExLlamaV3's gemm fixes TILESIZE_M at 16 and loops over the batch in 16-row
+// chunks, re-reading the whole trellis for every chunk. That is optimal for
+// single-stream decode but makes cost linear in the batch size: on an RTX PRO
+// 6000 the kernel sits at ~1.65 TB/s (i.e. HBM-bound) from m=24 upward, so a
+// 512-row batch reads a 47 MB tensor 32 times.
+//
+// vLLM's continuous batching lives exactly in that range, so this kernel tiles
+// M instead: one block owns BM rows x BN columns and the full k extent, reads
+// its slice of the trellis *once*, and amortizes the dequant over all BM rows.
+// Owning the full k extent also means the block holds a complete output row
+// segment, so the output Hadamard and svh scaling fold into the epilogue with
+// no second pass and no k x n scratch buffer.
+//
+// The trellis decode itself (exl3_dq.cuh) and the fragment layout come from
+// ExLlamaV3 and are part of the on-disk format.
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include <algorithm>
+#include <set>
+#include <vector>
+
+#include "exl3_common.cuh"
+#include "exl3_dq.cuh"
+#include "exl3_had.cuh"
+
+namespace vllm_exl3 {
+
+// Output Hadamard block size; BN must equal this so a block owns whole blocks.
+constexpr int HAD_N = 128;
+
+// Which shard of a fused layer each BN-wide column block belongs to. Shards are
+// contiguous column ranges, so a block just walks the (at most 8) boundaries.
+// Only the activation slice differs per shard -- trellis, svh and the output are
+// all addressed by absolute column -- so one launch can cover a whole qkv_proj.
+struct ShardMap
+{
+    int nblk_end[8];
+    int n_groups;
+};
+
+// WARP_N is the width of a warp's tile. Each 16x16 trellis tile is decoded by
+// exactly one warp, so a narrower warp tile means fewer warps decode the same
+// tile: with WARP_N=16 and one warp row, every tile is dequantized once per
+// block instead of WARPS_M times. That matters at small batch sizes, where the
+// kernel is dequant-bound rather than memory-bound.
+template <int BITS, int CB, int BM, int BN, int BK, int NWARPS, int STAGES, int WARP_N_>
+struct GemmCfg
+{
+    static constexpr int NTHREADS = NWARPS * 32;
+    static constexpr int WARPS_N = BN / WARP_N_;
+    static constexpr int WARPS_M = NWARPS / WARPS_N;
+    static constexpr int WARP_M = BM / WARPS_M;
+    static constexpr int WARP_N = WARP_N_;
+    static constexpr int MBLK = WARP_M / 16;             // m16n8k16 blocks
+    static constexpr int NBLK = WARP_N / 8;
+    static constexpr int KSTEPS = BK / 16;
+    static constexpr int A_COLS = BK / 8;                // int4 per A row
+    // ldmatrix reads 8 rows at one column offset. With a 64-byte row (BK=32)
+    // those 8 rows land on only 2 distinct bank groups, and no XOR swizzle can
+    // fix that because there are only 4 columns to permute. Padding the row
+    // stride by one 16-byte element makes the 8 rows hit 8 distinct banks
+    // (stride 80B -> banks 0,20,8,28,16,4,24,12), which removes the conflicts
+    // outright -- they were the kernel's single largest stall.
+    static constexpr int A_STRIDE = A_COLS + 1;
+    static constexpr int NTILES = BN / 16;               // B tiles per k step
+    static constexpr int TILE_U32 = 8 * BITS;            // uint32 per 16x16 tile
+    static constexpr int TILE_I4 = 2 * BITS;             // int4 per 16x16 tile
+
+    static constexpr int SH_A_I4 = BM * A_STRIDE;        // int4
+    static constexpr int SH_B_I4 = KSTEPS * NTILES * TILE_I4;
+    static constexpr int SH_STAGE_I4 = SH_A_I4 + SH_B_I4;
+
+    static constexpr int C_STRIDE = BN + 8;              // pad: bank conflicts
+    static constexpr int SH_C_BYTES = BM * C_STRIDE * 2;
+    static constexpr int SH_PIPE_BYTES = STAGES * SH_STAGE_I4 * 16;
+
+    // Split-k stages fp32 partials in shared so the atomics into the global
+    // accumulator come out coalesced. Only worth the shared memory for the small
+    // BM values split-k actually uses; BM=128 falls back to direct atomics.
+    static constexpr bool SPLIT_STAGED = BM <= 64;
+    static constexpr int F_STRIDE = BN + 4;
+    static constexpr int SH_F_BYTES = SPLIT_STAGED ? BM * F_STRIDE * 4 : 0;
+
+    static constexpr int MAX2(int a, int b) { return a > b ? a : b; }
+    static constexpr int SMEM = MAX2(MAX2(SH_PIPE_BYTES, SH_C_BYTES), SH_F_BYTES);
+};
+
+// SPLIT: this block covers only part of k, so it accumulates fp32 partials into
+// `acc` and a later pass does the Hadamard. Splitting k is how narrow-n layers
+// (Qwen3.5's down_proj is only 40 blocks wide at BN=128) and small batches keep
+// all 188 SMs busy. Unlike shrinking BN it adds blocks without multiplying the
+// number of times A is re-read.
+template <int BITS, int CB, int BM, int BN, int BK, int NWARPS, int STAGES, bool SPLIT,
+          typename OUT_T, int WARP_N_>
+__global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
+    const half* __restrict__ A,        // (groups, m, k), Hadamard-transformed
+    const uint16_t* __restrict__ Bq,   // (k/16, n/16, 16*BITS) trellis
+    OUT_T* __restrict__ C,             // (m, ldc)
+    const half* __restrict__ svh,      // (n_full,)
+    int m, int k, int n, int ldc,
+    int n_off,                         // first column of this shard, in features
+    int n_tiles_full,                  // trellis dim-1 extent, i.e. the row stride
+    float* __restrict__ acc,           // (m, ldc) fp32 partials, SPLIT only
+    int kt_per_split,
+    ShardMap smap)
+{
+    using Cfg = GemmCfg<BITS, CB, BM, BN, BK, NWARPS, STAGES, WARP_N_>;
+
+    extern __shared__ __align__(16) int4 smem[];
+
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int warp_m = warp / Cfg::WARPS_N;
+    const int warp_n = warp % Cfg::WARPS_N;
+
+    // Column ranges are expressed relative to the shard, then offset by n_off.
+    // Fused layers (qkv_proj, gate_up_proj) keep ONE trellis tensor covering
+    // every shard, so slicing it in python would produce a non-contiguous view
+    // whose real row stride the kernel cannot see. Pass the offset and the full
+    // dim-1 extent instead, and write straight into the merged output.
+    const int n0 = blockIdx.x * BN;          // first output column, shard-relative
+    const int m0 = blockIdx.y * BM;          // first output row
+    const int kt_total = k / BK;
+    const int kt_begin = SPLIT ? (int) blockIdx.z * kt_per_split : 0;
+    const int kt_end = SPLIT ? min(kt_begin + kt_per_split, kt_total) : kt_total;
+
+    // Pick this block's shard, and with it the activation slice to read.
+    int grp = 0;
+    while (grp + 1 < smap.n_groups && (int) blockIdx.x >= smap.nblk_end[grp]) ++grp;
+    A += (size_t) grp * m * k;
+
+    // ---- global -> shared staging -----------------------------------------
+    auto load_stage = [&](int stage, int k0) {
+        int4* sh = smem + stage * Cfg::SH_STAGE_I4;
+        int4* sh_a = sh;
+        int4* sh_b = sh + Cfg::SH_A_I4;
+
+        // A tile: BM rows x BK halfs, XOR-swizzled so ldmatrix is conflict-free
+#pragma unroll
+        for (int i = t; i < BM * Cfg::A_COLS; i += Cfg::NTHREADS)
+        {
+            int row = i / Cfg::A_COLS;
+            int c = i % Cfg::A_COLS;
+            int grow = m0 + row;
+            const int4* src = ((const int4*) A) + (size_t) grow * (k / 8) + k0 / 8 + c;
+            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + c, src, grow < m);
+        }
+
+        // B tiles: KSTEPS x NTILES packed 16x16 trellis tiles
+#pragma unroll
+        for (int i = t; i < Cfg::SH_B_I4; i += Cfg::NTHREADS)
+        {
+            int chunk = i % Cfg::TILE_I4;
+            int tile = i / Cfg::TILE_I4;
+            int ks = tile / Cfg::NTILES;
+            int nt = tile % Cfg::NTILES;
+            const int4* src = ((const int4*) Bq) +
+                              ((size_t) (k0 / 16 + ks) * n_tiles_full +
+                               (n_off + n0) / 16 + nt) * Cfg::TILE_I4 + chunk;
+            cp_async16(sh_b + tile * Cfg::TILE_I4 + chunk, src);
+        }
+    };
+
+    FragC frag_c[Cfg::MBLK][Cfg::NBLK];
+#pragma unroll
+    for (int i = 0; i < Cfg::MBLK; ++i)
+#pragma unroll
+        for (int j = 0; j < Cfg::NBLK; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) frag_c[i][j][e] = 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s)
+    {
+        if (kt_begin + s < kt_end) load_stage(s, (kt_begin + s) * BK);
+        cp_async_fence();
+    }
+
+    // ---- main loop ---------------------------------------------------------
+    for (int kt = kt_begin; kt < kt_end; ++kt)
+    {
+        int slot = (kt - kt_begin) % STAGES;
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+
+        // Prefetch into the buffer just retired by iteration kt-1.
+        int nxt_kt = kt + STAGES - 1;
+        if (nxt_kt < kt_end) load_stage((nxt_kt - kt_begin) % STAGES, nxt_kt * BK);
+        cp_async_fence();
+
+        const int4* sh = smem + slot * Cfg::SH_STAGE_I4;
+        const int4* sh_a = sh;
+        const uint32_t* sh_b = (const uint32_t*) (sh + Cfg::SH_A_I4);
+
+#pragma unroll
+        for (int ks = 0; ks < Cfg::KSTEPS; ++ks)
+        {
+            FragA frag_a[Cfg::MBLK];
+#pragma unroll
+            for (int mb = 0; mb < Cfg::MBLK; ++mb)
+            {
+                // ldmatrix.x4 addressing: lane -> (row, 8-col group)
+                int r = (lane & 7) + 8 * ((lane >> 3) & 1);
+                int R = warp_m * Cfg::WARP_M + mb * 16 + r;
+                int c = ks * 2 + (lane >> 4);
+                ldsm4(frag_a[mb], sh_a + R * Cfg::A_STRIDE + c);
+            }
+
+            FragB frag_b[Cfg::NBLK];
+#pragma unroll
+            for (int nb = 0; nb < Cfg::NBLK; nb += 2)
+            {
+                // One 16x16 trellis tile decodes to two n8 B fragments.
+                int nt = (warp_n * Cfg::WARP_N + nb * 8) / 16;
+                const uint32_t* tile =
+                    sh_b + (ks * Cfg::NTILES + nt) * Cfg::TILE_U32;
+                dq_dispatch<BITS, CB>(tile, lane << 3, frag_b[nb], frag_b[nb + 1]);
+            }
+
+#pragma unroll
+            for (int mb = 0; mb < Cfg::MBLK; ++mb)
+#pragma unroll
+                for (int nb = 0; nb < Cfg::NBLK; ++nb)
+                    mma_m16n8k16(frag_a[mb], frag_b[nb], frag_c[mb][nb]);
+        }
+    }
+
+    // ---- epilogue ----------------------------------------------------------
+    if constexpr (SPLIT)
+    {
+        // Partial sums only: accumulate and let exl3_epilogue finish the row
+        // once every split has landed.
+        if constexpr (Cfg::SPLIT_STAGED)
+        {
+            __syncthreads();
+            float* sh_f = (float*) smem;
+#pragma unroll
+            for (int mb = 0; mb < Cfg::MBLK; ++mb)
+            {
+                int r0 = warp_m * Cfg::WARP_M + mb * 16 + (lane >> 2);
+#pragma unroll
+                for (int nb = 0; nb < Cfg::NBLK; ++nb)
+                {
+                    int col = warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
+                    float* p0 = sh_f + r0 * Cfg::F_STRIDE + col;
+                    float* p1 = p0 + 8 * Cfg::F_STRIDE;
+                    p0[0] = frag_c[mb][nb][0];
+                    p0[1] = frag_c[mb][nb][1];
+                    p1[0] = frag_c[mb][nb][2];
+                    p1[1] = frag_c[mb][nb][3];
+                }
+            }
+            __syncthreads();
+
+            // Consecutive threads hit consecutive addresses, so each warp's
+            // atomics coalesce into whole cache lines.
+            for (int i = t; i < BM * BN; i += Cfg::NTHREADS)
+            {
+                int r = i / BN;
+                int c = i - r * BN;
+                int gr = m0 + r;
+                if (gr >= m) continue;
+                atomicAdd(&acc[(size_t) gr * ldc + n_off + n0 + c],
+                          sh_f[r * Cfg::F_STRIDE + c]);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int mb = 0; mb < Cfg::MBLK; ++mb)
+            {
+                int r0 = m0 + warp_m * Cfg::WARP_M + mb * 16 + (lane >> 2);
+#pragma unroll
+                for (int nb = 0; nb < Cfg::NBLK; ++nb)
+                {
+                    int col = n_off + n0 + warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
+                    if (r0 < m)
+                    {
+                        atomicAdd(&acc[(size_t) r0 * ldc + col], frag_c[mb][nb][0]);
+                        atomicAdd(&acc[(size_t) r0 * ldc + col + 1], frag_c[mb][nb][1]);
+                    }
+                    if (r0 + 8 < m)
+                    {
+                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col], frag_c[mb][nb][2]);
+                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col + 1], frag_c[mb][nb][3]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Non-split: this block owns the whole k extent for a full 128-wide output
+    // group, so the Hadamard and svh fold in here -- no second pass, no scratch.
+    __syncthreads();
+    half* sh_c = (half*) smem;
+
+#pragma unroll
+    for (int mb = 0; mb < Cfg::MBLK; ++mb)
+    {
+        int base_row = warp_m * Cfg::WARP_M + mb * 16 + (lane >> 2);
+#pragma unroll
+        for (int nb = 0; nb < Cfg::NBLK; ++nb)
+        {
+            int col = warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
+            half* p0 = sh_c + base_row * Cfg::C_STRIDE + col;
+            half* p1 = p0 + 8 * Cfg::C_STRIDE;
+            p0[0] = __float2half(frag_c[mb][nb][0]);
+            p0[1] = __float2half(frag_c[mb][nb][1]);
+            p1[0] = __float2half(frag_c[mb][nb][2]);
+            p1[1] = __float2half(frag_c[mb][nb][3]);
+        }
+    }
+    __syncthreads();
+
+    for (int r = warp; r < BM; r += NWARPS)
+    {
+        int grow = m0 + r;
+        if (grow >= m) continue;
+        had128_warp_out<OUT_T>(sh_c + r * Cfg::C_STRIDE,
+                               C + (size_t) grow * ldc + n_off + n0,
+                               svh + n_off + n0, lane);
+    }
+}
+
+// Finishes a split-k result: Hadamard + svh over each 128-column group, fp32 ->
+// fp16, and re-zeroes the accumulator so no memset is needed next time.
+template <typename OUT_T>
+__global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict__ C,
+                                     const half* __restrict__ svh, int m, int ldc,
+                                     int n_off, int n_size)
+{
+    int blocks_per_row = n_size / HAD_N;
+    long long total = (long long) m * blocks_per_row;
+    int warps_per_block = blockDim.x / 32;
+    long long w = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    if (w >= total) return;
+
+    int row = (int) (w / blocks_per_row);
+    int blk = (int) (w % blocks_per_row);
+    size_t off = (size_t) row * ldc + n_off + blk * HAD_N;
+    had128_warp_acc<OUT_T>(acc + off, C + off, svh + n_off + blk * HAD_N, threadIdx.x & 31);
+}
+
+}  // namespace vllm_exl3
+
+// ---------------------------------------------------------------------------
+// Host launcher
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using vllm_exl3::HAD_N;
+using vllm_exl3::ShardMap;
+
+constexpr int BN_ = 128;   // must equal HAD_N: a block owns whole Hadamard blocks
+constexpr int BK_ = 32;
+constexpr int NW_ = 8;
+
+// Cap on the fused activation workspace. Fusing every shard of a layer into one
+// launch needs all of their transformed activations live at once; past this the
+// shards are run in sequence instead, reusing a single buffer. Launch overhead
+// is irrelevant at those batch sizes anyway.
+constexpr int64_t FUSE_MAX_ELEMS = 32ll << 20;   // 64 MiB of fp16
+
+// Raising the dynamic-smem cap is a per-kernel, per-device property; do it once.
+bool raise_smem(const void* fn, int smem)
+{
+    static std::set<const void*> done[8];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    auto& s = done[dev & 7];
+    if (s.find(fn) == s.end())
+    {
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        s.insert(fn);
+    }
+    return true;
+}
+
+int pick_bm(int m)
+{
+    // Smallest BM that still covers the batch: BM >= m means the trellis is read
+    // exactly once. Past 128 the accumulator register file binds, so larger
+    // batches re-read in BM-sized passes.
+    if (m <= 32) return 32;
+    if (m <= 64) return 64;
+    return 128;
+}
+
+// How many ways to split k. Enough blocks to fill the machine, but split-k costs
+// an extra ~8*(S-1)*m*n bytes of accumulator traffic, so it is capped at a
+// fraction of the weight bytes it is trying to stream faster.
+int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
+{
+    if (!allowed) return 1;
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    if (sms <= 0) sms = 128;
+
+    long long blocks = (long long) (n / BN_) * ((m + bm - 1) / bm);
+    if (blocks <= 0) return 1;
+    int want = (int) (((long long) 2 * sms + blocks - 1) / blocks);
+    if (want <= 1) return 1;
+
+    double weight_bytes = (double) k * n * bits / 8.0;
+    double per_extra = 8.0 * (double) m * n;            // one extra RMW of acc
+    int by_traffic = 1 + (int) (0.30 * weight_bytes / per_extra);
+
+    int kt_total = k / BK_;
+    int s = want;
+    if (s > by_traffic) s = by_traffic;
+    if (s > kt_total) s = kt_total;
+    if (s > 16) s = 16;
+    return s < 1 ? 1 : s;
+}
+
+template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_>
+void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
+            int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
+            ShardMap smap, cudaStream_t stream)
+{
+    using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK_, NW_, ST_, WARP_N_>;
+    auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK_, NW_, ST_, SPLIT, OUT_T,
+                                            WARP_N_>;
+    raise_smem((const void*) fn, Cfg::SMEM);
+    int kt_total = k / BK_;
+    int kt_per_split = (kt_total + split - 1) / split;
+    dim3 grid(n / BN_, (m + BM - 1) / BM, SPLIT ? split : 1);
+    fn<<<grid, Cfg::NTHREADS, Cfg::SMEM, stream>>>(A, Bq, C, svh, m, k, n, ldc, n_off,
+                                                  n_tiles_full, acc, kt_per_split, smap);
+}
+
+template <int BITS, int CB, typename OUT_T>
+void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
+               int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
+               ShardMap smap, cudaStream_t stream)
+{
+    int bm = pick_bm(m);
+    // One warp row (WARPS_M == 1) keeps each trellis tile decoded exactly once.
+    // Pipeline depth trades against occupancy: the padded A tile is larger, so
+    // the biggest block tile uses one stage fewer to stay at 2 blocks/SM.
+#define VE3_BM(BM_, WN_, ST)                                                           \
+    if (bm == BM_)                                                                     \
+    {                                                                                  \
+        if (split > 1)                                                                 \
+            launch<BITS, CB, BM_, true, OUT_T, WN_, ST>(A, Bq, C, svh, m, k, n, ldc,   \
+                                 n_off, n_tiles_full, acc, split, smap, stream);       \
+        else                                                                           \
+            launch<BITS, CB, BM_, false, OUT_T, WN_, ST>(A, Bq, C, svh, m, k, n, ldc,  \
+                                 n_off, n_tiles_full, acc, 1, smap, stream);           \
+        return;                                                                        \
+    }
+    VE3_BM(32, 16, 4) VE3_BM(64, 16, 4) VE3_BM(128, 16, 3)
+#undef VE3_BM
+}
+
+template <typename OUT_T>
+void launch_epilogue(float* acc, OUT_T* C, const half* svh, int m, int ldc, int n_off,
+                     int n_size, cudaStream_t stream)
+{
+    long long warps = (long long) m * (n_size / HAD_N);
+    const int threads = 256;
+    long long blocks = (warps + threads / 32 - 1) / (threads / 32);
+    vllm_exl3::exl3_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0, stream>>>(
+        acc, C, svh, m, ldc, n_off, n_size);
+}
+
+template <typename OUT_T>
+void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T* C,
+                   const half* S, int m, int k, int n, int ldc, int n_off,
+                   int n_tiles_full, float* acc, int split, ShardMap smap,
+                   cudaStream_t stream)
+{
+#define VE3_CASE(B_, C_)                                                        \
+    if (bits == B_ && cb == C_)                                                 \
+    {                                                                           \
+        launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off, n_tiles_full,  \
+                                 acc, split, smap, stream);                     \
+        if (split > 1)                                                          \
+            launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);        \
+        C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
+        return;                                                                 \
+    }
+    VE3_CASE(5, 2) VE3_CASE(6, 2) VE3_CASE(7, 2)
+    VE3_CASE(2, 2) VE3_CASE(3, 2) VE3_CASE(4, 2) VE3_CASE(8, 2)
+#undef VE3_CASE
+    TORCH_CHECK(false, "exl3: unsupported (bits=", bits, ", cb=", cb,
+                "). Rebuild with this combination instantiated.");
+}
+
+// Process-wide workspaces. Kept here rather than per layer so they do not count
+// against the weight budget: one activation-transform buffer and one split-k
+// accumulator serve every EXL3 layer in the model.
+at::Tensor g_ahad[16];
+at::Tensor g_acc[16];
+
+// Growing a workspace hands back a *new* allocation, which silently invalidates
+// any pointer already baked into a captured CUDA graph -- the replay then writes
+// wherever the caching allocator reassigned that block, corrupting whatever now
+// lives there. So retired buffers are kept alive (never returned to the
+// allocator), and exl3_reserve() sizes both workspaces to the model's maximum at
+// load time, before anything is captured.
+std::vector<at::Tensor> g_retired;
+
+at::Tensor& get_ws(at::Tensor* pool, int64_t numel, at::ScalarType dt,
+                   const at::Device& device, bool zeroed)
+{
+    at::Tensor& t = pool[device.index() & 15];
+    if (!t.defined() || t.numel() < numel)
+    {
+        TORCH_CHECK(
+            at::cuda::currentStreamCaptureStatusMayInitCtx() == at::cuda::CaptureStatus::None,
+            "vllm-exl3: workspace must grow (", (t.defined() ? t.numel() : 0), " -> ", numel,
+            ") during CUDA graph capture. This should not happen: call "
+            "exl3_reserve() at load time.");
+        if (t.defined()) g_retired.push_back(t);
+        auto opts = at::TensorOptions().dtype(dt).device(device);
+        t = zeroed ? at::zeros({numel}, opts) : at::empty({numel}, opts);
+    }
+    return t;
+}
+
+}  // namespace
+
+namespace vllm_exl3 {
+
+// Defined in hadamard.cu.
+void exl3_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh);
+
+// Size both workspaces for the largest forward this model can issue, so that
+// nothing reallocates once CUDA graphs start being captured.
+void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t n,
+                  int64_t groups)
+{
+    const at::cuda::OptionalCUDAGuard guard(like.device());
+    int64_t fused = groups * max_tokens * k;
+    if (fused > FUSE_MAX_ELEMS) fused = FUSE_MAX_ELEMS;
+    int64_t ahad = std::max<int64_t>(max_tokens * k, fused);
+    get_ws(g_ahad, ahad, at::kHalf, like.device(), false);
+
+    // The split-k accumulator is only touched when the shape actually splits,
+    // which needs the layer to be block-starved. A wide output (lm_head, with
+    // n=248k, is 1940 blocks) never splits, so reserving max_tokens*n there
+    // would burn gigabytes on a buffer nothing ever writes. Reserve for the
+    // largest batch that genuinely splits, and nothing if none does.
+    const int bits_ub = 8;  // more bits -> more weight bytes -> larger split cap
+    int64_t acc_elems = 0;
+    for (int64_t m = 1; m <= max_tokens; m = (m < 8 ? m + 1 : m * 2))
+        if (pick_split((int) m, (int) k, (int) n, bits_ub, pick_bm((int) m), true) > 1)
+            acc_elems = std::max<int64_t>(acc_elems, m * n);
+    if (acc_elems) get_ws(g_acc, acc_elems, at::kFloat, like.device(), true);
+}
+
+at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
+                       const at::Tensor& suh, const at::Tensor& svh,
+                       at::IntArrayRef group_n, int64_t cb, bool split_k)
+{
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    TORCH_CHECK(trellis.is_contiguous(), "exl3_linear: trellis must be contiguous");
+    TORCH_CHECK(trellis.dim() == 3, "exl3_linear: trellis must be 3-D");
+    TORCH_CHECK(suh.dim() == 2, "exl3_linear: suh must be (groups, k)");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
+                "exl3_linear: activations must be float16 or bfloat16");
+
+    const int k = (int) x.size(-1);
+    const int m = (int) (x.numel() / k);
+    const int n_tiles_full = (int) trellis.size(1);
+    const int n_total = n_tiles_full * 16;
+    const int bits = (int) trellis.size(2) / 16;
+    const int groups = (int) group_n.size();
+
+    TORCH_CHECK((int) suh.size(0) == groups, "exl3_linear: suh has ", suh.size(0),
+                " rows for ", groups, " shards");
+    TORCH_CHECK((int) suh.size(1) == k, "exl3_linear: suh k mismatch");
+    TORCH_CHECK((int) trellis.size(0) * 16 == k, "exl3_linear: trellis k mismatch");
+    TORCH_CHECK(svh.numel() == n_total, "exl3_linear: svh size mismatch");
+    TORCH_CHECK(k % BK_ == 0, "exl3_linear: k must be a multiple of ", BK_);
+    TORCH_CHECK(groups >= 1 && groups <= 8, "exl3_linear: 1..8 shards supported");
+
+    auto out_sizes = x.sizes().vec();
+    out_sizes.back() = n_total;
+    at::Tensor out = at::empty(out_sizes, x.options());
+    if (m == 0) return out;
+
+    // Every shard boundary must land on a BN-wide block for one launch to cover
+    // them all; otherwise fall back to running the shards in sequence.
+    bool aligned = true;
+    int64_t sum = 0;
+    for (int g = 0; g < groups; ++g)
+    {
+        if (group_n[g] % BN_) aligned = false;
+        sum += group_n[g];
+    }
+    TORCH_CHECK(sum == n_total, "exl3_linear: shard widths sum to ", sum, ", expected ",
+                n_total);
+
+    const bool fuse =
+        groups == 1 || (aligned && (int64_t) groups * m * k <= FUSE_MAX_ELEMS);
+    const int64_t ahad_elems = (fuse ? (int64_t) groups : 1) * m * k;
+
+    at::Tensor& ahad = get_ws(g_ahad, ahad_elems, at::kHalf, x.device(), false);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const uint16_t* B = (const uint16_t*) trellis.data_ptr();
+    const half* S = (const half*) svh.data_ptr();
+    auto x2 = x.view({m, k});
+
+    auto run = [&](int n_off, int n_size, ShardMap smap, const at::Tensor& suh_rows) {
+        at::Tensor ahad_view = ahad.narrow(0, 0, (int64_t) smap.n_groups * m * k);
+        exl3_had_in(x2, ahad_view, suh_rows);
+
+        int split = pick_split(m, k, n_size, bits, pick_bm(m), split_k);
+        float* acc = nullptr;
+        if (split > 1)
+        {
+            at::Tensor& a = get_ws(g_acc, (int64_t) m * n_total, at::kFloat, x.device(), true);
+            acc = (float*) a.data_ptr();
+        }
+        const half* A = (const half*) ahad.data_ptr();
+        if (x.scalar_type() == at::kHalf)
+            dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, m, k, n_size,
+                                n_total, n_off, n_tiles_full, acc, split, smap, stream);
+        else
+            dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
+                                         m, k, n_size, n_total, n_off, n_tiles_full, acc,
+                                         split, smap, stream);
+    };
+
+    if (fuse)
+    {
+        ShardMap smap{};
+        smap.n_groups = groups;
+        int acc_blk = 0;
+        for (int g = 0; g < groups; ++g)
+        {
+            acc_blk += (int) (group_n[g] / BN_);
+            smap.nblk_end[g] = acc_blk;
+        }
+        run(0, n_total, smap, suh);
+    }
+    else
+    {
+        int64_t off = 0;
+        for (int g = 0; g < groups; ++g)
+        {
+            ShardMap smap{};
+            smap.n_groups = 1;
+            smap.nblk_end[0] = (int) (group_n[g] / BN_);
+            run((int) off, (int) group_n[g], smap, suh.narrow(0, g, 1));
+            off += group_n[g];
+        }
+    }
+    return out;
+}
+
+}  // namespace vllm_exl3
