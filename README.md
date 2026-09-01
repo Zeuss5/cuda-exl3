@@ -360,7 +360,7 @@ block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
 m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
 free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
 
-Six things were tried and rejected against measurement:
+Seven things were tried and rejected against measurement:
 
 * **Hoisting the dequant's index arithmetic** out of the inner loop. `dq4`
   recomputes bit indices per call including a `% 48` (non-power-of-two, so a
@@ -409,6 +409,21 @@ Six things were tried and rejected against measurement:
   1211.6 -> 1196.2, c=1 and c=64 a wash). This is the same wall the fused
   epilogue hit from the other side. Kept behind the knob, and covered by tests
   so it cannot rot, because the trade-off is hardware-dependent.
+
+* **Fusing the input transform into the gemm prologue.** At decode `exl3_had_in`
+  is ~2.3 us to move ~100 KB -- about 0.06 us of actual traffic -- and it is 4.7%
+  of decode GPU time across ~160 launches per step. Since the gemm re-reads A
+  once per n-block either way, building A in the prologue looked free: same
+  traffic, minus a launch and a global round trip. Implemented with BK=128, so a
+  pipeline stage is exactly one Hadamard block, writing straight into the swizzled
+  shared layout (`had128_warp_in_swz`). Correct to 8.4e-5 across 54 shape/dtype
+  combinations, and much slower: `q_proj` m=16 24.8 -> 33.0 us, m=32 33.0 -> 63.7,
+  `up_proj` m=32 41.2 -> 83.5. The traffic argument was right and irrelevant. What
+  it missed is that the A copy is a `cp.async` that overlaps with the previous
+  stage's mma, while the fused version is a synchronous chain of warp shuffles
+  sitting on the pipeline's critical path -- and it runs once per n-block (96x for
+  `q_proj`) instead of once per layer. A separate kernel does the transform once
+  and lets `cp.async` hide the read; that is worth more than the launch it costs.
 
 At large batch the kernel now runs at **81% of peak MMA throughput**, issuing 6.5
 non-MMA instructions per MMA -- 827M ALU+FMA against 178M tensor instructions at
