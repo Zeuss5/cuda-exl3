@@ -241,7 +241,19 @@ and rejected against measurement:
   alignment the 58-bit window crosses three 32-bit words, so two loads cannot
   cover it. ExLlamaV3's `dq4` x2 for 6 bits is correct.
 
-The remaining idea with real headroom is fp16 accumulation, which would halve the
-accumulator registers and allow BM=256, so each dequantized weight feeds twice
-the MMA work. It costs accuracy (the current relative error is ~3e-4) and drops
-to 1 block/SM, so it needs measuring before adoption.
+* **fp16 accumulation** (`VLLM_EXL3_FP16_ACC=1`, opt-in, off by default). Halving
+  the accumulator registers affords BM=256 and so twice the MMA work per
+  dequantized weight -- the obvious lever against the issue pressure above. It
+  does not pay off: BM=256 needs 145 registers and 69 KB of shared, which drops
+  occupancy to 1 block/SM and cancels the gain (8192-row `q_proj` 3518 -> 3599 us;
+  512-row `down_proj` regressed 403 -> 694 us). Relative error rose 8-16x at the
+  same time (3.5e-4 -> 2.6e-3, and 4.9e-3 on `down_proj`, where k=17408 gives the
+  most accumulation steps). Left in as a flag so the result does not get
+  re-derived. Note there is no bf16 accumulator to try instead -- bf16 mma inputs
+  always accumulate to fp32.
+
+So the kernel is at the practical ceiling of this design. Beating it further
+means a different structure -- e.g. decoding the trellis into shared memory once
+per block and feeding several M tiles from it, or the low-precision tensor cores
+(fp8 / nvfp4), which would need the dequant to target those formats rather than
+fp16.

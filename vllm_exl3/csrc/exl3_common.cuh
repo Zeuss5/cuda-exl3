@@ -24,6 +24,7 @@ struct Vec
 using FragA = Vec<half2, 4>;   // 16x16 A fragment
 using FragB = Vec<half2, 2>;   // 16x8  B fragment
 using FragC = Vec<float, 4>;   // 16x8  fp32 accumulator
+using FragC_h = Vec<half2, 2>; // 16x8  fp16 accumulator (half the registers)
 
 union half2_uint32
 {
@@ -56,6 +57,22 @@ __device__ __forceinline__ void mma_m16n8k16(const FragA& a, const FragB& b, Fra
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]));
+}
+
+// fp16-accumulate variant. Note there is no bf16 accumulator for mma: bf16
+// inputs always accumulate to fp32. fp16 in / fp16 out is the only form that
+// actually halves the accumulator register cost, which is what buys a larger M
+// tile (and so more MMA work per dequantized weight).
+__device__ __forceinline__ void mma_m16n8k16_h(const FragA& a, const FragB& b, FragC_h& c)
+{
+    const uint32_t* A = reinterpret_cast<const uint32_t*>(&a);
+    const uint32_t* B = reinterpret_cast<const uint32_t*>(&b);
+    uint32_t* C = reinterpret_cast<uint32_t*>(&c);
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(C[0]), "+r"(C[1])
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]));
 }
 

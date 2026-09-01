@@ -24,6 +24,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
@@ -44,6 +45,68 @@ struct ShardMap
 {
     int nblk_end[8];
     int n_groups;
+};
+
+// Accumulator policy.
+//
+// MEASURED AND REJECTED (kept opt-in so the result is not re-derived): fp16
+// accumulation halves the accumulator registers, which affords BM=256 and so
+// twice the MMA work per dequantized weight -- the obvious lever against this
+// kernel's dequant-vs-MMA issue pressure. It does not pay off. BM=256 needs 145
+// registers and 69 KB of shared, dropping to 1 block/SM, and that occupancy loss
+// cancels the gain exactly: 8192-row q_proj went 3518 -> 3599 us, and 512-row
+// down_proj regressed 403 -> 694 us. Relative error meanwhile rose 8-16x
+// (3.5e-4 -> 2.6e-3, and 4.9e-3 on down_proj where k=17408 gives the most
+// accumulation steps). fp32 accumulation stays the default.
+//
+// (There is no bf16 accumulator to try instead: bf16 mma inputs always
+// accumulate to fp32.)
+template <bool H_ACC>
+struct Acc;
+
+template <>
+struct Acc<false>
+{
+    using T = FragC;
+    __device__ __forceinline__ static void zero(T& c)
+    {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) c[i] = 0.0f;
+    }
+    __device__ __forceinline__ static void mma(const FragA& a, const FragB& b, T& c)
+    {
+        mma_m16n8k16(a, b, c);
+    }
+    __device__ __forceinline__ static half geth(const T& c, int i)
+    {
+        return __float2half(c[i]);
+    }
+    __device__ __forceinline__ static float getf(const T& c, int i) { return c[i]; }
+};
+
+template <>
+struct Acc<true>
+{
+    using T = FragC_h;
+    __device__ __forceinline__ static void zero(T& c)
+    {
+        c[0] = __float2half2_rn(0.0f);
+        c[1] = __float2half2_rn(0.0f);
+    }
+    __device__ __forceinline__ static void mma(const FragA& a, const FragB& b, T& c)
+    {
+        mma_m16n8k16_h(a, b, c);
+    }
+    // Element i of the mma D fragment: regs pack (0,1) and (2,3).
+    __device__ __forceinline__ static half geth(const T& c, int i)
+    {
+        half2 h = c[i >> 1];
+        return (i & 1) ? __high2half(h) : __low2half(h);
+    }
+    __device__ __forceinline__ static float getf(const T& c, int i)
+    {
+        return __half2float(geth(c, i));
+    }
 };
 
 // WARP_N is the width of a warp's tile. Each 16x16 trellis tile is decoded by
@@ -99,7 +162,7 @@ struct GemmCfg
 // all 188 SMs busy. Unlike shrinking BN it adds blocks without multiplying the
 // number of times A is re-read.
 template <int BITS, int CB, int BM, int BN, int BK, int NWARPS, int STAGES, bool SPLIT,
-          typename OUT_T, int WARP_N_>
+          typename OUT_T, int WARP_N_, bool H_ACC>
 __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     const half* __restrict__ A,        // (groups, m, k), Hadamard-transformed
     const uint16_t* __restrict__ Bq,   // (k/16, n/16, 16*BITS) trellis
@@ -170,13 +233,12 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
         }
     };
 
-    FragC frag_c[Cfg::MBLK][Cfg::NBLK];
+    using A_ = Acc<H_ACC>;
+    typename A_::T frag_c[Cfg::MBLK][Cfg::NBLK];
 #pragma unroll
     for (int i = 0; i < Cfg::MBLK; ++i)
 #pragma unroll
-        for (int j = 0; j < Cfg::NBLK; ++j)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) frag_c[i][j][e] = 0.0f;
+        for (int j = 0; j < Cfg::NBLK; ++j) A_::zero(frag_c[i][j]);
 
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s)
@@ -230,7 +292,7 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
             for (int mb = 0; mb < Cfg::MBLK; ++mb)
 #pragma unroll
                 for (int nb = 0; nb < Cfg::NBLK; ++nb)
-                    mma_m16n8k16(frag_a[mb], frag_b[nb], frag_c[mb][nb]);
+                    A_::mma(frag_a[mb], frag_b[nb], frag_c[mb][nb]);
         }
     }
 
@@ -253,10 +315,10 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
                     int col = warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
                     float* p0 = sh_f + r0 * Cfg::F_STRIDE + col;
                     float* p1 = p0 + 8 * Cfg::F_STRIDE;
-                    p0[0] = frag_c[mb][nb][0];
-                    p0[1] = frag_c[mb][nb][1];
-                    p1[0] = frag_c[mb][nb][2];
-                    p1[1] = frag_c[mb][nb][3];
+                    p0[0] = A_::getf(frag_c[mb][nb], 0);
+                    p0[1] = A_::getf(frag_c[mb][nb], 1);
+                    p1[0] = A_::getf(frag_c[mb][nb], 2);
+                    p1[1] = A_::getf(frag_c[mb][nb], 3);
                 }
             }
             __syncthreads();
@@ -285,13 +347,13 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
                     int col = n_off + n0 + warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
                     if (r0 < m)
                     {
-                        atomicAdd(&acc[(size_t) r0 * ldc + col], frag_c[mb][nb][0]);
-                        atomicAdd(&acc[(size_t) r0 * ldc + col + 1], frag_c[mb][nb][1]);
+                        atomicAdd(&acc[(size_t) r0 * ldc + col], A_::getf(frag_c[mb][nb], 0));
+                        atomicAdd(&acc[(size_t) r0 * ldc + col + 1], A_::getf(frag_c[mb][nb], 1));
                     }
                     if (r0 + 8 < m)
                     {
-                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col], frag_c[mb][nb][2]);
-                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col + 1], frag_c[mb][nb][3]);
+                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col], A_::getf(frag_c[mb][nb], 2));
+                        atomicAdd(&acc[(size_t) (r0 + 8) * ldc + col + 1], A_::getf(frag_c[mb][nb], 3));
                     }
                 }
             }
@@ -314,10 +376,10 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
             int col = warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
             half* p0 = sh_c + base_row * Cfg::C_STRIDE + col;
             half* p1 = p0 + 8 * Cfg::C_STRIDE;
-            p0[0] = __float2half(frag_c[mb][nb][0]);
-            p0[1] = __float2half(frag_c[mb][nb][1]);
-            p1[0] = __float2half(frag_c[mb][nb][2]);
-            p1[1] = __float2half(frag_c[mb][nb][3]);
+            p0[0] = A_::geth(frag_c[mb][nb], 0);
+            p0[1] = A_::geth(frag_c[mb][nb], 1);
+            p1[0] = A_::geth(frag_c[mb][nb], 2);
+            p1[1] = A_::geth(frag_c[mb][nb], 3);
         }
     }
     __syncthreads();
@@ -387,6 +449,16 @@ bool raise_smem(const void* fn, int smem)
     return true;
 }
 
+// VLLM_EXL3_FP16_ACC=1 enables fp16 accumulation in the GEMM (see Acc<>).
+bool h_acc_enabled()
+{
+    static const bool v = [] {
+        const char* e = getenv("VLLM_EXL3_FP16_ACC");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
 int pick_bm(int m)
 {
     // Smallest BM that still covers the batch: BM >= m means the trellis is read
@@ -424,14 +496,15 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
     return s < 1 ? 1 : s;
 }
 
-template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_>
+template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_,
+          bool H_ACC = false>
 void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
             ShardMap smap, cudaStream_t stream)
 {
     using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK_, NW_, ST_, WARP_N_>;
     auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK_, NW_, ST_, SPLIT, OUT_T,
-                                            WARP_N_>;
+                                            WARP_N_, H_ACC>;
     raise_smem((const void*) fn, Cfg::SMEM);
     int kt_total = k / BK_;
     int kt_per_split = (kt_total + split - 1) / split;
@@ -445,6 +518,18 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
                int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
                ShardMap smap, cudaStream_t stream)
 {
+    // fp16 accumulation is opt-in and only used where it can pay for itself: no
+    // split-k (which reduces in fp32 anyway) and a batch large enough for the
+    // 256-row tile it unlocks. Partial sums are then kept in fp16, so it trades
+    // accuracy for MMA work per dequantized weight.
+    if (h_acc_enabled() && split == 1 && m > 128)
+    {
+        launch<BITS, CB, 256, false, OUT_T, 16, 3, true>(A, Bq, C, svh, m, k, n, ldc,
+                                                         n_off, n_tiles_full, acc, 1,
+                                                         smap, stream);
+        return;
+    }
+
     int bm = pick_bm(m);
     // One warp row (WARPS_M == 1) keeps each trellis tile decoded exactly once.
     // Pipeline depth trades against occupancy: the padded A tile is larger, so
