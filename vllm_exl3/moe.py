@@ -190,8 +190,25 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return p._exl3_name
 
     @property
+    def _tp_size(self) -> int:
+        return int(getattr(self.moe, "tp_size", 1) or 1)
+
+    @property
     def _tp_rank(self) -> int:
-        return int(getattr(self.moe, "tp_rank", 0) or 0)
+        # Defaulting a missing rank to 0 would make every rank load shard 0:
+        # wrong output on every rank but the first, with no error anywhere. Only
+        # tolerate that when there is genuinely one shard.
+        r = getattr(self.moe, "tp_rank", None)
+        if r is None:
+            if self._tp_size > 1:
+                raise RuntimeError(
+                    f"EXL3 {self.prefix}: cannot determine the tensor-parallel rank "
+                    f"(tp_size={self._tp_size}); vLLM's FusedMoEConfig no longer "
+                    "exposes tp_rank. Refusing to load, as guessing rank 0 would "
+                    "silently give every rank the same shard."
+                )
+            return 0
+        return int(r)
 
     def get_fused_moe_quant_config(self, layer):
         # Not using vLLM's modular kernel framework; apply() runs the whole thing.
