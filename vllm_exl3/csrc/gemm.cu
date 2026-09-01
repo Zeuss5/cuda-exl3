@@ -126,13 +126,16 @@ struct GemmCfg
     static constexpr int NBLK = WARP_N / 8;
     static constexpr int KSTEPS = BK / 16;
     static constexpr int A_COLS = BK / 8;                // int4 per A row
-    // ldmatrix reads 8 rows at one column offset. With a 64-byte row (BK=32)
-    // those 8 rows land on only 2 distinct bank groups, and no XOR swizzle can
-    // fix that because there are only 4 columns to permute. Padding the row
-    // stride by one 16-byte element makes the 8 rows hit 8 distinct banks
-    // (stride 80B -> banks 0,20,8,28,16,4,24,12), which removes the conflicts
-    // outright -- they were the kernel's single largest stall.
-    static constexpr int A_STRIDE = A_COLS + 1;
+    // ldmatrix reads 8 rows at one column offset, so those 8 rows must land on
+    // 8 distinct bank groups.
+    //
+    // With BK=64 an A row is exactly 128 B = 32 banks, and an 8-way XOR swizzle
+    // achieves that with no padding at all (this is what Marlin does). With
+    // BK=32 a row is only 64 B, giving 4 columns to permute -- not enough for 8
+    // rows, and no XOR can fix it -- so there we pad the stride by one 16-byte
+    // element instead (80 B -> banks 0,20,8,28,16,4,24,12).
+    static constexpr bool A_SWIZZLE = (A_COLS >= 8);
+    static constexpr int A_STRIDE = A_SWIZZLE ? A_COLS : A_COLS + 1;
     static constexpr int NTILES = BN / 16;               // B tiles per k step
     static constexpr int TILE_U32 = 8 * BITS;            // uint32 per 16x16 tile
     static constexpr int TILE_I4 = 2 * BITS;             // int4 per 16x16 tile
@@ -214,8 +217,9 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
             int row = i / Cfg::A_COLS;
             int c = i % Cfg::A_COLS;
             int grow = m0 + row;
+            int cw = Cfg::A_SWIZZLE ? (c ^ (row & (Cfg::A_COLS - 1))) : c;
             const int4* src = ((const int4*) A) + (size_t) grow * (k / 8) + k0 / 8 + c;
-            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + c, src, grow < m);
+            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + cw, src, grow < m);
         }
 
         // B tiles: KSTEPS x NTILES packed 16x16 trellis tiles
@@ -274,7 +278,8 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
                 int r = (lane & 7) + 8 * ((lane >> 3) & 1);
                 int R = warp_m * Cfg::WARP_M + mb * 16 + r;
                 int c = ks * 2 + (lane >> 4);
-                ldsm4(frag_a[mb], sh_a + R * Cfg::A_STRIDE + c);
+                int cw = Cfg::A_SWIZZLE ? (c ^ (R & (Cfg::A_COLS - 1))) : c;
+                ldsm4(frag_a[mb], sh_a + R * Cfg::A_STRIDE + cw);
             }
 
             FragB frag_b[Cfg::NBLK];
@@ -481,12 +486,41 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
 
     long long blocks = (long long) (n / BN_) * ((m + bm - 1) / bm);
     if (blocks <= 0) return 1;
-    int want = (int) (((long long) 2 * sms + blocks - 1) / blocks);
+    static const double target_mult = [] {
+        const char* e = getenv("VLLM_EXL3_SPLIT_TARGET");
+        return e && *e ? atof(e) : 3.0;
+    }();
+    long long target = (long long) (target_mult * sms);
+    int want = (int) ((target + blocks - 1) / blocks);
     if (want <= 1) return 1;
 
+    // Split-k's cost is the extra read-modify-write of the fp32 accumulator.
+    // Charging that against HBM weight bytes was far too conservative: on a GPU
+    // with a large L2 (128 MiB here) the accumulator is usually resident, so it
+    // is L2 traffic, not memory traffic. Discounting it by L2_GAIN when it fits
+    // was worth up to 1.5x in the m=16..256 range -- the region where the kernel
+    // is block-starved and split-k is exactly what it needs. Not free, though:
+    // treating it as free over-splits and regresses (down_proj m=128 went
+    // 101 -> 121 us), so the discount is a factor, not a bypass.
+    static const double l2_bytes = [] {
+        int v = 0;
+        cudaDeviceGetAttribute(&v, cudaDevAttrL2CacheSize, 0);
+        return v > 0 ? (double) v : 8.0 * 1024 * 1024;
+    }();
+    double acc_bytes = 4.0 * (double) m * n;
+    int by_traffic;
+    static const double budget = [] {
+        const char* e = getenv("VLLM_EXL3_SPLIT_BUDGET");
+        return e && *e ? atof(e) : 0.30;
+    }();
+    static const double l2_gain = [] {
+        const char* e = getenv("VLLM_EXL3_L2_GAIN");
+        return e && *e ? atof(e) : 2.0;
+    }();
     double weight_bytes = (double) k * n * bits / 8.0;
     double per_extra = 8.0 * (double) m * n;            // one extra RMW of acc
-    int by_traffic = 1 + (int) (0.30 * weight_bytes / per_extra);
+    double b_eff = budget * (acc_bytes < 0.25 * l2_bytes ? l2_gain : 1.0);
+    by_traffic = 1 + (int) (b_eff * weight_bytes / per_extra);
 
     int kt_total = k / BK_;
     int s = want;
@@ -497,16 +531,16 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed)
 }
 
 template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_,
-          bool H_ACC = false>
+          bool H_ACC = false, int BK = BK_>
 void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
             ShardMap smap, cudaStream_t stream)
 {
-    using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK_, NW_, ST_, WARP_N_>;
-    auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK_, NW_, ST_, SPLIT, OUT_T,
+    using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
+    auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
                                             WARP_N_, H_ACC>;
     raise_smem((const void*) fn, Cfg::SMEM);
-    int kt_total = k / BK_;
+    int kt_total = k / BK;
     int kt_per_split = (kt_total + split - 1) / split;
     dim3 grid(n / BN_, (m + BM - 1) / BM, SPLIT ? split : 1);
     fn<<<grid, Cfg::NTHREADS, Cfg::SMEM, stream>>>(A, Bq, C, svh, m, k, n, ldc, n_off,
@@ -534,19 +568,29 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
     // One warp row (WARPS_M == 1) keeps each trellis tile decoded exactly once.
     // Pipeline depth trades against occupancy: the padded A tile is larger, so
     // the biggest block tile uses one stage fewer to stay at 2 blocks/SM.
-#define VE3_BM(BM_, WN_, ST)                                                           \
+#define VE3_ONE(BM_, WN_, ST, BKT)                                                     \
+    if (split > 1)                                                                     \
+        launch<BITS, CB, BM_, true, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,      \
+                      k, n, ldc, n_off, n_tiles_full, acc, split, smap, stream);       \
+    else                                                                               \
+        launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
+                      k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream);
+
+// BK=64 borrows Marlin's shape: an A row is then exactly 128 B = 32 banks, so the
+// XOR swizzle is conflict-free with no padding at all. It needs k % 64 == 0
+// though (EXL3 only guarantees multiples of 16), so BK=32 stays as a fallback --
+// there a row is 64 B with just 4 columns to permute, and the stride is padded
+// instead.
+#define VE3_BM(BM_, WN_, ST64, ST32)                                                   \
     if (bm == BM_)                                                                     \
     {                                                                                  \
-        if (split > 1)                                                                 \
-            launch<BITS, CB, BM_, true, OUT_T, WN_, ST>(A, Bq, C, svh, m, k, n, ldc,   \
-                                 n_off, n_tiles_full, acc, split, smap, stream);       \
-        else                                                                           \
-            launch<BITS, CB, BM_, false, OUT_T, WN_, ST>(A, Bq, C, svh, m, k, n, ldc,  \
-                                 n_off, n_tiles_full, acc, 1, smap, stream);           \
+        if (k % 64 == 0) { VE3_ONE(BM_, WN_, ST64, 64) }                               \
+        else             { VE3_ONE(BM_, WN_, ST32, 32) }                               \
         return;                                                                        \
     }
-    VE3_BM(32, 16, 4) VE3_BM(64, 16, 4) VE3_BM(128, 16, 3)
+    VE3_BM(32, 16, 3, 4) VE3_BM(64, 16, 3, 4) VE3_BM(128, 16, 2, 3)
 #undef VE3_BM
+#undef VE3_ONE
 }
 
 template <typename OUT_T>
@@ -669,7 +713,7 @@ at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
     TORCH_CHECK((int) suh.size(1) == k, "exl3_linear: suh k mismatch");
     TORCH_CHECK((int) trellis.size(0) * 16 == k, "exl3_linear: trellis k mismatch");
     TORCH_CHECK(svh.numel() == n_total, "exl3_linear: svh size mismatch");
-    TORCH_CHECK(k % BK_ == 0, "exl3_linear: k must be a multiple of ", BK_);
+    TORCH_CHECK(k % 32 == 0, "exl3_linear: k must be a multiple of 32, got ", k);
     TORCH_CHECK(groups >= 1 && groups <= 8, "exl3_linear: 1..8 shards supported");
 
     auto out_sizes = x.sizes().vec();

@@ -73,14 +73,18 @@ limits. `bench/bench_gemm.py` reports achieved TFLOPS, GB/s and %SoL per shape.
 
 Qwen3.5-27B 5.5bpw, 6-bit tensors, speedup vs `exllamav3_ext.exl3_gemm`:
 
-| layer | m=16 | m=32 | m=64 | m=128 | m=256 | m=512 | m=1024 | m=2048 |
+| layer | m=16 | m=32 | m=64 | m=128 | m=256 | m=512 | m=2048 | m=8192 |
 |---|---|---|---|---|---|---|---|---|
-| `q_proj` 5120x12288 | 0.92x | 1.53x | 2.09x | 1.78x | 2.04x | 2.70x | 3.36x | 3.85x |
-| `up_proj` 5120x17408 | 0.87x | 1.52x | 1.74x | 2.27x | 2.50x | 3.24x | 3.54x | 3.62x |
-| `down_proj` 17408x5120 | 1.09x | 2.15x | 2.71x | 3.02x | 3.25x | 3.45x | 3.96x | 4.12x |
+| `q_proj` 5120x12288 | 1.11x | 1.86x | 2.43x | 2.65x | 2.59x | 3.05x | 4.28x | 4.50x |
+| `up_proj` 5120x17408 | 1.08x | 2.01x | 2.43x | 2.30x | 3.17x | 3.88x | 4.02x | 3.94x |
+| `down_proj` 17408x5120 | 1.42x | 2.71x | 3.37x | 3.66x | 4.03x | 4.26x | 4.58x | 4.98x |
 
-At m=16-32 the memory-bound shapes run at **84-98% of speed of light**;
-`up_proj` reaches 74% of the compute bound at m=2048.
+Faster at every batch size measured, and **101-128% of the roofline above** at
+m=16-32. Over 100% is not an error: that roofline charges every weight byte to
+HBM, and this GPU has a **128 MiB L2** -- a whole `q_proj` (47 MB) or `down_proj`
+(67 MB) trellis fits in it, so part of the traffic never reaches memory. The
+effective read rate at m=16 is ~1.9 TB/s against 1.52 TB/s of HBM. At m>=2048 the
+compute bound binds instead, at 71-83% (330 TFLOPS peak).
 
 ### End to end (online serving)
 
@@ -230,10 +234,31 @@ context on one GPU:
 * **Decode at 8k context** (c=16) splits ~60% GEMM, ~25% attention, ~8% GDN. The
   GEMM there is at 84-98% of the memory-bandwidth limit.
 
-`ncu` at prefill sizes: tensor pipe 70.4% active, occupancy 2 blocks/SM
+`ncu` at prefill sizes: tensor pipe 77.8% active, occupancy 2 blocks/SM
 (register-bound at 99 registers), and the dominant stall is `math_pipe_throttle`
--- the trellis dequant competes with MMA for issue slots. Two things were tried
-and rejected against measurement:
+-- the trellis dequant competes with MMA for issue slots. This is structural:
+Marlin's int4 dequant is 4 instructions for 8 weights (two `lop3`, an `hsub2`
+and an `hfma2`), while EXL3's procedural trellis codebook needs ~52 for 8 --
+**13x more ALU work per weight**. Marlin can be MMA-bound; this kernel cannot.
+
+The one thing worth stealing from Marlin *was* its tile shape. It uses BK=64 so
+an A row is exactly 128 B = 32 banks, which makes an 8-way XOR swizzle
+conflict-free with no padding (`transform_a`, `... ^ (row % 8)`). This kernel
+originally used BK=32, where a 64 B row leaves only 4 columns to permute and no
+XOR can fix it -- hence the stride padding, which cost a pipeline stage. Adopting
+BK=64 across all tiers was worth **10-26%** (tensor pipe 70.4% -> 77.8%) and
+raised the small-batch shapes to 85-112% of the memory bound.
+
+That large L2 also mis-calibrated the split-k heuristic. Its cost is an extra
+read-modify-write of the fp32 accumulator, which the original heuristic charged
+against HBM weight bytes -- but at m<=256 that accumulator is only a few MB and
+stays in L2, so it is far cheaper than modelled. Discounting it when it fits
+(`VLLM_EXL3_L2_GAIN`, default 2) unblocked split-k exactly where the kernel is
+block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
+m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
+free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
+
+Three things were tried and rejected against measurement:
 
 * A wider warp tile (WARP_N=32) at BM=128, re-evaluated after the bank-conflict
   fix changed the ldsm/dequant balance. Consistently ~3% slower; reverted.
