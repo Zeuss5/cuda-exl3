@@ -147,6 +147,35 @@ is *dequant*-bound, not memory-bound, and with two warp rows each trellis tile
 was being decoded twice. A 16-wide warp tile (one warp row) decodes each tile
 exactly once and lifted m=16-32 from ~66% to 84-98% of speed of light.
 
+## What is supported
+
+**Bitrates and codebooks: all of them.** Every EXL3 bitrate (1-8 bits, which may
+vary per tensor within one checkpoint) and all three procedural codebooks --
+`3inst`, `mcg`, `mul1` -- are instantiated. The codebook multiplier is a constant
+of the codebook id rather than per-tensor data, so the id is all the kernel
+needs. Verified end-to-end on both a 5.5bpw checkpoint (bits {5,6,7}) and a
+4.0bpw one (bits {4,6}).
+
+**Models: dense architectures that vLLM already supports.** The plugin only
+provides the EXL3 runtime -- it does not implement any model. Layers whose
+tensors are not EXL3 in the checkpoint (norms, embeddings, an unquantized vision
+tower) fall through to vLLM's normal paths untouched, so a multimodal model works
+as long as its language model is the quantized part.
+
+Two real caveats:
+
+* **Mixture-of-experts is not supported.** Fused experts need a grouped GEMM (one
+  trellis per expert, selected per token), which is a separate kernel from the
+  dense path. The plugin raises `NotImplementedError` naming the layer rather
+  than letting vLLM fall back to its unquantized MoE method and fail later with
+  an unrelated error.
+* **Module-name resolution is heuristic.** vLLM's module paths do not always
+  match the checkpoint's (Qwen3.5 is `model.language_model.layers.N` on disk but
+  `language_model.model.layers.N` in vLLM), so names are matched exactly first
+  and then with the `model`/`language_model` wrapper segments dropped. A model
+  that renames layers more aggressively than that would need a mapping entry.
+  `VLLM_EXL3_DEBUG_NAMES=1` logs what resolved and what did not.
+
 ## VRAM
 
 Exactly what ExLlamaV3 stores: `trellis` (int16), `suh`/`svh` (fp16), bias. No
@@ -290,6 +319,13 @@ m=4096. That ratio is set by the format: a procedural trellis codebook costs
 ~74 instructions per 8 weights where an int4 LUT costs 4. Issue slots are only
 ~33% occupied, so the limit is the math pipes competing with the tensor pipe,
 not instruction bandwidth.
+
+One thing tuning *did* still find: the best block-M is shape-dependent, not just
+batch-dependent. At m=128, `up_proj` (n=17408) is 16% faster with BM=64 while
+`q_proj` (n=12288) prefers BM=128 -- no static rule captures both. The kernel now
+times the three BM tiers once per distinct shape and caches the winner (skipped
+during CUDA graph capture, which cannot tolerate the syncs). That is worth
+~7-10% in the m=128..256 range.
 
 Beating it further needs a different structure, not tuning. The honest options
 are: decode the trellis into shared once per block and stream several M tiles

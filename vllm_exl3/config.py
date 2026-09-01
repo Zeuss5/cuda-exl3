@@ -349,10 +349,33 @@ class Exl3Config(QuantizationConfig):
                     return infos  # type: ignore[return-value]
         return None
 
+    def _has_exl3_under(self, prefix: str) -> bool:
+        """Any EXL3 tensor nested under this module prefix (e.g. MoE experts)."""
+        key = _normalize(prefix) + "."
+        return any(n.startswith(key) for n in self.modules_norm)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         from vllm_exl3.linear import Exl3LinearMethod
 
         infos = self.resolve(prefix)
+
+        # Mixture-of-experts layers are not implemented. vLLM silently falls back
+        # to UnquantizedFusedMoEMethod when get_quant_method returns None, which
+        # then fails deep inside weight loading with an unrelated-looking error,
+        # so fail here with the actual reason. Fused experts need a grouped GEMM
+        # (one trellis per expert, selected per token), which is a separate
+        # kernel from the dense path.
+        cls_name = type(layer).__name__
+        if cls_name in ("RoutedExperts", "FusedMoE", "SharedFusedMoE") or (
+            "MoE" in cls_name and "Method" not in cls_name
+        ):
+            if infos is not None or self._has_exl3_under(prefix):
+                raise NotImplementedError(
+                    f"EXL3: {prefix} is a mixture-of-experts layer with quantized "
+                    "experts, which vllm-exl3 does not support yet (dense layers "
+                    "only). Fused experts need a grouped EXL3 GEMM."
+                )
+            return None
 
         if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
             if infos is not None:

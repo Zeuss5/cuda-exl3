@@ -25,7 +25,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 #include "exl3_common.cuh"
@@ -466,6 +468,13 @@ bool h_acc_enabled()
 
 int pick_bm(int m)
 {
+    // Override for tuning sweeps; 0 = use the heuristic.
+    static const int forced = [] {
+        const char* e = getenv("VLLM_EXL3_FORCE_BM");
+        return e && *e ? atoi(e) : 0;
+    }();
+    if (forced) return forced;
+
     // Smallest BM that still covers the batch: BM >= m means the trellis is read
     // exactly once. Past 128 the accumulator register file binds, so larger
     // batches re-read in BM-sized passes.
@@ -547,10 +556,91 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
                                                   n_tiles_full, acc, kt_per_split, smap);
 }
 
+// ---------------------------------------------------------------------------
+// Autotuner for the block-M tier.
+//
+// Which BM wins is shape-dependent, not just batch-dependent: at m=128 up_proj
+// (n=17408) is 16% faster with BM=64 while q_proj (n=12288) prefers BM=128. A
+// static rule cannot capture that, so time the candidates once per distinct
+// shape and remember the winner. All candidates compute the same result, so
+// timing them on the real operands is safe -- the winner is simply run last.
+// ---------------------------------------------------------------------------
+
+uint64_t tune_key(int bits, int64_t cb, int m, int k, int n, bool bf16)
+{
+    uint64_t mb = 1;                       // bucket m by power of two
+    while (mb < (uint64_t) m && mb < 4096) mb <<= 1;
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t v : {(uint64_t) bits, (uint64_t) cb, mb, (uint64_t) k, (uint64_t) n,
+                       (uint64_t) bf16})
+    {
+        h ^= v;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::map<uint64_t, int>& tune_cache()
+{
+    static std::map<uint64_t, int> c;
+    return c;
+}
+
+bool tuning_enabled()
+{
+    static const bool v = [] {
+        const char* e = getenv("VLLM_EXL3_AUTOTUNE");
+        return !(e && *e == '0');
+    }();
+    return v;
+}
+
+// Runs `run(bm)` for each candidate, returns the fastest. `run` must leave the
+// output correct for whichever bm it was last called with.
+template <typename F>
+int autotune_bm(uint64_t key, int heuristic, const F& run, cudaStream_t stream)
+{
+    auto& cache = tune_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    // Never time inside graph capture: it needs syncs, and the capture would
+    // record whichever candidate ran last.
+    if (!tuning_enabled() ||
+        at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None)
+        return heuristic;
+
+    const int cands[3] = {32, 64, 128};
+    cudaEvent_t beg, end;
+    cudaEventCreate(&beg);
+    cudaEventCreate(&end);
+    int best = heuristic;
+    float best_ms = 1e30f;
+    for (int c : cands)
+    {
+        run(c);                                  // warm
+        cudaEventRecord(beg, stream);
+        for (int r = 0; r < 3; ++r) run(c);
+        cudaEventRecord(end, stream);
+        cudaEventSynchronize(end);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, beg, end);
+        if (ms < best_ms)
+        {
+            best_ms = ms;
+            best = c;
+        }
+    }
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    cache[key] = best;
+    return best;
+}
+
 template <int BITS, int CB, typename OUT_T>
 void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
                int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
-               ShardMap smap, cudaStream_t stream)
+               ShardMap smap, cudaStream_t stream, int bm_override = 0)
 {
     // fp16 accumulation is opt-in and only used where it can pay for itself: no
     // split-k (which reduces in fp32 anyway) and a batch large enough for the
@@ -564,7 +654,7 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
         return;
     }
 
-    int bm = pick_bm(m);
+    int bm = bm_override ? bm_override : pick_bm(m);
     // One warp row (WARPS_M == 1) keeps each trellis tile decoded exactly once.
     // Pipeline depth trades against occupancy: the padded A tile is larger, so
     // the biggest block tile uses one stage fewer to stay at 2 blocks/SM.
@@ -613,15 +703,29 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
 #define VE3_CASE(B_, C_)                                                        \
     if (bits == B_ && cb == C_)                                                 \
     {                                                                           \
-        launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off, n_tiles_full,  \
-                                 acc, split, smap, stream);                     \
-        if (split > 1)                                                          \
-            launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);        \
+        {                                                                       \
+            auto run = [&](int bm_) {                                           \
+                launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off,       \
+                                 n_tiles_full, acc, split, smap, stream, bm_);  \
+                if (split > 1)                                                  \
+                    launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);\
+            };                                                                  \
+            int bm = autotune_bm(tune_key(B_, C_, m, k, n,                      \
+                                          sizeof(OUT_T) == 2 && !std::is_same<OUT_T, half>::value), \
+                                 pick_bm(m), run, stream);                      \
+            run(bm);                                                            \
+        }                                                                       \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
         return;                                                                 \
     }
-    VE3_CASE(5, 2) VE3_CASE(6, 2) VE3_CASE(7, 2)
-    VE3_CASE(2, 2) VE3_CASE(3, 2) VE3_CASE(4, 2) VE3_CASE(8, 2)
+    // Every bitrate (1-8) and every EXL3 codebook: 3inst (0), mcg (1), mul1 (2).
+    // The codebook multiplier is a constant of the codebook id, not per tensor,
+    // so an id is all the kernel needs to be format-complete.
+#define VE3_ALL_BITS(C_)                                                        \
+    VE3_CASE(1, C_) VE3_CASE(2, C_) VE3_CASE(3, C_) VE3_CASE(4, C_)             \
+    VE3_CASE(5, C_) VE3_CASE(6, C_) VE3_CASE(7, C_) VE3_CASE(8, C_)
+    VE3_ALL_BITS(2) VE3_ALL_BITS(1) VE3_ALL_BITS(0)
+#undef VE3_ALL_BITS
 #undef VE3_CASE
     TORCH_CHECK(false, "exl3: unsupported (bits=", bits, ", cb=", cb,
                 "). Rebuild with this combination instantiated.");
