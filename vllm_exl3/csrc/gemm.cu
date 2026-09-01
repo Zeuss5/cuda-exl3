@@ -499,6 +499,7 @@ int pick_bm(int m)
     // Smallest BM that still covers the batch: BM >= m means the trellis is read
     // exactly once. Past 128 the accumulator register file binds, so larger
     // batches re-read in BM-sized passes.
+    if (m <= 16) return 16;
     if (m <= 32) return 32;
     if (m <= 64) return 64;
     return 128;
@@ -635,7 +636,7 @@ int autotune_bm(uint64_t key, int heuristic, const F& run, cudaStream_t stream)
         at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None)
         return heuristic;
 
-    const int cands[3] = {32, 64, 128};
+    const int cands[4] = {16, 32, 64, 128};
     cudaEvent_t beg, end;
     cudaEventCreate(&beg);
     cudaEventCreate(&end);
@@ -707,7 +708,7 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
         else             { VE3_ONE(BM_, WN_, ST32, 32) }                               \
         return;                                                                        \
     }
-    VE3_BM(32, 16, 3, 4) VE3_BM(64, 16, 3, 4) VE3_BM(128, 16, 2, 3)
+    VE3_BM(16, 16, 3, 4) VE3_BM(32, 16, 3, 4) VE3_BM(64, 16, 3, 4) VE3_BM(128, 16, 2, 3)
 #undef VE3_BM
 #undef VE3_ONE
 }

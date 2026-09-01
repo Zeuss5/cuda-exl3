@@ -261,11 +261,27 @@ Two things worth knowing if you touch this path:
   them explicitly; without that the trellis pointer goes negative and the launch
   faults.
 
-Padding each expert's run up to a whole block does waste rows when the batch is
-small and the expert count is large (256 experts, 8 routed, 32 tokens is roughly
-one token per expert). It costs less than it looks: MoE decode is bound by
-reading each *active* expert's weights, and those are read once either way -- the
-surplus is MMA work on a memory-bound kernel.
+Padding each expert's run up to a whole block wastes rows when the batch is small
+and the expert count large: with 256 experts and 8 routed, live rows are 20-32x
+the useful rows below 32 tokens. That cost is **sublinear but not free** --
+measured by varying the block size on Qwen3.5-35B-A3B:
+
+| block | c=1 | c=8 | c=32 |
+|---|---|---|---|
+| 16 | 186 tok/s | 1173 | 2684 |
+| 32 | 172 (0.92x) | 1031 (0.88x) | 2294 (0.85x) |
+| 64 | 158 (0.85x) | 848 (0.72x) | 1716 (0.64x) |
+| 128 | 123 (0.66x) | 610 (0.52x) | 1161 (0.43x) |
+
+Quadrupling the block costs ~2x, not ~4x, because weight traffic is unchanged
+(the same experts are read either way) -- the surplus is MMA work on a
+memory-bound kernel. But it is real, so the block size drops to 16 when there are
+few tokens per expert. **16 is the floor**: `mma.m16n8k16` computes 16 rows at a
+time, so no finer alignment is expressible.
+
+It costs no VRAM. The padded buffers are transient and reused by the caching
+allocator: peak activation is 1.04 GiB for the MoE model against 1.01 GiB for the
+dense one, and weights land at 17.79 GiB against a 19.58 GiB checkpoint.
 
 ## Not yet done
 

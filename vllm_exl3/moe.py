@@ -207,8 +207,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         read over more rows, but each expert's run is padded up to a whole block,
         so with few tokens per expert the padding dominates.
         """
+        import os
+
+        forced = os.environ.get("VLLM_EXL3_MOE_BLOCK_M")
+        if forced:
+            return int(forced)
+        # Measured: doubling the block costs 8-25% at low concurrency and up to
+        # 2x at block=128, because every expert's run is padded up to a whole
+        # block. Weight traffic is unchanged (the same experts are read either
+        # way), which is why the cost is sublinear rather than proportional --
+        # but it is not free, so use the smallest block until there are enough
+        # tokens per expert to fill a larger one.
         per_expert = rows / max(num_experts, 1)
-        if per_expert < 32:
+        if per_expert < 16:
+            return 16
+        if per_expert < 48:
             return 32
         return 64 if per_expert < 96 else 128
 
