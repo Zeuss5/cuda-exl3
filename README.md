@@ -162,13 +162,19 @@ tensors are not EXL3 in the checkpoint (norms, embeddings, an unquantized vision
 tower) fall through to vLLM's normal paths untouched, so a multimodal model works
 as long as its language model is the quantized part.
 
-Two real caveats:
+**Mixture-of-experts works.** Routed experts run as a grouped GEMM: vLLM's
+`moe_align_block_size` sorts the (token, expert) pairs and pads each expert's run
+to a whole row block, so every block belongs to one expert and the kernel just
+offsets the trellis by a per-block expert id. Verified on Qwen3.5-35B-A3B (256
+experts, top-8, 4-bit, `mcg` codebook), eager and under CUDA graphs.
 
-* **Mixture-of-experts is not supported.** Fused experts need a grouped GEMM (one
-  trellis per expert, selected per token), which is a separate kernel from the
-  dense path. The plugin raises `NotImplementedError` naming the layer rather
-  than letting vLLM fall back to its unquantized MoE method and fail later with
-  an unrelated error.
+The EXL3-specific part is that `suh` is per expert *and* per shard, and it lives
+inside the input Hadamard -- so the activation transform has to happen after
+routing. `exl3_moe_had_in` gathers each routed row and transforms it with its own
+expert's scales in one pass.
+
+One caveat:
+
 * **Module-name resolution is heuristic.** vLLM's module paths do not always
   match the checkpoint's (Qwen3.5 is `model.language_model.layers.N` on disk but
   `language_model.model.layers.N` in vLLM), so names are matched exactly first
@@ -240,6 +246,26 @@ through the stock vLLM parameter path. Splitting the input dim stays exact
 because the EXL3 input transform is a *block-diagonal* Hadamard over 128-element
 blocks and every split dim here is 128-divisible; `svh` and the output Hadamard
 are linear, so they commute with the all-reduce. Weights land at ~7 GiB/GPU.
+
+## MoE notes
+
+Two things worth knowing if you touch this path:
+
+* vLLM's MoE weight loader decides `is_fused = loaded_weight.dim() == 3`, i.e. it
+  treats any 3-D tensor as *all experts stacked*. An EXL3 trellis is genuinely
+  3-D **per expert**, so that heuristic slices it apart on the wrong axis, and
+  there is no hook before the decision. This module therefore installs its own
+  `load_weights`.
+* `moe_align_block_size` marks blocks belonging to no expert with `-1`, and those
+  appear inside the live row range, not only in the tail. Both MoE kernels skip
+  them explicitly; without that the trellis pointer goes negative and the launch
+  faults.
+
+Padding each expert's run up to a whole block does waste rows when the batch is
+small and the expert count is large (256 experts, 8 routed, 32 tokens is roughly
+one token per expert). It costs less than it looks: MoE decode is bound by
+reading each *active* expert's weights, and those are read once either way -- the
+surplus is MMA work on a memory-bound kernel.
 
 ## Not yet done
 

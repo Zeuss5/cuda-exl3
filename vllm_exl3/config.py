@@ -349,6 +349,20 @@ class Exl3Config(QuantizationConfig):
                     return infos  # type: ignore[return-value]
         return None
 
+    def resolve_moe(self, prefix: str) -> tuple | None:
+        """Resolve a routed-experts module to expert 0's gate/up/down tensors.
+
+        All experts of a layer share a bitrate and codebook (checked at load), so
+        one expert is enough to size the fused weights.
+        """
+        out = []
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            info = self.resolve(f"{prefix}.0.{proj}")
+            if info is None or len(info) != 1:
+                return None
+            out.append(info[0])
+        return tuple(out)
+
     def _has_exl3_under(self, prefix: str) -> bool:
         """Any EXL3 tensor nested under this module prefix (e.g. MoE experts)."""
         key = _normalize(prefix) + "."
@@ -369,11 +383,16 @@ class Exl3Config(QuantizationConfig):
         if cls_name in ("RoutedExperts", "FusedMoE", "SharedFusedMoE") or (
             "MoE" in cls_name and "Method" not in cls_name
         ):
+            moe_infos = self.resolve_moe(prefix)
+            if moe_infos is not None:
+                from vllm_exl3.moe import Exl3MoEMethod
+
+                moe_cfg = getattr(layer, "moe_config", None)
+                return Exl3MoEMethod(moe_cfg, self, *moe_infos, prefix=prefix)
             if infos is not None or self._has_exl3_under(prefix):
                 raise NotImplementedError(
-                    f"EXL3: {prefix} is a mixture-of-experts layer with quantized "
-                    "experts, which vllm-exl3 does not support yet (dense layers "
-                    "only). Fused experts need a grouped EXL3 GEMM."
+                    f"EXL3: {prefix} has quantized experts that could not be "
+                    "resolved to per-expert gate/up/down tensors."
                 )
             return None
 

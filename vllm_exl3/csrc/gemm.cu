@@ -178,7 +178,11 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     int n_tiles_full,                  // trellis dim-1 extent, i.e. the row stride
     float* __restrict__ acc,           // (m, ldc) fp32 partials, SPLIT only
     int kt_per_split,
-    ShardMap smap)
+    ShardMap smap,
+    const int* __restrict__ expert_ids,  // MoE: one expert per BM-row block
+    int64_t b_expert_stride,             // uint16 elements between experts
+    int64_t svh_expert_stride,
+    const int* __restrict__ n_rows)      // MoE: live row count, device-side
 {
     using Cfg = GemmCfg<BITS, CB, BM, BN, BK, NWARPS, STAGES, WARP_N_>;
 
@@ -205,6 +209,23 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     int grp = 0;
     while (grp + 1 < smap.n_groups && (int) blockIdx.x >= smap.nblk_end[grp]) ++grp;
     A += (size_t) grp * m * k;
+
+    // MoE: every row of a BM block belongs to the same expert (the caller pads
+    // each expert's token run out to a multiple of BM), so the expert -- and
+    // with it the weight tensor -- is uniform across the block.
+    if (expert_ids)
+    {
+        // The alignment pass sizes its output for the worst case (every expert
+        // padded out to a full block), but only reports the live row count on
+        // the device. Retire the surplus blocks immediately rather than sync to
+        // find out how many there are.
+        if (n_rows && m0 >= *n_rows) return;
+        int e = expert_ids[blockIdx.y];
+        // moe_align_block_size marks blocks that belong to no expert with -1.
+        if (e < 0) return;
+        Bq += (size_t) e * b_expert_stride;
+        svh += (size_t) e * svh_expert_stride;
+    }
 
     // ---- global -> shared staging -----------------------------------------
     auto load_stage = [&](int stage, int k0) {
@@ -543,7 +564,9 @@ template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int
           bool H_ACC = false, int BK = BK_>
 void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
-            ShardMap smap, cudaStream_t stream)
+            ShardMap smap, cudaStream_t stream, const int* expert_ids = nullptr,
+            int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
+            const int* n_rows = nullptr)
 {
     using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
     auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
@@ -553,7 +576,9 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
     int kt_per_split = (kt_total + split - 1) / split;
     dim3 grid(n / BN_, (m + BM - 1) / BM, SPLIT ? split : 1);
     fn<<<grid, Cfg::NTHREADS, Cfg::SMEM, stream>>>(A, Bq, C, svh, m, k, n, ldc, n_off,
-                                                  n_tiles_full, acc, kt_per_split, smap);
+                                                  n_tiles_full, acc, kt_per_split, smap,
+                                                  expert_ids, b_expert_stride,
+                                                  svh_expert_stride, n_rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +665,9 @@ int autotune_bm(uint64_t key, int heuristic, const F& run, cudaStream_t stream)
 template <int BITS, int CB, typename OUT_T>
 void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
                int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
-               ShardMap smap, cudaStream_t stream, int bm_override = 0)
+               ShardMap smap, cudaStream_t stream, int bm_override = 0,
+               const int* expert_ids = nullptr, int64_t b_expert_stride = 0,
+               int64_t svh_expert_stride = 0, const int* n_rows = nullptr)
 {
     // fp16 accumulation is opt-in and only used where it can pay for itself: no
     // split-k (which reduces in fp32 anyway) and a batch large enough for the
@@ -661,10 +688,12 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
 #define VE3_ONE(BM_, WN_, ST, BKT)                                                     \
     if (split > 1)                                                                     \
         launch<BITS, CB, BM_, true, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,      \
-                      k, n, ldc, n_off, n_tiles_full, acc, split, smap, stream);       \
+                      k, n, ldc, n_off, n_tiles_full, acc, split, smap, stream,        \
+                      expert_ids, b_expert_stride, svh_expert_stride, n_rows);         \
     else                                                                               \
         launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
-                      k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream);
+                      k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,            \
+                      expert_ids, b_expert_stride, svh_expert_stride);
 
 // BK=64 borrows Marlin's shape: an A row is then exactly 128 B = 32 banks, so the
 // XOR swizzle is conflict-free with no padding at all. It needs k % 64 == 0
@@ -698,7 +727,9 @@ template <typename OUT_T>
 void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T* C,
                    const half* S, int m, int k, int n, int ldc, int n_off,
                    int n_tiles_full, float* acc, int split, ShardMap smap,
-                   cudaStream_t stream)
+                   cudaStream_t stream, const int* expert_ids = nullptr,
+                   int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
+                   int force_bm = 0, const int* n_rows = nullptr)
 {
 #define VE3_CASE(B_, C_)                                                        \
     if (bits == B_ && cb == C_)                                                 \
@@ -706,11 +737,16 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
         {                                                                       \
             auto run = [&](int bm_) {                                           \
                 launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off,       \
-                                 n_tiles_full, acc, split, smap, stream, bm_);  \
+                                 n_tiles_full, acc, split, smap, stream, bm_,   \
+                                 expert_ids, b_expert_stride, svh_expert_stride, \
+                                 n_rows);                                        \
                 if (split > 1)                                                  \
                     launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream);\
             };                                                                  \
-            int bm = autotune_bm(tune_key(B_, C_, m, k, n,                      \
+            /* MoE pins BM: the caller padded each expert's rows to that block, \
+               so the grid's row tiling has to match it exactly. */             \
+            int bm = force_bm ? force_bm                                        \
+                   : autotune_bm(tune_key(B_, C_, m, k, n,                      \
                                           sizeof(OUT_T) == 2 && !std::is_same<OUT_T, half>::value), \
                                  pick_bm(m), run, stream);                      \
             run(bm);                                                            \
@@ -893,6 +929,77 @@ at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
             off += group_n[g];
         }
     }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// MoE grouped GEMM.
+//
+// Rows are pre-sorted by expert and padded to whole BM blocks, so every row of a
+// block shares an expert; the kernel just offsets the trellis and svh by that
+// expert. Split-k is off here: the block-count heuristic assumes a dense row
+// range, and MoE already has plenty of blocks from the expert dimension.
+// ---------------------------------------------------------------------------
+
+at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
+                         const at::Tensor& suh_unused, const at::Tensor& svh,
+                         const at::Tensor& expert_ids, const at::Tensor& n_rows,
+                         at::IntArrayRef group_n, int64_t cb, int64_t block_m,
+                         at::ScalarType out_dtype)
+{
+    const at::cuda::OptionalCUDAGuard guard(a_had.device());
+    TORCH_CHECK(trellis.is_contiguous() && trellis.dim() == 4,
+                "exl3_moe_gemm: trellis must be contiguous (experts, k/16, n/16, 16*bits)");
+    TORCH_CHECK(svh.dim() == 2, "exl3_moe_gemm: svh must be (experts, n)");
+
+    const int k = (int) a_had.size(-1);
+    const int rows = (int) expert_ids.size(0) * (int) block_m;
+    const int n_tiles_full = (int) trellis.size(2);
+    const int n_total = n_tiles_full * 16;
+    const int bits = (int) trellis.size(3) / 16;
+    const int groups = (int) group_n.size();
+
+    TORCH_CHECK((int) trellis.size(1) * 16 == k, "exl3_moe_gemm: trellis k mismatch");
+    TORCH_CHECK((int) svh.size(1) == n_total, "exl3_moe_gemm: svh n mismatch");
+    TORCH_CHECK(a_had.numel() >= (long long) groups * rows * k,
+                "exl3_moe_gemm: a_had holds ", a_had.numel(), " elements, need ",
+                (long long) groups * rows * k, " for ", rows, " rows");
+
+    auto opts = at::TensorOptions().dtype(out_dtype).device(a_had.device());
+    at::Tensor out = at::empty({rows, n_total}, opts);
+
+    ShardMap smap{};
+    smap.n_groups = groups;
+    int acc_blk = 0;
+    int64_t sum = 0;
+    for (int g = 0; g < groups; ++g)
+    {
+        TORCH_CHECK(group_n[g] % BN_ == 0, "exl3_moe_gemm: shard widths must be a "
+                    "multiple of ", BN_);
+        acc_blk += (int) (group_n[g] / BN_);
+        smap.nblk_end[g] = acc_blk;
+        sum += group_n[g];
+    }
+    TORCH_CHECK(sum == n_total, "exl3_moe_gemm: shard widths sum to ", sum, ", expected ",
+                n_total);
+
+    const int64_t b_stride = (int64_t) trellis.size(1) * n_tiles_full * trellis.size(3);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const half* A = (const half*) a_had.data_ptr();
+    const uint16_t* B = (const uint16_t*) trellis.data_ptr();
+    const half* S = (const half*) svh.data_ptr();
+    const int* eids = expert_ids.data_ptr<int>();
+    const int* nrows = n_rows.numel() ? n_rows.data_ptr<int>() : nullptr;
+
+    if (out_dtype == at::kHalf)
+        dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, rows, k, n_total,
+                            n_total, 0, n_tiles_full, nullptr, 1, smap, stream, eids,
+                            b_stride, n_total, (int) block_m, nrows);
+    else
+        dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
+                                     rows, k, n_total, n_total, 0, n_tiles_full, nullptr,
+                                     1, smap, stream, eids, b_stride, n_total,
+                                     (int) block_m, nrows);
     return out;
 }
 
