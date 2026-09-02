@@ -551,7 +551,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 float best_ms = 1e30f;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
-                for (int c : {16, 32, 64, 128, 256}) {
+                for (int c : {16, 32, 48, 64, 96, 128, 192, 256, 384}) {
                     for (int wd : {1, 2}) {
                         mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
                         cudaEventRecord(beg);

@@ -1,3 +1,9 @@
+"""Knob sweep for the sparse-MLA decode kernel: split size and block shape.
+
+The cache here is small enough to be L2-resident, so these numbers are the
+warm-cache case and are optimistic. For a real comparison against b12x with a
+cold cache and a fresh selection per call, use bench_mla_headtohead.py.
+"""
 import torch, itertools
 from vllm_exl3 import ops as _ops
 _ops._try_native()
@@ -38,5 +44,4 @@ for B in (1,4,16):
         except Exception: continue
         blocks=((topk+chunk-1)//chunk)*((H+15)//16)*B
         if best is None or us<best[0]: best=(us,chunk,hpb,blocks)
-    print(f"{B:>3d} {best[1]:>6d} {best[2]:>5d} {best[3]:>7d} {best[0]:>7.1f} {sol/best[0]*100:>5.1f}%"
-          f"   [b12x {'18.5' if B==1 else '19.6' if B==4 else '28.2'}]")
+    print(f"{B:>3d} {best[1]:>6d} {best[2]:>5d} {best[3]:>7d} {best[0]:>7.1f} {sol/best[0]*100:>5.1f}%")

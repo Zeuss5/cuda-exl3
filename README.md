@@ -465,25 +465,55 @@ at GLM-5.3-Flash's exact attention dimensions. What is **not** verified is a
 served model, because `Glm5Next*` is not in a released vLLM and the only build
 that has it is inside the community Docker image.
 
-Measured at GLM-5.3-Flash's decode shape (head_dim 576, v_head_dim 512,
-topk 2048, 16 heads = TP=4), CUDA-graph timed, against b12x on the same host.
-b12x rejects head_dim 512 outright (*"SM120 sparse MLA decode requires the
-GLM_NSA contract (q_head_dim=576)"*), so the comparison is at 576; our own 512
-numbers are 7.3 / 9.4 / 19.0 us:
+### Measurements
 
-| batch | b12x | ours | speedup | HBM roofline |
+Two things flatter a sparse-MLA benchmark, and both of them fooled this one
+first. GLM's latent row is 1 KB per token, so an 8k-row cache is 8 MB against a
+128 MB L2 and every read hits. And even against a large cache, replaying one
+top-k list inside a CUDA graph makes the *selected* rows L2-resident after the
+first pass. Measured that way this kernel looked like it was at 106% of the HBM
+roofline at batch 16 and comfortably ahead of b12x. It is neither.
+
+`bench/bench_mla_headtohead.py` uses a 1 GiB cache and a fresh selection for
+every call in the graph. GLM-5.3-Flash's decode shape, 16 heads (TP=4),
+topk 2048, head_dim 576 -- b12x refuses 512 outright (*"SM120 sparse MLA decode
+requires the GLM_NSA contract (q_head_dim=576)"*), so the head-to-head is at the
+padded width:
+
+| batch | b12x | ours | | ours at head_dim 512 |
 |---|---|---|---|---|
-| 1 | 18.5 us | **7.7 us** | 2.40x | 1.3 us |
-| 4 | 19.6 us | **10.0 us** | 1.96x | 5.3 us |
-| 16 | 28.2 us | **19.8 us** | 1.42x | 21.1 us |
+| 1 | 18.5 us | **7.7 us** | 2.40x | 7.1 us |
+| 4 | 19.4 us | **13.1 us** | 1.48x | 11.7 us |
+| 16 | 31.2 us | 33.6 us | 0.93x | 31.0 us |
+| 32 | 56.3 us | 60.8 us | 0.93x | 55.1 us |
 
-At batch 16 the kernel is at the roofline -- 106% of it, because the benchmark's
-cache fits in L2. Batch 1 cannot get there: filling 256 SMs needs ~256 key
-splits, and flash-decoding must write a partial output per split, so the merge
-traffic overtakes the cache read long before the machine is full. The measured
-7.7 us is within ~30% of that structural floor.
+So: a large win at the batch sizes where latency matters, and **7% behind b12x
+at batch 16 and above**, where both kernels are simply reading memory. At batch
+32 this one sustains 1242 GB/s of useful cache read; a stream copy on this card
+reaches 1461 GB/s and an `index_select` over the same scattered 1 KB rows reaches
+about 1400, so both kernels are within about 15% of what the access pattern
+allows and there is little left to win there.
 
-Four things were tried against measurement and reverted:
+Batch 1 is a different story: 307 GB/s, nowhere near the ceiling. It cannot get
+there. Filling 256 SMs needs roughly 256 key splits, and flash-decoding writes a
+partial output per split, so merge traffic overtakes the cache read long before
+the machine is full. Counting bytes at the measured optimum gives a floor around
+5 us against the 7.7 achieved, and the ceiling that floor is chasing is 1.3 us.
+Breaking it needs the partials to stop going through global memory -- thread
+block clusters and distributed shared memory would do it, and that is the one
+structural idea left unexplored here.
+
+Things that did not work, all reverted:
+
+* `cp.async.cg` instead of `.ca` to keep the streamed cache out of L1. No change
+  at batch 16, 3% worse at batch 32.
+* An L2 prefetch two tiles ahead, to raise memory-level parallelism without
+  spending the shared memory a third buffer would cost. 2% worse.
+* Sorting the selection so the gather walks the cache in order. Exactly no
+  difference -- consecutive selected rows are still hundreds of rows apart, so
+  there is no DRAM page to reuse either way.
+
+And four in the kernel itself:
 
 * **Naive vectorization of the V load.** Giving each lane a contiguous 16-dim
   slice puts lanes 32 bytes apart and reconflicts the banks. The conflict-free
