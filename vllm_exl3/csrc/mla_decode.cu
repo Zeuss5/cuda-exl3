@@ -160,12 +160,15 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const int valid = seqlens ? seqlens[b] : topk;
     const int hi = min(lo + chunk, valid);
 
-    // Q for this block's heads, staged once.
-    for (int i = tid; i < MMA_M * D; i += NTHREADS) {
-        const int r = i / D, c = i % D;
+    // Q for this block's heads, staged once, 16 bytes at a time -- one scalar
+    // half per iteration meant 36 dependent global loads before the first tile.
+    constexpr int QV = D / 8;
+    for (int i = tid; i < MMA_M * QV; i += NTHREADS) {
+        const int r = i / QV, c = (i % QV) * 8;
         const int h = h0 + r;
-        q_s[r * KS + c] = (r < hpb && h < H) ? q[((size_t) b * H + h) * D + c]
-                                             : __float2bfloat16(0.f);
+        int4 v = int4{0, 0, 0, 0};
+        if (r < hpb && h < H) v = *reinterpret_cast<const int4*>(q + ((size_t) b * H + h) * D + c);
+        *reinterpret_cast<int4*>(q_s + r * KS + c) = v;
     }
     if (tid < MMA_M) { m_s[tid] = -INFINITY; l_s[tid] = 0.f; }
 
@@ -306,62 +309,114 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         const size_t o = ((size_t) b * splits + s) * H + h0 + tid;
         part_m[o] = m_s[tid]; part_l[o] = l_s[tid];
     }
+
+    // The accumulator layout puts consecutive lanes on different heads at the
+    // same dim, so writing it straight out is 32 scattered dwords per lane. Bounce
+    // it through the (now dead) K tile instead and write coalesced rows. The 260
+    // stride keeps the staging conflict-free: at 256 every head lands on one bank.
+    constexpr int OSH = 256, OSS = OSH + 4;
+    float* osh = reinterpret_cast<float*>(k_s);
 #pragma unroll
-    for (int mt = 0; mt < MTPW; ++mt) {
-        const int mbase = (warp + mt * NWARPS) * 16;
+    for (int pass = 0; pass < DV / OSH; ++pass) {
+        __syncthreads();
 #pragma unroll
-        for (int nn = 0; nn < NT; ++nn) {
-            const int hb = nn * 8 + (lane & 3) * 2;
-            const int d0 = mbase + (lane >> 2);
+        for (int mt = 0; mt < MTPW; ++mt) {
+            const int mi = warp + mt * NWARPS;
+            if (mi / (OSH / 16) != pass) continue;
+            const int mbase = mi * 16 - pass * OSH;
 #pragma unroll
-            for (int f = 0; f < 4; ++f) {
-                const int hl = hb + (f & 1), dd = d0 + 8 * (f >> 1);
-                if (hl >= hpb || h0 + hl >= H) continue;
-                part_o[(((size_t) b * splits + s) * H + h0 + hl) * DV + dd] = acc[mt][nn][f];
+            for (int nn = 0; nn < NT; ++nn) {
+                const int hb = nn * 8 + (lane & 3) * 2, d0 = mbase + (lane >> 2);
+#pragma unroll
+                for (int f = 0; f < 4; ++f)
+                    osh[(hb + (f & 1)) * OSS + d0 + 8 * (f >> 1)] = acc[mt][nn][f];
             }
+        }
+        __syncthreads();
+        for (int i = tid; i < MMA_M * OSH; i += NTHREADS) {
+            const int hl = i / OSH, d = i % OSH;
+            if (hl >= hpb || h0 + hl >= H) continue;
+            part_o[(((size_t) b * splits + s) * H + h0 + hl) * DV + pass * OSH + d] =
+                osh[hl * OSS + d];
         }
     }
 }
 
 // Merge the per-split partials. Standard log-sum-exp combine: rescale each
 // split's output by exp(m_s - m*) and divide by the summed weight.
-// One block per (batch, head, slice of the output dims). Sixteen blocks -- one
-// per head -- left 188 SMs almost idle and cost 6.8 us of a 28.7 us call, which
-// is a quarter of the kernel spent merging a few kilobytes.
-template <int DV, int DIMS_PER_BLOCK>
-__global__ void mla_decode_reduce_kernel(
+//
+// The merge is small -- a megabyte at batch 1 -- but it was costing as much as
+// the attention itself, for three reasons: every thread rescanned the whole
+// per-split max/sum before doing any output work, exp(m_s - m*) was recomputed
+// once per output dim instead of once per split, and 64-thread blocks left the
+// machine mostly idle. Now the weights are computed once into shared, and the
+// split axis is spread over SG thread groups so there are SG independent loads
+// in flight per output element.
+template <int DV, int DIMS, int SG>
+__global__ __launch_bounds__(DIMS* SG) void mla_decode_reduce_kernel(
     const float* __restrict__ part_o, const float* __restrict__ part_m,
     const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
     int H, int splits)
 {
+    constexpr int NT = DIMS * SG;
     const int h = blockIdx.x;
     const int b = blockIdx.y;
-    const int d0 = blockIdx.z * DIMS_PER_BLOCK;
-    const int lane = threadIdx.x;
+    const int d0 = blockIdx.z * DIMS;
+    const int tid = threadIdx.x;
+    const int di = tid % DIMS, sg = tid / DIMS;
 
-    float m_all = -INFINITY;
-    for (int s = 0; s < splits; ++s)
-        m_all = fmaxf(m_all, part_m[((size_t) b * splits + s) * H + h]);
+    extern __shared__ __align__(16) char red_raw[];
+    float* w = reinterpret_cast<float*>(red_raw);       // splits
+    float* red = w + splits;                            // SG x DIMS
+    __shared__ float xchg[NT / 32];
+    __shared__ float m_all, inv;
+
+    float mx = -INFINITY;
+    for (int s = tid; s < splits; s += NT)
+        mx = fmaxf(mx, part_m[((size_t) b * splits + s) * H + h]);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+    if ((tid & 31) == 0) xchg[tid >> 5] = mx;
+    __syncthreads();
+    if (tid == 0) {
+        float t = xchg[0];
+        for (int i = 1; i < NT / 32; ++i) t = fmaxf(t, xchg[i]);
+        m_all = t;
+    }
+    __syncthreads();
+
     if (!isfinite(m_all)) {                       // no keys landed here
-        for (int d = d0 + lane; d < d0 + DIMS_PER_BLOCK; d += blockDim.x)
-            out[((size_t) b * H + h) * DV + d] = __float2bfloat16(0.f);
+        if (sg == 0) out[((size_t) b * H + h) * DV + d0 + di] = __float2bfloat16(0.f);
         return;
     }
 
-    float l_all = 0.f;
-    for (int s = 0; s < splits; ++s) {
+    float ls = 0.f;
+    for (int s = tid; s < splits; s += NT) {
         const size_t base = ((size_t) b * splits + s) * H + h;
-        l_all += part_l[base] * __expf(part_m[base] - m_all);
+        const float e = __expf(part_m[base] - m_all);
+        w[s] = e;
+        ls += part_l[base] * e;
     }
-    const float inv = l_all > 0.f ? 1.f / l_all : 0.f;
+#pragma unroll
+    for (int off = 16; off; off >>= 1) ls += __shfl_xor_sync(0xffffffff, ls, off);
+    if ((tid & 31) == 0) xchg[tid >> 5] = ls;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int i = 0; i < NT / 32; ++i) t += xchg[i];
+        inv = t > 0.f ? 1.f / t : 0.f;
+    }
+    __syncthreads();
 
-    for (int d = d0 + lane; d < d0 + DIMS_PER_BLOCK; d += blockDim.x) {
-        float v = 0.f;
-        for (int s = 0; s < splits; ++s) {
-            const size_t base = ((size_t) b * splits + s) * H + h;
-            v += part_o[base * DV + d] * __expf(part_m[base] - m_all);
-        }
-        out[((size_t) b * H + h) * DV + d] = __float2bfloat16(v * inv);
+    float v = 0.f;
+    for (int s = sg; s < splits; s += SG)
+        v += part_o[(((size_t) b * splits + s) * H + h) * DV + d0 + di] * w[s];
+    red[sg * DIMS + di] = v;
+    __syncthreads();
+    if (sg == 0) {
+#pragma unroll
+        for (int t = 1; t < SG; ++t) v += red[t * DIMS + di];
+        out[((size_t) b * H + h) * DV + d0 + di] = __float2bfloat16(v * inv);
     }
 }
 
@@ -501,9 +556,10 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
         H, topk, splits, chunk, (float) scale, hpb);
 
-    constexpr int RED_DIMS = 64;
-    mla_decode_reduce_kernel<512, RED_DIMS>
-        <<<dim3(H, B, 512 / RED_DIMS), 64, 0, stream>>>(
+    constexpr int RED_DIMS = 64, RED_SG = 4;
+    const size_t red_smem = ((size_t) splits + RED_SG * RED_DIMS) * sizeof(float);
+    mla_decode_reduce_kernel<512, RED_DIMS, RED_SG>
+        <<<dim3(H, B, 512 / RED_DIMS), RED_DIMS * RED_SG, red_smem, stream>>>(
         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
         (__nv_bfloat16*) out.data_ptr(), H, splits);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

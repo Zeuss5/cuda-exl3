@@ -41,7 +41,7 @@ def build(batch, heads, seq_len, dtype=torch.bfloat16):
                         cache_seqlens_int32=sl, nsa_cache_seqlens_int32=sl)
     return binding, q, kv, pt, sl
 
-def tm(f, reps=50):
+def tm(f, reps=50, inner=20):
     """GPU time only.
 
     The planned API does real host work per call (validation, scratch
@@ -59,7 +59,7 @@ def tm(f, reps=50):
     torch.cuda.current_stream().wait_stream(s_)
     torch.cuda.synchronize()
     with torch.cuda.graph(g):
-        f()
+        for _ in range(inner): f()
     torch.cuda.synchronize()
     for _ in range(5): g.replay()
     torch.cuda.synchronize()
@@ -67,7 +67,7 @@ def tm(f, reps=50):
     beg.record()
     for _ in range(reps): g.replay()
     end.record(); torch.cuda.synchronize()
-    return beg.elapsed_time(end) / reps * 1000
+    return beg.elapsed_time(end) / reps / inner * 1000
 
 print(f"supported on this device: {sm.is_supported(dev)}")
 print(f"\nGLM sparse-MLA decode, head_dim={HEAD_DIM} topk={TOPK} heads={HEADS_TP4} (TP=4)")
