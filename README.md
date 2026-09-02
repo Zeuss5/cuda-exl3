@@ -482,10 +482,10 @@ padded width:
 
 | batch | b12x | ours | | ours at head_dim 512 | GB/s |
 |---|---|---|---|---|---|
-| 1 | 18.5 us | **7.6 us** | 2.43x | 7.1 us | 312 |
-| 4 | 19.4 us | **13.1 us** | 1.48x | 11.6 us | 721 |
-| 16 | 31.2 us | 31.4 us | 0.99x | 28.9 us | 1202 |
-| 32 | 56.4 us | **55.9 us** | 1.01x | 50.3 us | 1351 |
+| 1 | 18.5 us | **7.4 us** | 2.50x | 7.0 us | 320 |
+| 4 | 19.4 us | **13.0 us** | 1.49x | 11.6 us | 727 |
+| 16 | 31.2 us | 31.4 us | 0.99x | 28.9 us | 1201 |
+| 32 | 56.3 us | **55.9 us** | 1.01x | 50.1 us | 1352 |
 
 So: a large win at the batch sizes where latency matters, and parity at batch 16
 and above, where both kernels are simply reading memory. At batch 32 this one
@@ -498,11 +498,11 @@ split axis; at 11 splits, spreading over 32 split groups left two thirds of
 every block idle and still paid for the cross-group reduce. Sizing the split
 axis to the actual split count is worth 8% end to end at batch 32.
 
-Batch 1 is a different story: 312 GB/s, nowhere near the ceiling. It cannot get
+Batch 1 is a different story: 320 GB/s, nowhere near the ceiling. It cannot get
 there. Filling 256 SMs needs roughly 256 key splits, and flash-decoding writes a
 partial output per split, so merge traffic overtakes the cache read long before
 the machine is full. Counting bytes at the measured optimum gives a floor around
-5 us against the 7.6 achieved, and the ceiling that floor is chasing is 1.3 us.
+5 us against the 7.4 achieved, and the ceiling that floor is chasing is 1.3 us.
 Breaking it needs the partials to stop going through global memory -- thread
 block clusters and distributed shared memory would do it, and that is the one
 structural idea left unexplored here.
@@ -526,9 +526,12 @@ And four in the kernel itself:
   local memory. bf16 to fp32 is a 16-bit shift; do that instead.
 * **Double buffering the obvious way**, before Q moved to registers: 60 KB of
   shared drops the SM to one block and costs more than the prefetch saves.
-* **Splitting heads across blocks** for parallelism, which was worth it when
-  the inner loop was an FMA chain. The mma tile is 16 heads wide, so a narrower
-  group just wastes half of every instruction.
+* **Splitting heads across blocks** as the *only* source of parallelism, which
+  was right when the inner loop was an FMA chain. The mma tile is 16 heads wide,
+  so a narrower group wastes half of every instruction -- but at batch 1, where
+  the kernel is latency-bound rather than bandwidth-bound, that waste is cheaper
+  than idle SMs, so the autotuner still keeps a half-group shape and picks it
+  there (3%).
 
 ## MoE notes
 

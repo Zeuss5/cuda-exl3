@@ -576,7 +576,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
                 for (int c : {16, 32, 48, 64, 96, 128, 192, 256, 384}) {
-                    for (int wd : {1, 2}) {
+                    for (int wd : {1, 2, 3, 4}) {
                         mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
                         cudaEventRecord(beg);
                         for (int r = 0; r < 3; ++r)
@@ -598,7 +598,11 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // buffer and a costlier reduce. Splitting *heads* costs nothing -- their
     // outputs are disjoint -- at the price of re-reading K once per head group.
     // The mma tile is 16 heads wide, so that is the only useful group size.
-    const int hpb = std::min(H, 16);
+    // Codes 3 and 4 halve the head group. That wastes half of every mma, but at
+    // batch 1 the kernel is nowhere near bandwidth-bound and the extra blocks
+    // cost nothing but a second read of the cache -- the partial write, which is
+    // the expensive part, is per head and so unchanged.
+    const int hpb = std::min(H, (wide >= 3 && H >= 16) ? 8 : 16);
     const int hgroups = (H + hpb - 1) / hpb;
 
     const int splits = (topk + chunk - 1) / chunk;
@@ -634,9 +638,9 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
 
     dim3 grid(splits, hgroups, B);
     if (D == 576) {
-        if (wide >= 2) { MLA_LAUNCH(576, 16, 32); } else { MLA_LAUNCH(576, 8, 16); }
+        if (wide == 2 || wide == 4) { MLA_LAUNCH(576, 16, 32); } else { MLA_LAUNCH(576, 8, 16); }
     } else {
-        if (wide >= 2) { MLA_LAUNCH(512, 16, 32); } else { MLA_LAUNCH(512, 8, 16); }
+        if (wide == 2 || wide == 4) { MLA_LAUNCH(512, 16, 32); } else { MLA_LAUNCH(512, 8, 16); }
     }
 #undef MLA_LAUNCH
 

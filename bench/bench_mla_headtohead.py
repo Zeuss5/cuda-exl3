@@ -65,7 +65,7 @@ def gather_ceiling(kv, batch, sels):
 def bench_ours(kv, q, sels, seqlens):
     d = kv.shape[1]
     best = None
-    for chunk, wide in itertools.product((16, 32, 48, 64, 96, 128, 192, 256), (1, 2)):
+    for chunk, wide in itertools.product((16, 32, 48, 64, 96, 128, 192, 256), (1, 2, 3, 4)):
         us = graph_us([
             (lambda s=s, c=chunk, w=wide: torch.ops.vllm_exl3_C.mla_decode(
                 q, kv, s, seqlens, 1.0 / d**0.5, DV, c, w))
