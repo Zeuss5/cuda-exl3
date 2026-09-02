@@ -376,10 +376,10 @@ but it quantizes *only* the routed experts (`scope: glm53_routed_experts_only`),
 leaving attention, the shared experts and the head in bf16. 45 layers, 288
 experts, top-8, MLA with `qk_rope_head_dim: 0`.
 
-The model definition and its sparse-MLA attention are **not ours**: `Glm5Next*`
-is upstream Apache-2.0 vLLM (shipping in a pre-release, not yet on PyPI), and
-the SM120 sparse-MLA backend that makes it run at `pe_dim=0` is b12x. This
-plugin supplies the EXL3 quantization only. Stock vLLM cannot serve this model
+The model definition is **not ours**: `Glm5Next*` is upstream Apache-2.0 vLLM
+(shipping in a pre-release, not yet on PyPI). The sparse-MLA decode kernel now
+is (see below); the rest of the SM120 sparse-MLA path that makes the model run
+at `pe_dim=0` is still b12x. Stock vLLM cannot serve this model
 on SM120 by any configuration: the sparse path wants `fp8_ds_mla` (which asserts
 `pe_dim == 64`), and forcing dense MLA with `index_topk: null` then fails with
 no MLA prefill backend for `(qk_nope 256, rope 0, v 256)`.
@@ -402,6 +402,64 @@ Two measurement traps, both of which cost real time here: a random-token dataset
 like a regression, and counting *stream chunks* rather than the server's token
 count undercounts speculative decode by ~3x. Use a realistic prompt and
 `stream_options: {include_usage: true}`.
+
+## Sparse-MLA decode
+
+`torch.ops.vllm_exl3_C.mla_decode` is a fused sparse-MLA decode kernel written
+for SM120. MLA shares one latent row across every query head, so a decode step
+reads `topk x head_dim` of cache no matter how many heads there are; that read
+is the roofline and everything above it is the kernel's own overhead.
+
+Both matmuls run on tensor cores, using nothing newer than `mma.m16n8k16` and
+`cp.async` -- no wgmma, no TMA, no datacenter-only instruction -- so the same
+source targets the RTX PRO 6000 and the DGX Spark.
+
+* `S = Q @ K^T` is an mma with **m = 16 heads exactly** (GLM's head count at
+  TP=4), and `row.col` wants B stored `[n][k] = [key][dim]`, which is already
+  the cache layout. No transpose.
+* `O += P @ V` is a second mma with the roles rotated -- m = dim, n = head,
+  k = key -- so V comes out of shared through a transposing `ldmatrix` and P,
+  produced `[head][key]`, is the B fragment as-is.
+* Softmax runs once per tile rather than once per key. That is what makes the
+  second mma possible (an accumulator can only be rescaled between mmas), and
+  it drops the rescale count by a factor of the tile on its own.
+* Q occupies `16 x KS` halves and a K tile occupies `TILE x KS`; at `TILE = 16`
+  those are equal, so Q is staged into the second K buffer, read out into
+  register fragments, and the buffer handed back to the pipeline. Double
+  buffering costs no shared memory.
+* The row stride is padded to `D + 8`. At the natural 576 halves the stride is
+  288 words, a multiple of 32, which puts every `ldmatrix` on the same four
+  banks; at 584 the rows step by four banks and each one covers all 32.
+* The split size and block shape are autotuned per `(batch, heads, topk)` and
+  cached, skipped during graph capture (`VLLM_EXL3_MLA_TUNE=0` to disable).
+
+Measured at GLM-5.3-Flash's decode shape (head_dim 576, v_head_dim 512,
+topk 2048, 16 heads = TP=4), CUDA-graph timed, against b12x on the same host:
+
+| batch | b12x | ours | speedup | HBM roofline |
+|---|---|---|---|---|
+| 1 | 18.5 us | **7.7 us** | 2.40x | 1.3 us |
+| 4 | 19.6 us | **10.0 us** | 1.96x | 5.3 us |
+| 16 | 28.2 us | **19.8 us** | 1.42x | 21.1 us |
+
+At batch 16 the kernel is at the roofline -- 106% of it, because the benchmark's
+cache fits in L2. Batch 1 cannot get there: filling 256 SMs needs ~256 key
+splits, and flash-decoding must write a partial output per split, so the merge
+traffic overtakes the cache read long before the machine is full. The measured
+7.7 us is within ~30% of that structural floor.
+
+Four things were tried against measurement and reverted:
+
+* **Naive vectorization of the V load.** Giving each lane a contiguous 16-dim
+  slice puts lanes 32 bytes apart and reconflicts the banks. The conflict-free
+  pattern is consecutive lanes on consecutive 16-byte chunks.
+* **`&int4` to read a loaded vector as bf16.** Taking the address spills it to
+  local memory. bf16 to fp32 is a 16-bit shift; do that instead.
+* **Double buffering the obvious way**, before Q moved to registers: 60 KB of
+  shared drops the SM to one block and costs more than the prefetch saves.
+* **Splitting heads across blocks** for parallelism, which was worth it when
+  the inner loop was an FMA chain. The mma tile is 16 heads wide, so a narrower
+  group just wastes half of every instruction.
 
 ## MoE notes
 
