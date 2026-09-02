@@ -25,7 +25,7 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
 at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                       const at::Tensor& sel, const at::Tensor& seqlens,
                       double scale, int64_t v_head_dim, int64_t split_chunk,
-                      int64_t heads_per_block);
+                      int64_t heads_per_block, double kv_scale);
 at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
                        const at::Tensor& suh, const at::Tensor& svh,
                        at::IntArrayRef group_n, int64_t cb, bool split_k);
@@ -60,7 +60,7 @@ TORCH_LIBRARY(vllm_exl3_C, m)
         "int num_tokens) -> Tensor");
     m.def(
         "mla_decode(Tensor q, Tensor kv, Tensor sel, Tensor seqlens, float scale, "
-        "int v_head_dim, int split_chunk, int heads_per_block) -> Tensor");
+        "int v_head_dim, int split_chunk, int heads_per_block, float kv_scale) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)

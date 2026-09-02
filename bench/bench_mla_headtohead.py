@@ -65,10 +65,11 @@ def gather_ceiling(kv, batch, sels):
 def bench_ours(kv, q, sels, seqlens):
     d = kv.shape[1]
     best = None
-    for chunk, wide in itertools.product((16, 32, 48, 64, 96, 128, 192, 256), (1, 2, 3, 4)):
+    for chunk, wide in itertools.product(
+            (16, 32, 48, 64, 96, 128, 192, 256), (1, 2, 3, 4)):
         us = graph_us([
             (lambda s=s, c=chunk, w=wide: torch.ops.vllm_exl3_C.mla_decode(
-                q, kv, s, seqlens, 1.0 / d**0.5, DV, c, w))
+                q, kv, s, seqlens, 1.0 / d**0.5, DV, c, w, 1.0))
             for s in sels
         ])
         if best is None or us < best[0]:
@@ -123,10 +124,14 @@ def main():
     print(f"cache {ROWS} rows, topk {TOPK}, heads {HEADS}, "
           f"{INNER} distinct selections per graph\n")
     for d in (576, 512):
-        kv = torch.randn(ROWS, d, device=DEV, dtype=torch.bfloat16) * 0.05
-        print(f"head_dim {d} ({d * ROWS * 2 / 2**30:.1f} GiB cache)")
-        print(f"{'batch':>6s} {'gather':>9s} {'ours':>9s} {'b12x':>9s} "
-              f"{'ours GB/s':>10s} {'% ceiling':>10s}")
+        f32 = torch.randn(ROWS, d, device=DEV) * 0.05
+        kv = f32.to(torch.bfloat16)
+        kv8 = (f32 / (f32.abs().max().item() / 448.0)).to(torch.float8_e4m3fn)
+        del f32
+        torch.cuda.empty_cache()
+        print(f"head_dim {d} ({d * ROWS * 2 / 2**30:.1f} GiB bf16 cache)")
+        print(f"{'batch':>6s} {'gather':>9s} {'ours':>9s} {'ours fp8':>9s} "
+              f"{'b12x':>9s} {'fp8 GB/s':>9s}")
         for batch in (1, 4, 16, 32):
             q = torch.randn(batch, HEADS, d, device=DEV, dtype=torch.bfloat16) * 0.05
             sels = [torch.randint(0, ROWS, (batch, TOPK), device=DEV,
@@ -134,12 +139,13 @@ def main():
             sl = torch.full((batch,), TOPK, device=DEV, dtype=torch.int32)
             ceil_us = gather_ceiling(kv, batch, sels)
             ours = bench_ours(kv, q, sels, sl)
+            ours8 = bench_ours(kv8, q, sels, sl)
             theirs = bench_b12x(batch, d, sels)
-            gb = batch * TOPK * d * 2 / ours[0] / 1e3
-            print(f"{batch:>6d} {ceil_us:>8.1f}u {ours[0]:>8.1f}u "
+            gb = batch * TOPK * d / ours8[0] / 1e3
+            print(f"{batch:>6d} {ceil_us:>8.1f}u {ours[0]:>8.1f}u {ours8[0]:>8.1f}u "
                   f"{('%.1fu' % theirs[0]) if theirs else '     n/a':>9s} "
-                  f"{gb:>10.0f} {ceil_us / ours[0] * 100:>9.0f}%")
-        del kv
+                  f"{gb:>9.0f}")
+        del kv, kv8
         torch.cuda.empty_cache()
         print()
 

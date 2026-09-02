@@ -60,6 +60,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <type_traits>
 #include <map>
 #include <algorithm>
 
@@ -77,6 +79,20 @@ __device__ __forceinline__ void bf16x2_f32(uint32_t u, float& a, float& b)
 // The other direction, round-to-nearest-even, packed two at a time. Done with
 // bit math rather than __float2bfloat16 so nothing has its address taken: an
 // int4 built through a pointer spills to local memory.
+// fp8 e4m3 pair -> bf16 pair. Both conversions are exact: e4m3 carries three
+// mantissa bits against bf16's seven, and its 448 maximum is far inside range.
+__device__ __forceinline__ uint32_t e4m3x2_bf16(uint32_t packed)
+{
+    uint32_t h2;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"((uint16_t) packed));
+    float lo, hi;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(lo) : "h"((uint16_t) (h2 & 0xffffu)));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(hi) : "h"((uint16_t) (h2 >> 16)));
+    const uint32_t x = __float_as_uint(lo), y = __float_as_uint(hi);
+    return ((x + 0x7fffu + ((x >> 16) & 1u)) >> 16)
+         | ((y + 0x7fffu + ((y >> 16) & 1u)) & 0xffff0000u);
+}
+
 __device__ __forceinline__ uint32_t f32x2_bf16(float a, float b)
 {
     const uint32_t x = __float_as_uint(a), y = __float_as_uint(b);
@@ -124,10 +140,10 @@ __device__ __forceinline__ float warp_sum(float v) {
 // 1152 B = 288 words, a multiple of 32, so every group of lanes reading down a
 // column would land on the same four banks -- an 8-way conflict. At 584 the rows
 // step by 4 banks and every ldmatrix covers all 32 exactly once.
-template <int D, int DV, int NWARPS, int TILE>
+template <int D, int DV, int NWARPS, int TILE, typename KT>
 __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const __nv_bfloat16* __restrict__ q,     // (B, H, D)
-    const __nv_bfloat16* __restrict__ kv,    // (rows, D) latent cache
+    const KT* __restrict__ kv,               // (rows, D) latent cache
     const int* __restrict__ sel,             // (B, topk) row ids, -1 = empty
     const int* __restrict__ seqlens,         // (B) valid entries of sel
     // (B, H, splits, DV): splits contiguous, so the merge walks them 1 KB apart
@@ -148,6 +164,15 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     constexpr int MTPW = MTILES / NWARPS;    // m-tiles per warp
     constexpr int NT = MMA_M / 8;            // PV n-tiles (heads)
     constexpr int PS = TILE + 8;             // padded P row stride
+    // An fp8 cache is read into registers, widened, and written to shared as
+    // bf16, so there is nothing for cp.async to do and only one buffer is
+    // needed; the load latency is hidden by prefetching the next tile into
+    // registers instead. The dequant scale never appears here: it folds into
+    // the softmax scale for QK and into the merged output for PV.
+    constexpr bool KV8 = !std::is_same<KT, __nv_bfloat16>::value;
+    constexpr int NBUF = KV8 ? 1 : 2;
+    constexpr int EPL = KV8 ? 16 : 8;        // cache elements per 16-byte load
+    constexpr int NPF = (TILE * (D / EPL) + NWARPS * 32 - 1) / (NWARPS * 32);
     static_assert(NTHREADS >= MMA_M * TILE, "softmax pass needs one thread per score");
     static_assert(TILE % 16 == 0, "PV mma consumes 16 keys at a time");
 
@@ -156,9 +181,9 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     // register fragments, and the buffer is handed back to the pipeline. Double
     // buffering therefore costs no shared memory at all.
     extern __shared__ __align__(16) char smem_raw[];
-    __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // 2 x TILE x KS
-    __nv_bfloat16* q_s = k_s + TILE * KS;                                 // aliases buffer 1
-    __nv_bfloat16* p_s = k_s + 2 * TILE * KS;                             // 16 x PS
+    __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // NBUF x TILE x KS
+    __nv_bfloat16* q_s = k_s + (NBUF - 1) * TILE * KS;                    // aliases a buffer
+    __nv_bfloat16* p_s = k_s + NBUF * TILE * KS;                          // 16 x PS
     float* s_s = reinterpret_cast<float*>(p_s + MMA_M * PS);              // KSL x 16 x TILE
     float* m_s = s_s + KSL * MMA_M * TILE;                                // 16
     float* l_s = m_s + MMA_M;                                             // 16
@@ -225,7 +250,8 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
                 const int row = (r < n) ? sel_s[t * TILE + r] : -1;
                 void* dst = dst_b + r * KS + c;
                 if (row >= 0) {
-                    const __nv_bfloat16* src = kv + (size_t) row * D + c;
+                    const __nv_bfloat16* src =
+                        reinterpret_cast<const __nv_bfloat16*>(kv) + (size_t) row * D + c;
                     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                                  :: "r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src));
                 } else {
@@ -236,14 +262,55 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         asm volatile("cp.async.commit_group;\n" ::);
     };
 
-    stage(0);
+    // fp8 path: 16 cache bytes per thread per slot, widened on the way to shared.
+    uint4 pf[NPF];
+    auto fetch = [&](int t) {
+#pragma unroll
+        for (int u = 0; u < NPF; ++u) {
+            const int i = tid + u * NTHREADS;
+            if (i >= TILE * (D / EPL)) break;
+            const int r = i / (D / EPL), c = (i % (D / EPL)) * EPL;
+            const int row = (t < ntiles && r < min(TILE, hi - lo - t * TILE))
+                          ? sel_s[t * TILE + r] : -1;
+            pf[u] = (row >= 0) ? *reinterpret_cast<const uint4*>(kv + (size_t) row * D + c)
+                               : uint4{0, 0, 0, 0};
+        }
+    };
+    auto widen = [&]() {
+#pragma unroll
+        for (int u = 0; u < NPF; ++u) {
+            const int i = tid + u * NTHREADS;
+            if (i >= TILE * (D / EPL)) break;
+            const int r = i / (D / EPL), c = (i % (D / EPL)) * EPL;
+            const uint32_t* w = &pf[u].x;
+            uint32_t out[8];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                out[2 * e] = e4m3x2_bf16(w[e]);
+                out[2 * e + 1] = e4m3x2_bf16(w[e] >> 16);
+            }
+            __nv_bfloat16* dst = k_s + r * KS + c;
+            *reinterpret_cast<int4*>(dst) =
+                make_int4(out[0], out[1], out[2], out[3]);
+            *reinterpret_cast<int4*>(dst + 8) =
+                make_int4(out[4], out[5], out[6], out[7]);
+        }
+    };
+
+    if constexpr (KV8) fetch(0); else stage(0);
     for (int t = 0; t < ntiles; ++t) {
         const int base = lo + t * TILE;
         const int n = min(TILE, hi - base);
-        const __nv_bfloat16* k_cur = k_s + (t & 1) * (TILE * KS);
-        stage(t + 1);
-        asm volatile("cp.async.wait_group 1;\n" ::);
-        __syncthreads();
+        const __nv_bfloat16* k_cur = k_s + (KV8 ? 0 : (t & 1) * (TILE * KS));
+        if constexpr (KV8) {
+            widen();
+            __syncthreads();
+            fetch(t + 1);
+        } else {
+            stage(t + 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+            __syncthreads();
+        }
 
         // S[16 heads][TILE keys] = Q @ K^T
         {
@@ -404,7 +471,7 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
     const __nv_bfloat16* __restrict__ part_o,   // (B, H, splits, DV)
     const float* __restrict__ part_m,           // (B, H, splits)
     const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
-    int H, int splits)
+    int H, int splits, float out_scale)
 {
     constexpr int TPG = DIMS / VEC;          // threads per split group
     static_assert(TPG <= 32, "a split group must fit in one warp");
@@ -502,7 +569,8 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
         float v = red[d];
 #pragma unroll
         for (int i = 1; i < NW; ++i) v += red[i * DIMS + d];
-        out[((size_t) b * H + h) * DV + d0 + d] = __float2bfloat16(v * inv);
+        out[((size_t) b * H + h) * DV + d0 + d] =
+            __float2bfloat16(v * inv * out_scale);
     }
 }
 
@@ -543,13 +611,20 @@ bool mla_tuning_enabled() {
 at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                       const at::Tensor& sel, const at::Tensor& seqlens,
                       double scale, int64_t v_head_dim, int64_t split_chunk,
-                      int64_t heads_per_block)
+                      int64_t heads_per_block, double kv_scale)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dim() == 3, "mla_decode: q must be (batch, heads, head_dim)");
     TORCH_CHECK(kv.dim() == 2, "mla_decode: kv must be (rows, head_dim)");
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && kv.scalar_type() == at::kBFloat16,
-                "mla_decode: q and kv must be bfloat16");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "mla_decode: q must be bfloat16");
+    const bool kv8 = kv.scalar_type() == at::kFloat8_e4m3fn;
+    TORCH_CHECK(kv.scalar_type() == at::kBFloat16 || kv8,
+                "mla_decode: kv must be bfloat16 or float8_e4m3fn");
+    // An fp8 cache stores k / kv_scale. Both matmuls are linear in it, so the
+    // scale never has to touch an element: it folds into the softmax scale for
+    // Q@K^T and into the merged output for P@V.
+    const double sscale = kv8 ? scale * kv_scale : scale;
+    const double oscale = kv8 ? kv_scale : 1.0;
     TORCH_CHECK(sel.scalar_type() == at::kInt, "mla_decode: sel must be int32");
 
     const int B = (int) q.size(0), H = (int) q.size(1), D = (int) q.size(2);
@@ -577,10 +652,10 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 cudaEventCreate(&beg); cudaEventCreate(&end);
                 for (int c : {16, 32, 48, 64, 96, 128, 192, 256, 384}) {
                     for (int wd : {1, 2, 3, 4}) {
-                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
+                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
                         cudaEventRecord(beg);
                         for (int r = 0; r < 3; ++r)
-                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
+                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
                         cudaEventRecord(end);
                         cudaEventSynchronize(end);
                         float ms = 0.f; cudaEventElapsedTime(&ms, beg, end);
@@ -624,31 +699,41 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // Two block shapes. The wide one halves the block count for the same thread
     // count, which halves both the Q re-read and the partial write: those are
     // per block, not per key, and at low batch they outweigh the cache traffic.
-#define MLA_LAUNCH(D_, NW_, TILE_)                                             \
+#define MLA_LAUNCH(D_, NW_, TILE_, KT_)                                             \
     do {                                                                       \
         constexpr int KSL_ = (NW_) / ((TILE_) / 8);                            \
-        const size_t smem = 2 * (TILE_) * ((D_) + 8) * sizeof(__nv_bfloat16)   \
+        constexpr int NBUF_ = std::is_same<KT_, __nv_bfloat16>::value ? 2 : 1; \
+        const size_t smem = NBUF_ * (TILE_) * ((D_) + 8)                       \
+                              * sizeof(__nv_bfloat16)                          \
                           + 16 * ((TILE_) + 8) * sizeof(__nv_bfloat16)         \
                           + (size_t) KSL_ * 16 * (TILE_) * sizeof(float)       \
                           + 3 * 16 * sizeof(float)                             \
                           + (size_t) chunk * sizeof(int);                      \
-        auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_>;            \
+        auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_, KT_>;       \
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,\
                              101376);                                          \
         kern<<<grid, (NW_) * 32, smem, stream>>>(                              \
             (const __nv_bfloat16*) q.data_ptr(),                               \
-            (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),         \
+            (const KT_*) kv.data_ptr(), sel.data_ptr<int>(),                   \
             seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,               \
             (__nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(),              \
-            pl.data_ptr<float>(), H, topk, splits, chunk, (float) scale, hpb); \
+            pl.data_ptr<float>(), H, topk, splits, chunk, (float) sscale,      \
+            hpb);                                                              \
     } while (0)
 
     dim3 grid(splits, hgroups, B);
+#define MLA_PICK(D_, KT_)                                                      \
+    do {                                                                       \
+        if (wide == 2 || wide == 4) { MLA_LAUNCH(D_, 16, 32, KT_); }           \
+        else { MLA_LAUNCH(D_, 8, 16, KT_); }                                   \
+    } while (0)
+
     if (D == 576) {
-        if (wide == 2 || wide == 4) { MLA_LAUNCH(576, 16, 32); } else { MLA_LAUNCH(576, 8, 16); }
+        if (kv8) { MLA_PICK(576, __nv_fp8_e4m3); } else { MLA_PICK(576, __nv_bfloat16); }
     } else {
-        if (wide == 2 || wide == 4) { MLA_LAUNCH(512, 16, 32); } else { MLA_LAUNCH(512, 8, 16); }
+        if (kv8) { MLA_PICK(512, __nv_fp8_e4m3); } else { MLA_PICK(512, __nv_bfloat16); }
     }
+#undef MLA_PICK
 #undef MLA_LAUNCH
 
     // The merge splits its 256 threads between output dims and the split axis.
@@ -666,7 +751,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
             <<<dim3(H, B, 512 / DIMS_), NT_, rsm, stream>>>(                   \
                 (const __nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(),    \
                 pl.data_ptr<float>(), (__nv_bfloat16*) out.data_ptr(), H,      \
-                splits);                                                       \
+                splits, (float) oscale);                                       \
     } while (0)
 
     if (splits >= 24) { MLA_REDUCE(32); }

@@ -11,9 +11,9 @@ metadata builder are vLLM's ``SparseMLACommonImpl`` and
 Two differences from ``FLASHINFER_MLA_SPARSE_SM120``, which is the backend this
 replaces on SM120:
 
-* The cache stays bf16 in its natural ``(slot, head_size)`` layout instead of
-  the packed 656-byte ``fp8_ds_mla`` record, so no dequantisation happens on
-  the read path and no per-block scales are stored.
+* The cache is bf16 or e4m3 fp8 in its natural ``(slot, head_size)`` layout,
+  not the packed 656-byte ``fp8_ds_mla`` record, so there are no per-block
+  scales to unpack on the read path.
 * ``head_size`` is whatever the model actually has. GLM-5.3-Flash has
   ``qk_rope_head_dim = 0`` and therefore a 512-wide latent; the kernels this
   replaces require 576 and are fed 64 zero dims per key to get there.
@@ -54,7 +54,9 @@ class Exl3MLASparseBackend(AttentionBackend):
     """Sparse MLA on SM120 with a bf16 cache."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto", "bfloat16", "fp8", "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -168,11 +170,12 @@ class Exl3MLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             raise NotImplementedError(
                 "EXL3_MLA_SPARSE only supports decoder self-attention"
             )
-        if kv_cache_dtype not in ("auto", "bfloat16"):
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
             raise NotImplementedError(
                 "EXL3_MLA_SPARSE reads the cache directly and needs it in "
-                f"bfloat16; got kv_cache_dtype={kv_cache_dtype!r}"
+                f"bfloat16 or e4m3 fp8; got kv_cache_dtype={kv_cache_dtype!r}"
             )
+        self._fp8_cache = kv_cache_dtype in ("fp8", "fp8_e4m3")
         super().__init__(
             num_heads,
             head_size,
@@ -197,6 +200,20 @@ class Exl3MLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # The kernel takes a query per token, not a fused fp8 one.
         self.supports_quant_query_input = False
         self._no_seqlens = torch.empty(0, dtype=torch.int32)
+
+    def _kv_scale(self, layer: AttentionLayer) -> float:
+        """The dequant scale for an fp8 cache, 1.0 for bf16.
+
+        It is never applied per element: both matmuls are linear in it, so the
+        kernel folds it into the softmax scale and into the merged output.
+        """
+        if not self._fp8_cache:
+            return 1.0
+        s = getattr(layer, "_k_scale_float", None)
+        if s is None:
+            k = getattr(layer, "_k_scale", None)
+            s = float(k.item()) if k is not None else 1.0
+        return float(s)
 
     def forward_mqa(
         self,
@@ -235,5 +252,6 @@ class Exl3MLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             self.kv_lora_rank,
             0,  # split_chunk: autotuned
             0,  # block shape: autotuned
+            self._kv_scale(layer),
         )
         return out, None
