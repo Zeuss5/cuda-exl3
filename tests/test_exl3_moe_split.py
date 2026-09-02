@@ -1,7 +1,8 @@
-"""MoE split-k is off by default (it does not pay off end to end -- see
-exl3_moe_gemm) but the code path is still reachable via the cap knob. These keep
-it honest: the split result must match the unsplit one, and the accumulator must
-be left zeroed so a second call does not add to stale partials.
+"""MoE split-k is on by default, gated on wave occupancy: a grid that already
+fills the machine is never split, because past one full wave the accumulator
+traffic and epilogue launch cost more than the occupancy they buy. These keep it
+honest: the split result must match the unsplit one, and the accumulator must be
+left zeroed so a second call does not add to stale partials.
 """
 import pytest
 import torch
@@ -71,5 +72,6 @@ def test_split_leaves_accumulator_zeroed(gemm, rows, block_m):
     assert (f - s).norm() / f.norm() < 1e-3
 
 
-def test_default_is_off(gemm):
-    assert int(gemm.exl3_get_moe_acc_cap()) == 0
+def test_default_is_on(gemm):
+    """Split-k is enabled; pick_split's wave gate decides per shape."""
+    assert int(gemm.exl3_get_moe_acc_cap()) > 0

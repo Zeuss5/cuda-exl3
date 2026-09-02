@@ -535,6 +535,15 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
 
     long long blocks = (long long) (n / BN_) * ((m + bm - 1) / bm);
     if (blocks <= 0) return 1;
+
+    // MoE only: never split a grid that already fills the machine. Past one
+    // full wave the extra accumulator traffic and the epilogue launch cost more
+    // than the occupancy they buy, and the two projections of one GLM layer
+    // land on opposite sides of that line -- at TP=4, w13 is 64 blocks on 188
+    // SMs (0.34 waves) and splitting takes it 27.8 -> 18.7 us, while w2 is 256
+    // blocks (1.36 waves) and splitting costs it 10.5 -> 12.7. No single split
+    // target serves both; wave occupancy is what separates them.
+    if (weight_mult > 1 && blocks >= sms) return 1;
     static const double target_mult = [] {
         const char* e = getenv("VLLM_EXL3_SPLIT_TARGET");
         return e && *e ? atof(e) : 3.0;
@@ -920,7 +929,7 @@ int64_t& moe_acc_cap_ref()
 {
     static int64_t v = [] {
         const char* e = getenv("VLLM_EXL3_MOE_ACC_MAX_ELEMS");
-        return e && *e ? (int64_t) atoll(e) : 0ll;
+        return e && *e ? (int64_t) atoll(e) : (8ll << 20);   // 32 MiB of fp32
     }();
     return v;
 }
