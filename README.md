@@ -377,9 +377,9 @@ leaving attention, the shared experts and the head in bf16. 45 layers, 288
 experts, top-8, MLA with `qk_rope_head_dim: 0`.
 
 The model definition is **not ours**: `Glm5Next*` is upstream Apache-2.0 vLLM
-(shipping in a pre-release, not yet on PyPI). The sparse-MLA decode kernel now
-is (see below); the rest of the SM120 sparse-MLA path that makes the model run
-at `pe_dim=0` is still b12x. Stock vLLM cannot serve this model
+(shipping in a pre-release, not yet on PyPI). The sparse-MLA decode kernel and
+its attention backend now are (see below); the measurements in this section
+predate that backend and were taken against b12x. Stock vLLM cannot serve this model
 on SM120 by any configuration: the sparse path wants `fp8_ds_mla` (which asserts
 `pe_dim == 64`), and forcing dense MLA with `index_topk: null` then fails with
 no MLA prefill backend for `(qk_nope 256, rope 0, v 256)`.
@@ -433,8 +433,43 @@ source targets the RTX PRO 6000 and the DGX Spark.
 * The split size and block shape are autotuned per `(batch, heads, topk)` and
   cached, skipped during graph capture (`VLLM_EXL3_MLA_TUNE=0` to disable).
 
+### Using it from vLLM
+
+`vllm_exl3.attention.Exl3MLASparseBackend` wires the kernel into vLLM as a
+sparse-MLA backend. vLLM's backends live in an enum that an out-of-tree package
+cannot add to, but `CUSTOM` is reserved for this, so the plugin binds that slot
+and you select it by name:
+
+```
+--attention-backend CUSTOM --kv-cache-dtype auto
+```
+
+Only the decode path is ours. Prefill, the top-k mask machinery and the metadata
+builder are vLLM's `SparseMLACommonImpl` and `FlashInferMLASparseMetadataBuilder`,
+untouched. Two differences from `FLASHINFER_MLA_SPARSE_SM120`:
+
+* The cache stays **bf16 in its natural `(slot, head_size)` layout** rather than
+  the packed 656-byte `fp8_ds_mla` record, so nothing is dequantised on the read
+  path and no per-block scales are stored.
+* `head_size` is whatever the model actually has. GLM's is 512; the kernels this
+  replaces require 576 and must be fed 64 zero dims per key to get there.
+
+It declines a quantised cache rather than silently misreading one, and it does
+not return an LSE, so decode-context parallelism is not supported on this path.
+
+What is verified: the kernel against an fp32 reference across head dims, head
+counts, batch sizes and top-k widths; the backend's `forward_mqa` end to end
+against a gather reference, driving vLLM's own Triton index conversion with a
+shuffled block table and `-1` holes; and construction through the real base class
+at GLM-5.3-Flash's exact attention dimensions. What is **not** verified is a
+served model, because `Glm5Next*` is not in a released vLLM and the only build
+that has it is inside the community Docker image.
+
 Measured at GLM-5.3-Flash's decode shape (head_dim 576, v_head_dim 512,
-topk 2048, 16 heads = TP=4), CUDA-graph timed, against b12x on the same host:
+topk 2048, 16 heads = TP=4), CUDA-graph timed, against b12x on the same host.
+b12x rejects head_dim 512 outright (*"SM120 sparse MLA decode requires the
+GLM_NSA contract (q_head_dim=576)"*), so the comparison is at 576; our own 512
+numbers are 7.3 / 9.4 / 19.0 us:
 
 | batch | b12x | ours | speedup | HBM roofline |
 |---|---|---|---|---|
