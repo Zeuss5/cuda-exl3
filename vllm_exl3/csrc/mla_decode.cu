@@ -60,6 +60,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <map>
 
 namespace vllm_exl3 {
 
@@ -94,7 +95,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     float* __restrict__ part_o,              // (B, splits, H, DV)
     float* __restrict__ part_m,              // (B, splits, H)
     float* __restrict__ part_l,              // (B, splits, H)
-    int H, int topk, int splits, int chunk, float scale)
+    int H, int topk, int splits, int chunk, float scale, int hpb)
 {
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);   // 2 x TILE x D
@@ -102,7 +103,9 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int s = blockIdx.x;
-    const int b = blockIdx.y;
+    const int hg = blockIdx.y;               // head group
+    const int b = blockIdx.z;
+    const int h0 = hg * hpb;                 // first head this block owns
     constexpr int NTHREADS = NWARPS * 32;
     constexpr int VPT = DV / 32;             // v dims each lane owns
 
@@ -121,7 +124,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         for (int d = 0; d < VPT; ++d) acc[i][d] = 0.f;
         // q is loop-invariant: hold this lane's slice in registers rather than
         // re-reading it from global for every key (v2 did, and paid ~2x for it).
-        const int h = warp * HPW + i;
+        const int h = h0 + warp * HPW + i;
         const __nv_bfloat16* qh = q + ((size_t) b * H + (h < H ? h : 0)) * D;
 #pragma unroll
         for (int d = 0; d < QPT; ++d) q_r[i][d] = __bfloat162float(qh[d * 32 + lane]);
@@ -187,7 +190,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             const __nv_bfloat16* k = tile + j * D;
 #pragma unroll
             for (int i = 0; i < HPW; ++i) {
-                if (warp * HPW + i >= H) break;
+                if (h0 + warp * HPW + i >= H) break;
                 const float sc = part[j][i] * scale;
                 const float m_new = fmaxf(m_run[i], sc);
                 const float corr = __expf(m_run[i] - m_new);
@@ -205,7 +208,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
 
 #pragma unroll
     for (int i = 0; i < HPW; ++i) {
-        const int h = warp * HPW + i;
+        const int h = h0 + warp * HPW + i;
         if (h >= H) break;
         const size_t base = (((size_t) b * splits + s) * H + h);
         if (lane == 0) { part_m[base] = m_run[i]; part_l[base] = l_run[i]; }
@@ -216,7 +219,10 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
 
 // Merge the per-split partials. Standard log-sum-exp combine: rescale each
 // split's output by exp(m_s - m*) and divide by the summed weight.
-template <int DV>
+// One block per (batch, head, slice of the output dims). Sixteen blocks -- one
+// per head -- left 188 SMs almost idle and cost 6.8 us of a 28.7 us call, which
+// is a quarter of the kernel spent merging a few kilobytes.
+template <int DV, int DIMS_PER_BLOCK>
 __global__ void mla_decode_reduce_kernel(
     const float* __restrict__ part_o, const float* __restrict__ part_m,
     const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
@@ -224,13 +230,14 @@ __global__ void mla_decode_reduce_kernel(
 {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
+    const int d0 = blockIdx.z * DIMS_PER_BLOCK;
     const int lane = threadIdx.x;
 
     float m_all = -INFINITY;
     for (int s = 0; s < splits; ++s)
         m_all = fmaxf(m_all, part_m[((size_t) b * splits + s) * H + h]);
     if (!isfinite(m_all)) {                       // no keys landed here
-        for (int d = lane; d < DV; d += blockDim.x)
+        for (int d = d0 + lane; d < d0 + DIMS_PER_BLOCK; d += blockDim.x)
             out[((size_t) b * H + h) * DV + d] = __float2bfloat16(0.f);
         return;
     }
@@ -242,7 +249,7 @@ __global__ void mla_decode_reduce_kernel(
     }
     const float inv = l_all > 0.f ? 1.f / l_all : 0.f;
 
-    for (int d = lane; d < DV; d += blockDim.x) {
+    for (int d = d0 + lane; d < d0 + DIMS_PER_BLOCK; d += blockDim.x) {
         float v = 0.f;
         for (int s = 0; s < splits; ++s) {
             const size_t base = ((size_t) b * splits + s) * H + h;
@@ -270,9 +277,40 @@ at::Tensor& grow(at::Tensor& t, int64_t n, at::ScalarType dt, const at::Device& 
 
 namespace vllm_exl3 {
 
+// Which (chunk, heads_per_block) wins is shape-dependent and not guessable:
+// splitting keys buys blocks but grows the partial buffer the reduce must read,
+// while splitting heads buys blocks for free in the reduce but re-reads K per
+// group. At batch 1 the answer is a 4-head block; by batch 4 it is a 16-head
+// one. So time the candidates once per shape and remember the winner.
+namespace {
+
+std::map<uint64_t, std::pair<int, int>>& mla_tune_cache() {
+    static std::map<uint64_t, std::pair<int, int>> c;
+    return c;
+}
+
+uint64_t mla_tune_key(int B, int H, int topk) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t v : {(uint64_t) B, (uint64_t) H, (uint64_t) topk}) {
+        h ^= v; h *= 1099511628211ull;
+    }
+    return h;
+}
+
+bool mla_tuning_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("VLLM_EXL3_MLA_TUNE");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
+
+}  // namespace
+
 at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                       const at::Tensor& sel, const at::Tensor& seqlens,
-                      double scale, int64_t v_head_dim, int64_t split_chunk)
+                      double scale, int64_t v_head_dim, int64_t split_chunk,
+                      int64_t heads_per_block)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dim() == 3, "mla_decode: q must be (batch, heads, head_dim)");
@@ -287,13 +325,55 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     TORCH_CHECK(D == 576 && DV == 512,
                 "mla_decode: built for head_dim 576 / v_head_dim 512, got ", D, "/", DV);
 
-    constexpr int NWARPS = 8;
     constexpr int TILE = 8;
-    const int hpw = (H + NWARPS - 1) / NWARPS;
-    TORCH_CHECK(hpw <= 4, "mla_decode: at most ", NWARPS * 4, " heads");
-
     int chunk = (int) split_chunk;
-    if (chunk <= 0) chunk = 64;
+    int hpb_in = (int) heads_per_block;
+    if (chunk <= 0 || hpb_in <= 0) {
+        const uint64_t key = mla_tune_key(B, H, topk);
+        auto& cache = mla_tune_cache();
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            std::pair<int, int> best{32, H};
+            if (mla_tuning_enabled() &&
+                at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+                    at::cuda::CaptureStatus::None) {
+                float best_ms = 1e30f;
+                cudaEvent_t beg, end;
+                cudaEventCreate(&beg); cudaEventCreate(&end);
+                for (int c : {16, 32, 64, 128}) {
+                    for (int hb : {H, H / 2, H / 4}) {
+                        if (hb < 1 || H % hb) continue;
+                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, hb);
+                        cudaEventRecord(beg);
+                        for (int r = 0; r < 3; ++r)
+                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, hb);
+                        cudaEventRecord(end);
+                        cudaEventSynchronize(end);
+                        float ms = 0.f; cudaEventElapsedTime(&ms, beg, end);
+                        if (ms < best_ms) { best_ms = ms; best = {c, hb}; }
+                    }
+                }
+                cudaEventDestroy(beg); cudaEventDestroy(end);
+            }
+            it = cache.emplace(key, best).first;
+        }
+        if (chunk <= 0) chunk = it->second.first;
+        if (hpb_in <= 0) hpb_in = it->second.second;
+    }
+    // Splitting keys needs an LSE merge, so more splits means a bigger partial
+    // buffer and a costlier reduce. Splitting *heads* costs nothing -- their
+    // outputs are disjoint -- at the price of re-reading K once per head group.
+    // With DRAM at 8.9% and occupancy at 16.6%, that is the right trade.
+    int hpb = hpb_in;
+    if (hpb <= 0 || hpb > H) hpb = H;
+    TORCH_CHECK(H % hpb == 0, "mla_decode: heads_per_block must divide ", H);
+    const int hgroups = H / hpb;
+    // Warps follow the head count: with NWARPS pinned at 8, a 4-head block left
+    // half its warps with no head to own.
+    const int nwarps = hpb >= 8 ? 8 : hpb;
+    const int hpw = (hpb + nwarps - 1) / nwarps;
+    TORCH_CHECK(hpw <= 4, "mla_decode: at most 4 heads per warp");
+
     const int splits = (topk + chunk - 1) / chunk;
 
     auto dev = q.device();
@@ -305,23 +385,33 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     auto stream = at::cuda::getCurrentCUDAStream();
     const size_t smem = 2 * TILE * 576 * sizeof(__nv_bfloat16);
 
-    dim3 grid(splits, B);
-#define MLA_LAUNCH(HPW_)                                                       \
-    mla_decode_partial_kernel<576, 512, NWARPS, HPW_, TILE>                    \
-        <<<grid, NWARPS * 32, smem, stream>>>(                                 \
+    dim3 grid(splits, hgroups, B);
+#define MLA_LAUNCH(NW_, HPW_)                                                  \
+    mla_decode_partial_kernel<576, 512, NW_, HPW_, TILE>                       \
+        <<<grid, NW_ * 32, smem, stream>>>(                                    \
             (const __nv_bfloat16*) q.data_ptr(),                               \
             (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),         \
             seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,               \
             po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),  \
-            H, topk, splits, chunk, (float) scale)
+            H, topk, splits, chunk, (float) scale, hpb)
 
-    if (hpw <= 1) { MLA_LAUNCH(1); }
-    else if (hpw == 2) { MLA_LAUNCH(2); }
-    else if (hpw == 3) { MLA_LAUNCH(3); }
-    else { MLA_LAUNCH(4); }
+    if (nwarps == 8) {
+        if (hpw <= 1) { MLA_LAUNCH(8, 1); }
+        else if (hpw == 2) { MLA_LAUNCH(8, 2); }
+        else if (hpw == 3) { MLA_LAUNCH(8, 3); }
+        else { MLA_LAUNCH(8, 4); }
+    } else if (nwarps == 4) {
+        MLA_LAUNCH(4, 1);
+    } else if (nwarps == 2) {
+        MLA_LAUNCH(2, 1);
+    } else {
+        MLA_LAUNCH(1, 1);
+    }
 #undef MLA_LAUNCH
 
-    mla_decode_reduce_kernel<512><<<dim3(H, B), 256, 0, stream>>>(
+    constexpr int RED_DIMS = 64;
+    mla_decode_reduce_kernel<512, RED_DIMS>
+        <<<dim3(H, B, 512 / RED_DIMS), 64, 0, stream>>>(
         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
         (__nv_bfloat16*) out.data_ptr(), H, splits);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -38,7 +38,7 @@ def _run(B, H, topk, chunk, holes=False, rows=4096, seed=0):
         sel[:, ::7] = -1
     sl = torch.full((B,), topk, device=dev, dtype=torch.int32)
     scale = 1.0 / (D ** 0.5)
-    got = torch.ops.vllm_exl3_C.mla_decode(q, kv, sel, sl, scale, DV, chunk)
+    got = torch.ops.vllm_exl3_C.mla_decode(q, kv, sel, sl, scale, DV, chunk, 0)
     ref = _reference(q, kv, sel, sl, scale)
     return ((ref - got.float()).norm() / ref.norm()).item()
 
