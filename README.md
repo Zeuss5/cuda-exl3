@@ -296,13 +296,25 @@ in NVFP4's favour:
   its FP8 kernel wants static per-tensor activation scales, the checkpoint has
   dynamic per-token.)
 
-| | NVFP4 (21.83 GiB) | EXL3 5.5bpw (19.98 GiB) | EXL3 4.0bpw (15.73 GiB) |
+End-to-end output tok/s -- every request pays an 8k prefill, so this folds
+prefill and decode together:
+
+| tok/s | NVFP4 (21.83 GiB) | EXL3 5.5bpw (19.98 GiB) | EXL3 4.0bpw (15.73 GiB) |
 |---|---|---|---|
-| prefill tok/s | **11,863** | 5,182 | 5,435 |
-| TPOT c=1 (ms) | 17.17 | 16.13 | **13.34** |
-| TPOT c=8 | 22.31 | 24.93 | **21.89** |
-| TPOT c=32 | **38.26** | 51.45 | 47.38 |
-| TPOT c=64 | **60.72** | 90.56 | 86.00 |
+| prefill | **11,862** | 5,182 | 5,435 |
+| c=1 | 56.1 | 56.6 | **67.6** |
+| c=8 | **317.3** | 253.7 | 283.9 |
+| c=32 | **645.9** | 408.2 | 438.0 |
+| c=64 | **772.8** | 448.3 | 471.6 |
+
+Decode alone (concurrency / mean TPOT), with prefill taken out:
+
+| decode tok/s | NVFP4 | EXL3 5.5bpw | EXL3 4.0bpw |
+|---|---|---|---|
+| c=1 | 58.2 | 62.0 | **75.0** |
+| c=8 | 358.6 | 320.9 | **365.5** |
+| c=32 | **836.4** | 622.0 | 675.4 |
+| c=64 | **1054.0** | 706.7 | 744.2 |
 
 The crossover is the whole story, and it is exactly what the kernel analysis
 predicts. At c=1-8 decode is weight-bandwidth-bound, the EXL3 GEMM is already at
