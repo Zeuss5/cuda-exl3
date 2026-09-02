@@ -560,6 +560,55 @@ And four in the kernel itself:
   than idle SMs, so the autotuner still keeps a half-group shape and picks it
   there (3%).
 
+### Serving GLM-5.3-Flash on it
+
+The kernel and backend were run end to end on GLM-5.3-Flash (45 layers, 288
+experts, EXL3 4-bit routed experts) across 4x RTX PRO 6000, TP=4, with this
+plugin providing both the EXL3 quantization and the attention:
+
+```
+--attention-backend CUSTOM --kv-cache-dtype auto --tensor-parallel-size 4
+```
+
+All four workers log `Using AttentionBackendEnum.CUSTOM backend`, the model
+generates coherently, and the KV cache reports 1.8M tokens -- a bf16 512-wide
+latent, not the packed 656-byte record. `docker/Dockerfile.sparse-mla` builds
+the plugin into a base image that carries a vLLM with the model definition;
+`Glm5Next*` is in no released vLLM, so a stock nightly cannot serve this model
+whatever the backend.
+
+Measured against b12x on **the same image, the same weights, the same
+everything but the attention backend and its cache dtype** (`vllm bench serve`,
+random 512-token inputs, 256 outputs, output token throughput):
+
+| concurrency | ours (bf16 KV) | b12x (nvfp4 KV) |
+|---|---|---|
+| 1 | 104.7 tok/s | 105.7 |
+| 2 | 175.2 | 173.3 |
+| 4 | 302.2 | 313.2 |
+| 8 | 499.8 | 515.9 |
+| 16 | 721.2 | 773.1 |
+
+At 24k-token inputs, where top-k 2048 actually bites, per-token decode latency:
+
+| concurrency | ours | b12x |
+|---|---|---|
+| 1 | 9.26 ms | 9.27 ms |
+| 4 | 29.3 ms | 24.3 ms |
+| 8 | 94.7 ms | 80.3 ms |
+
+So: parity at concurrency 1, and 15-17% behind at 4-8. That is not the decode
+kernel -- which is 2.5x faster than b12x at batch 1 and at parity above -- it is
+the **cache dtype**. b12x reads an nvfp4 cache, a quarter of the bytes ours
+reads, which also buys it 7.1M tokens of cache against our 1.8M. Prefill is
+further behind (TTFT 3.6s vs 2.5s at 24k) and is not ours at all: only
+`forward_mqa` is, and prefill runs vLLM's generic sparse path over a bf16 cache.
+
+Two things follow. Attention is a small share of decode at this model's shape --
+the 2.5x kernel win at batch 1 shows up as parity end to end, because 45 layers
+of it is about 3.5% of a token. And the way to actually win here is fewer cache
+bytes, not a faster kernel over the same bytes.
+
 ## MoE notes
 
 Two things worth knowing if you touch this path:
