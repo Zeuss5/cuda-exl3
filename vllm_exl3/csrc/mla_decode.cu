@@ -508,23 +508,9 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
 
 }  // namespace vllm_exl3
 
-namespace {
-using namespace vllm_exl3;
-
-// Workspace for the split partials, grown in place and never freed, so that
-// nothing reallocates once CUDA graphs are being captured.
-at::Tensor g_po, g_pm, g_pl;
-
-at::Tensor& grow(at::Tensor& t, int64_t n, at::ScalarType dt, const at::Device& dev) {
-    if (!t.defined() || t.numel() < n)
-        t = at::empty({n}, at::TensorOptions().dtype(dt).device(dev));
-    return t;
-}
-}  // namespace
-
 namespace vllm_exl3 {
 
-// Which (chunk, heads_per_block) wins is shape-dependent and not guessable:
+// Which (chunk, block shape) wins is shape-dependent and not guessable:
 // splitting keys buys blocks but grows the partial buffer the reduce must read,
 // while splitting heads buys blocks for free in the reduce but re-reads K per
 // group. At batch 1 the answer is a 4-head block; by batch 4 it is a 16-head
@@ -622,9 +608,16 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     const int splits = (topk + chunk - 1) / chunk;
 
     auto dev = q.device();
-    auto& po = grow(g_po, (int64_t) B * splits * H * DV, at::kBFloat16, dev);
-    auto& pm = grow(g_pm, (int64_t) B * splits * H, at::kFloat, dev);
-    auto& pl = grow(g_pl, (int64_t) B * splits * H, at::kFloat, dev);
+    // Allocated per call rather than kept in a global workspace. A workspace
+    // that grows reallocates, and a reallocation between two CUDA graph captures
+    // leaves the earlier graph pointing at freed memory, which faults during
+    // capture of the later one. Under capture these land in the graph's private
+    // pool and stay valid; outside it the caching allocator makes them cheap.
+    const auto fopt = at::TensorOptions().dtype(at::kFloat).device(dev);
+    auto po = at::empty({(int64_t) B * splits * H * DV},
+                        at::TensorOptions().dtype(at::kBFloat16).device(dev));
+    auto pm = at::empty({(int64_t) B * splits * H}, fopt);
+    auto pl = at::empty({(int64_t) B * splits * H}, fopt);
     auto out = at::empty({B, H, DV}, q.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();

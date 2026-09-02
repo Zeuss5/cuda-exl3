@@ -75,8 +75,12 @@ class Exl3MLASparseBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # The top-k list is converted to absolute slot indices before it reaches
-        # the kernel, which reads rows, so any block size works.
-        return [MultipleOf(16)]
+        # the kernel, which reads rows, so the kernel itself does not care. But
+        # advertising MultipleOf(16) lets vLLM grow the page to 1152 tokens to
+        # match the indexer's page size, and the DSA indexer's own paged-MQA
+        # kernel then asserts (`block_kv == 64` on sm120 without an fp4 index
+        # cache). Offer the same fixed sizes the backend this replaces does.
+        return [64, 256]
 
     @classmethod
     def is_mla(cls) -> bool:
