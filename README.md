@@ -480,25 +480,29 @@ topk 2048, head_dim 576 -- b12x refuses 512 outright (*"SM120 sparse MLA decode
 requires the GLM_NSA contract (q_head_dim=576)"*), so the head-to-head is at the
 padded width:
 
-| batch | b12x | ours | | ours at head_dim 512 |
-|---|---|---|---|---|
-| 1 | 18.5 us | **7.7 us** | 2.40x | 7.1 us |
-| 4 | 19.4 us | **13.1 us** | 1.48x | 11.7 us |
-| 16 | 31.2 us | 33.6 us | 0.93x | 31.0 us |
-| 32 | 56.3 us | 60.8 us | 0.93x | 55.1 us |
+| batch | b12x | ours | | ours at head_dim 512 | GB/s |
+|---|---|---|---|---|---|
+| 1 | 18.5 us | **7.6 us** | 2.43x | 7.1 us | 312 |
+| 4 | 19.4 us | **13.1 us** | 1.48x | 11.6 us | 721 |
+| 16 | 31.2 us | 31.4 us | 0.99x | 28.9 us | 1202 |
+| 32 | 56.4 us | **55.9 us** | 1.01x | 50.3 us | 1351 |
 
-So: a large win at the batch sizes where latency matters, and **7% behind b12x
-at batch 16 and above**, where both kernels are simply reading memory. At batch
-32 this one sustains 1242 GB/s of useful cache read; a stream copy on this card
-reaches 1461 GB/s and an `index_select` over the same scattered 1 KB rows reaches
-about 1400, so both kernels are within about 15% of what the access pattern
-allows and there is little left to win there.
+So: a large win at the batch sizes where latency matters, and parity at batch 16
+and above, where both kernels are simply reading memory. At batch 32 this one
+sustains 1351 GB/s of useful cache read against a 1461 GB/s stream copy on this
+card, so there is little left to win there.
 
-Batch 1 is a different story: 307 GB/s, nowhere near the ceiling. It cannot get
+Getting from 0.93x to parity at large batch was one fix, and not in the
+attention at all. The merge splits its 256 threads between output dims and the
+split axis; at 11 splits, spreading over 32 split groups left two thirds of
+every block idle and still paid for the cross-group reduce. Sizing the split
+axis to the actual split count is worth 8% end to end at batch 32.
+
+Batch 1 is a different story: 312 GB/s, nowhere near the ceiling. It cannot get
 there. Filling 256 SMs needs roughly 256 key splits, and flash-decoding writes a
 partial output per split, so merge traffic overtakes the cache read long before
 the machine is full. Counting bytes at the measured optimum gives a floor around
-5 us against the 7.7 achieved, and the ceiling that floor is chasing is 1.3 us.
+5 us against the 7.6 achieved, and the ceiling that floor is chasing is 1.3 us.
 Breaking it needs the partials to stop going through global memory -- thread
 block clusters and distributed shared memory would do it, and that is the one
 structural idea left unexplored here.

@@ -74,6 +74,17 @@ __device__ __forceinline__ void bf16x2_f32(uint32_t u, float& a, float& b)
     b = __uint_as_float(u & 0xffff0000u);
 }
 
+// The other direction, round-to-nearest-even, packed two at a time. Done with
+// bit math rather than __float2bfloat16 so nothing has its address taken: an
+// int4 built through a pointer spills to local memory.
+__device__ __forceinline__ uint32_t f32x2_bf16(float a, float b)
+{
+    const uint32_t x = __float_as_uint(a), y = __float_as_uint(b);
+    const uint32_t rx = (x + 0x7fffu + ((x >> 16) & 1u)) >> 16;
+    const uint32_t ry = (y + 0x7fffu + ((y >> 16) & 1u));
+    return rx | (ry & 0xffff0000u);
+}
+
 namespace vllm_exl3 {
 
 #ifndef MLA_MAX_HEADS
@@ -336,6 +347,10 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     // stride keeps the staging conflict-free: at 256 every head lands on one bank.
     constexpr int OSH = 256, OSS = OSH + 4;
     float* osh = reinterpret_cast<float*>(k_s);
+    // The merge reads these back, but this kernel pushes many times their volume
+    // of cache through L2 first and evicts them. Ask L2 to keep them.
+    uint64_t keep;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(keep));
 #pragma unroll
     for (int pass = 0; pass < DV / OSH; ++pass) {
         __syncthreads();
@@ -353,11 +368,19 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             }
         }
         __syncthreads();
-        for (int i = tid; i < MMA_M * OSH; i += NTHREADS) {
-            const int hl = i / OSH, d = i % OSH;
+        // Eight dims per thread in one 16-byte store, instead of one bf16 each.
+        for (int i = tid; i < MMA_M * (OSH / 8); i += NTHREADS) {
+            const int hl = i / (OSH / 8), d = (i % (OSH / 8)) * 8;
             if (hl >= hpb || h0 + hl >= H) continue;
-            part_o[(((size_t) b * splits + s) * H + h0 + hl) * DV + pass * OSH + d] =
-                __float2bfloat16(osh[hl * OSS + d]);
+            const float* src = osh + hl * OSS + d;
+            __nv_bfloat16* dst = part_o
+                + (((size_t) b * splits + s) * H + h0 + hl) * DV + pass * OSH + d;
+            asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1,%2,%3,%4}, %5;\n"
+                         :: "l"(dst), "r"(f32x2_bf16(src[0], src[1])),
+                            "r"(f32x2_bf16(src[2], src[3])),
+                            "r"(f32x2_bf16(src[4], src[5])),
+                            "r"(f32x2_bf16(src[6], src[7])), "l"(keep)
+                         : "memory");
         }
     }
 }
@@ -381,6 +404,7 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
     int H, int splits)
 {
     constexpr int TPG = DIMS / VEC;          // threads per split group
+    static_assert(TPG <= 32, "a split group must fit in one warp");
     constexpr int NT = TPG * SG;
     constexpr int NW = NT / 32;
     const int h = blockIdx.x;
@@ -616,13 +640,29 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     }
 #undef MLA_LAUNCH
 
-    constexpr int RED_DIMS = 64, RED_VEC = 8, RED_SG = 32;
-    constexpr int RED_NT = RED_DIMS / RED_VEC * RED_SG;
-    const size_t red_smem = ((size_t) splits + RED_NT / 32 * RED_DIMS) * sizeof(float);
-    mla_decode_reduce_kernel<512, RED_DIMS, RED_VEC, RED_SG>
-        <<<dim3(H, B, 512 / RED_DIMS), RED_NT, red_smem, stream>>>(
-        (const __nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(), pl.data_ptr<float>(),
-        (__nv_bfloat16*) out.data_ptr(), H, splits);
+    // The merge splits its 256 threads between output dims and the split axis.
+    // Spreading over more splits than exist just idles the extra groups, so the
+    // shape follows the split count: at 11 splits, 32 groups left two thirds of
+    // the block doing nothing and still paid for the cross-group reduce.
+#define MLA_REDUCE(SG_)                                                        \
+    do {                                                                       \
+        constexpr int VEC_ = 8;                                                \
+        constexpr int DIMS_ = VEC_ * 256 / (SG_) < 256                         \
+                            ? VEC_ * 256 / (SG_) : 256;                        \
+        constexpr int NT_ = DIMS_ / VEC_ * (SG_);                              \
+        const size_t rsm = ((size_t) splits + NT_ / 32 * DIMS_) * sizeof(float);\
+        mla_decode_reduce_kernel<512, DIMS_, VEC_, SG_>                        \
+            <<<dim3(H, B, 512 / DIMS_), NT_, rsm, stream>>>(                   \
+                (const __nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(),    \
+                pl.data_ptr<float>(), (__nv_bfloat16*) out.data_ptr(), H,      \
+                splits);                                                       \
+    } while (0)
+
+    if (splits >= 24) { MLA_REDUCE(32); }
+    else if (splits >= 12) { MLA_REDUCE(16); }
+    else if (splits >= 6) { MLA_REDUCE(8); }
+    else { MLA_REDUCE(4); }
+#undef MLA_REDUCE
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
