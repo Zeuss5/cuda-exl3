@@ -27,6 +27,61 @@ logger = init_logger(__name__)
 TILE = 16
 
 
+# vLLM has two MoE weight-loading protocols and which one runs depends on the
+# version. Older builds call `layer.load_weights(...)` once with every expert
+# tensor; newer ones (RoutedExperts) call a per-parameter `weight_loader` with
+# MoE kwargs and only if it advertises `supports_moe_loading`. Missing the second
+# one is silent: the parameters simply stay at whatever `torch.empty` left, and
+# the model generates fluent nonsense rather than failing. Support both.
+_SHARD_TO_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+
+
+def _exl3_moe_weight_loader(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str | None = None,
+    shard_id: str | None = None,
+    expert_id: int | None = None,
+    return_success: bool = False,
+    **kwargs,
+):
+    method = getattr(param, "_exl3_method", None)
+    layer = getattr(param, "_exl3_layer", None)
+    if method is None or layer is None:
+        return False if return_success else None
+
+    # Models route non-expert tensors through the same weight_loader with no MoE
+    # kwargs at all. Nothing of ours belongs to that path, so decline quietly
+    # rather than raising a TypeError from a missing argument.
+    if shard_id is None or expert_id is None:
+        return False if return_success else None
+
+    proj = _SHARD_TO_PROJ.get(str(shard_id))
+    if proj is None:
+        return False if return_success else None
+
+    local = method._local_expert(layer, int(expert_id))
+    if local < 0:                       # this expert lives on another rank
+        return False if return_success else None
+
+    # The name handed over is the *parameter* name, because the caller has
+    # already rewritten "experts.<n>.gate_proj." to "w13_". Either form ends in
+    # the EXL3 suffix (trellis / suh / svh / mcg), so strip the prefix if it
+    # survived and take what is left.
+    tail = str(weight_name or "").rstrip(".").rsplit(".", 1)[-1]
+    for pre in ("w13_", "w2_"):
+        if tail.startswith(pre):
+            tail = tail[len(pre):]
+            break
+    ok = method._place(layer, local, proj, tail, loaded_weight) is not None
+    return ok if return_success else None
+
+
+# Model loaders check this before routing expert tensors through weight_loader
+# with MoE kwargs; without it the parameter is loaded as a plain dense tensor.
+_exl3_moe_weight_loader.supports_moe_loading = True
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     """Routed experts with EXL3-quantized w13 / w2."""
 
@@ -100,6 +155,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         for pname, p in list(layer.named_parameters(recurse=False)):
             p._exl3_name = pname
+            p._exl3_method = self
+            p._exl3_layer = layer
+            # Plain setattr, not set_weight_attrs: extra_weight_attrs has
+            # usually already installed vLLM's generic loader and
+            # set_weight_attrs asserts rather than overwrite. Ours has to win --
+            # it is the one that understands the four EXL3 tensors behind each
+            # projection.
+            p.weight_loader = _exl3_moe_weight_loader
         self._install_loader(layer)
 
         layer.exl3_num_experts = E
