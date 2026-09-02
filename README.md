@@ -278,6 +278,47 @@ that elementwise slice. Online, 8k in / 1k out, prefix caching off, one GPU:
 (Decode columns are output tok/s. These are far below the short-prompt table
 above because every request carries 8k of context.)
 
+## Versus NVFP4
+
+`unsloth/Qwen3.8-27B-NVFP4` is the same base model, so it is a direct read on
+where a trellis format stands against native FP4 tensor cores. One RTX PRO 6000
+Blackwell each, 8k in / 1k out, prefix caching off, `--gpu-memory-utilization
+0.9`, **FP8 KV cache on both sides**, NVFP4 on its fastest backend
+(`--kernel-config '{"linear_backend":"flashinfer_b12x"}'`).
+
+Two things have to be matched or the comparison is meaningless, and both default
+in NVFP4's favour:
+
+* Unsloth's checkpoint ships a `kv_cache_scheme`, so vLLM silently gives it an
+  **FP8 KV cache** while EXL3 runs BF16 -- half the KV traffic per decode step.
+* `linear_backend` `auto`/`cutlass` is not the fast path on SM120. `flashinfer_b12x`
+  is worth ~18% on decode TPOT at c=1. (Plain `b12x` cannot load this checkpoint:
+  its FP8 kernel wants static per-tensor activation scales, the checkpoint has
+  dynamic per-token.)
+
+| | NVFP4 (21.83 GiB) | EXL3 5.5bpw (19.98 GiB) | EXL3 4.0bpw (15.73 GiB) |
+|---|---|---|---|
+| prefill tok/s | **11,863** | 5,182 | 5,435 |
+| TPOT c=1 (ms) | 17.17 | 16.13 | **13.34** |
+| TPOT c=8 | 22.31 | 24.93 | **21.89** |
+| TPOT c=32 | **38.26** | 51.45 | 47.38 |
+| TPOT c=64 | **60.72** | 90.56 | 86.00 |
+
+The crossover is the whole story, and it is exactly what the kernel analysis
+predicts. At c=1-8 decode is weight-bandwidth-bound, the EXL3 GEMM is already at
+the HBM roofline, and the format with fewer bits wins -- 4.0bpw is **22% faster
+than NVFP4 at c=1** on a checkpoint 28% smaller. From c=32 up the batch is large
+enough to be compute-bound, and there the trellis costs ~74 instructions per 8
+weights to dequantize into bf16 mma while NVFP4 feeds FP4 tensor cores directly:
+NVFP4 wins by 24% at c=32 and 42% at c=64. Prefill is the same effect at its
+extreme -- **2.3x**.
+
+So EXL3 is the better choice for local, low-concurrency serving on this hardware,
+and NVFP4 for prefill-heavy or high-concurrency serving. Closing the compute-bound
+gap needs a codebook that decodes into fp8/nvfp4 rather than bf16 -- a format
+change, not a kernel change. Note these are speed numbers at different bit
+budgets; no accuracy comparison was run.
+
 ## MoE notes
 
 Two things worth knowing if you touch this path:
