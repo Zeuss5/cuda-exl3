@@ -480,12 +480,25 @@ topk 2048, head_dim 576 -- b12x refuses 512 outright (*"SM120 sparse MLA decode
 requires the GLM_NSA contract (q_head_dim=576)"*), so the head-to-head is at the
 padded width:
 
-| batch | b12x | ours | | ours at head_dim 512 | GB/s |
+| batch | b12x (nvfp4) | ours, bf16 | ours, fp8 | | at head_dim 512 |
 |---|---|---|---|---|---|
-| 1 | 18.5 us | **7.1 us** | 2.61x | 6.7 us | 333 |
-| 4 | 19.4 us | **13.0 us** | 1.49x | 11.6 us | 727 |
-| 16 | 31.2 us | 31.4 us | 0.99x | 28.9 us | 1201 |
-| 32 | 56.3 us | **55.9 us** | 1.01x | 50.1 us | 1352 |
+| 1 | 18.5 us | 7.1 us | **7.4 us** | 2.50x | 6.9 us |
+| 4 | 19.5 us | 12.8 us | **9.8 us** | 1.99x | 9.2 us |
+| 16 | 31.1 us | 31.7 us | **19.9 us** | 1.56x | 18.0 us |
+| 32 | 56.3 us | 56.0 us | **31.6 us** | 1.78x | 28.2 us |
+
+The cache is the whole cost here, so the way to go faster is to read less of
+it. An e4m3 cache stores `k / kv_scale`, and **both matmuls are linear in that
+scale, so it never touches an element**: it folds into the softmax scale for
+`Q @ K^T` and into the merged output for `P @ V`. The widening to bf16 is exact
+-- e4m3 carries three mantissa bits against bf16's seven and its 448 maximum is
+far inside range. fp8 gives up cp.async, since values must be widened on the way
+to shared, so that path reads global into registers, one buffer instead of two,
+with the next tile prefetched into registers. That costs 4% at batch 1 (which is
+latency-bound, not bandwidth-bound) and pays 1.3-1.8x everywhere else.
+
+With it the kernel is ahead of b12x at every batch size while still reading
+twice the bytes b12x does.
 
 So: a large win at the batch sizes where latency matters, and parity at batch 16
 and above, where both kernels are simply reading memory. At batch 32 this one
@@ -597,17 +610,29 @@ At 24k-token inputs, where top-k 2048 actually bites, per-token decode latency:
 | 4 | 29.3 ms | 24.3 ms |
 | 8 | 94.7 ms | 80.3 ms |
 
-So: parity at concurrency 1, and 15-17% behind at 4-8. That is not the decode
-kernel -- which is 2.5x faster than b12x at batch 1 and at parity above -- it is
-the **cache dtype**. b12x reads an nvfp4 cache, a quarter of the bytes ours
-reads, which also buys it 7.1M tokens of cache against our 1.8M. Prefill is
-further behind (TTFT 3.6s vs 2.5s at 24k) and is not ours at all: only
-`forward_mqa` is, and prefill runs vLLM's generic sparse path over a bf16 cache.
+An fp8 cache (`--kv-cache-dtype fp8`) also serves correctly and doubles the KV
+capacity, 1.8M tokens to 3.0M. It changes none of these numbers, and that turns
+out to be the most useful measurement in this section.
 
-Two things follow. Attention is a small share of decode at this model's shape --
-the 2.5x kernel win at batch 1 shows up as parity end to end, because 45 layers
-of it is about 3.5% of a token. And the way to actually win here is fewer cache
-bytes, not a faster kernel over the same bytes.
+**Sparse-MLA decode is not where GLM's decode time goes.** Attention here reads
+`topk = 2048` keys no matter how long the context is, so its cost is fixed;
+anything that grows with context is the indexer. Same batch, same weights, same
+MoE work, only the context differs:
+
+| concurrency | TPOT @ 512 ctx | TPOT @ 24k ctx | grows with context |
+|---|---|---|---|
+| 1 | 9.11 ms | 9.41 ms | 0.30 ms |
+| 8 | 14.06 ms | 98.70 ms | **84.6 ms** |
+
+Against that, 45 layers of this kernel is 0.33 ms/token at batch 1 and 0.58 at
+batch 8 -- 3.5% and **under 1%** of a token. The DSA indexer, which scores every
+key in the context to choose the 2048, is essentially the entire long-context
+decode cost. The 15-17% b12x lead at 24k is in that same region, not in the
+attention: b12x also runs a different indexer path (`VLLM_B12X_GLM_NOPE_NVFP4`).
+
+So the kernel is comfortably the fastest of the three in isolation, and it is
+the wrong thing to keep optimising for this model. The indexer is next, and the
+bf16 GEMMs after it.
 
 ## MoE notes
 
