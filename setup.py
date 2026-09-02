@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from setuptools import setup
 
@@ -26,8 +27,21 @@ def _default_arch_list() -> str:
             return ";".join(f"{maj}.{min}" for maj, min in sorted(caps))
     except Exception:
         pass
-    # mma.m16n8k16 + cp.async are the floor -> sm_80 and up.
-    return "8.0;8.6;8.9;9.0;12.0"
+    # mma.m16n8k16 + cp.async are the floor -> sm_80 and up. 12.1 is GB10
+    # (DGX Spark) and only exists from CUDA 12.8, so ask nvcc before naming it.
+    archs = ["8.0", "8.6", "8.9", "9.0", "12.0"]
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        listed = subprocess.run(
+            [os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc"),
+             "--list-gpu-arch"], capture_output=True, text=True, timeout=30
+        ).stdout
+        if "compute_121" in listed:
+            archs.append("12.1")
+    except Exception:
+        pass
+    return ";".join(archs)
 
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = _default_arch_list()
