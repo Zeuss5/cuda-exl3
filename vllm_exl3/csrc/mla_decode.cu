@@ -130,7 +130,9 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const __nv_bfloat16* __restrict__ kv,    // (rows, D) latent cache
     const int* __restrict__ sel,             // (B, topk) row ids, -1 = empty
     const int* __restrict__ seqlens,         // (B) valid entries of sel
-    __nv_bfloat16* __restrict__ part_o,      // (B, splits, H, DV)
+    // (B, H, splits, DV): splits contiguous, so the merge walks them 1 KB apart
+    // instead of H * DV * 2 = 16 KB apart, which is a different page every time.
+    __nv_bfloat16* __restrict__ part_o,
     float* __restrict__ part_m,              // (B, splits, H)
     float* __restrict__ part_l,              // (B, splits, H)
     int H, int topk, int splits, int chunk, float scale, int hpb)
@@ -337,7 +339,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     }
 
     if (tid < MMA_M && tid < hpb && h0 + tid < H) {
-        const size_t o = ((size_t) b * splits + s) * H + h0 + tid;
+        const size_t o = ((size_t) b * H + h0 + tid) * splits + s;
         part_m[o] = m_s[tid]; part_l[o] = l_s[tid];
     }
 
@@ -374,7 +376,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             if (hl >= hpb || h0 + hl >= H) continue;
             const float* src = osh + hl * OSS + d;
             __nv_bfloat16* dst = part_o
-                + (((size_t) b * splits + s) * H + h0 + hl) * DV + pass * OSH + d;
+                + (((size_t) b * H + h0 + hl) * splits + s) * DV + pass * OSH + d;
             asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1,%2,%3,%4}, %5;\n"
                          :: "l"(dst), "r"(f32x2_bf16(src[0], src[1])),
                             "r"(f32x2_bf16(src[2], src[3])),
@@ -399,7 +401,8 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
 // the split axis so there are SG independent loads in flight per dim.
 template <int DV, int DIMS, int VEC, int SG>
 __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
-    const __nv_bfloat16* __restrict__ part_o, const float* __restrict__ part_m,
+    const __nv_bfloat16* __restrict__ part_o,   // (B, H, splits, DV)
+    const float* __restrict__ part_m,           // (B, H, splits)
     const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
     int H, int splits)
 {
@@ -416,20 +419,46 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
     extern __shared__ __align__(16) char red_raw[];
     float* w = reinterpret_cast<float*>(red_raw);       // splits
     float* red = w + splits;                            // NW x DIMS
-    __shared__ float xchg[NW];
+    __shared__ float xchg[NW], xchl[NW];
     __shared__ float m_all, inv;
 
-    float mx = -INFINITY;
-    for (int s = tid; s < splits; s += NT)
-        mx = fmaxf(mx, part_m[((size_t) b * splits + s) * H + h]);
+    // (max, weight) is an associative pair under the log-sum-exp combine, so one
+    // reduction produces both. The old code ran two -- and read the per-split max
+    // from global twice, then finished each reduction on a single thread.
+    constexpr int RMAX = 8;
+    const size_t mbase = ((size_t) b * H + h) * splits;
+    float m_l = -INFINITY, l_l = 0.f;
+#pragma unroll 1
+    for (int r = 0; r < RMAX; ++r) {
+        const int sp = tid + r * NT;
+        if (sp >= splits) break;
+        const float mm = part_m[mbase + sp], ll = part_l[mbase + sp];
+        const float M = fmaxf(m_l, mm);
+        l_l = isfinite(M) ? l_l * __expf(m_l - M) + ll * __expf(mm - M) : 0.f;
+        m_l = M;
+    }
 #pragma unroll
-    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
-    if ((tid & 31) == 0) xchg[tid >> 5] = mx;
+    for (int off = 16; off; off >>= 1) {
+        const float m2 = __shfl_xor_sync(0xffffffff, m_l, off);
+        const float l2 = __shfl_xor_sync(0xffffffff, l_l, off);
+        const float M = fmaxf(m_l, m2);
+        l_l = isfinite(M) ? l_l * __expf(m_l - M) + l2 * __expf(m2 - M) : 0.f;
+        m_l = M;
+    }
+    if ((tid & 31) == 0) { xchg[tid >> 5] = m_l; xchl[tid >> 5] = l_l; }
     __syncthreads();
-    if (tid == 0) {
-        float v = xchg[0];
-        for (int i = 1; i < NW; ++i) v = fmaxf(v, xchg[i]);
-        m_all = v;
+    if (tid < 32) {
+        float mv = (tid < NW) ? xchg[tid] : -INFINITY;
+        float lv = (tid < NW) ? xchl[tid] : 0.f;
+#pragma unroll
+        for (int off = 16; off; off >>= 1) {
+            const float m2 = __shfl_xor_sync(0xffffffff, mv, off);
+            const float l2 = __shfl_xor_sync(0xffffffff, lv, off);
+            const float M = fmaxf(mv, m2);
+            lv = isfinite(M) ? lv * __expf(mv - M) + l2 * __expf(m2 - M) : 0.f;
+            mv = M;
+        }
+        if (tid == 0) { m_all = mv; inv = lv > 0.f ? 1.f / lv : 0.f; }
     }
     __syncthreads();
 
@@ -438,23 +467,8 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
             out[((size_t) b * H + h) * DV + d0 + d] = __float2bfloat16(0.f);
         return;
     }
-
-    float ls = 0.f;
-    for (int s = tid; s < splits; s += NT) {
-        const size_t base = ((size_t) b * splits + s) * H + h;
-        const float e = __expf(part_m[base] - m_all);
-        w[s] = e;
-        ls += part_l[base] * e;
-    }
-#pragma unroll
-    for (int off = 16; off; off >>= 1) ls += __shfl_xor_sync(0xffffffff, ls, off);
-    if ((tid & 31) == 0) xchg[tid >> 5] = ls;
-    __syncthreads();
-    if (tid == 0) {
-        float v = 0.f;
-        for (int i = 0; i < NW; ++i) v += xchg[i];
-        inv = v > 0.f ? 1.f / v : 0.f;
-    }
+    for (int sp = tid; sp < splits; sp += NT)
+        w[sp] = __expf(part_m[mbase + sp] - m_all);
     __syncthreads();
 
     float acc[VEC];
@@ -462,7 +476,7 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
     for (int e = 0; e < VEC; ++e) acc[e] = 0.f;
     for (int sp = g; sp < splits; sp += SG) {
         const uint4 r = *reinterpret_cast<const uint4*>(
-            part_o + (((size_t) b * splits + sp) * H + h) * DV + d0 + t * VEC);
+            part_o + (((size_t) b * H + h) * splits + sp) * DV + d0 + t * VEC);
         const float ws = w[sp];
         const uint32_t* u = reinterpret_cast<const uint32_t*>(&r);
 #pragma unroll

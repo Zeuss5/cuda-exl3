@@ -482,7 +482,7 @@ padded width:
 
 | batch | b12x | ours | | ours at head_dim 512 | GB/s |
 |---|---|---|---|---|---|
-| 1 | 18.5 us | **7.4 us** | 2.50x | 7.0 us | 320 |
+| 1 | 18.5 us | **7.1 us** | 2.61x | 6.7 us | 333 |
 | 4 | 19.4 us | **13.0 us** | 1.49x | 11.6 us | 727 |
 | 16 | 31.2 us | 31.4 us | 0.99x | 28.9 us | 1201 |
 | 32 | 56.3 us | **55.9 us** | 1.01x | 50.1 us | 1352 |
@@ -498,16 +498,43 @@ split axis; at 11 splits, spreading over 32 split groups left two thirds of
 every block idle and still paid for the cross-group reduce. Sizing the split
 axis to the actual split count is worth 8% end to end at batch 32.
 
-Batch 1 is a different story: 320 GB/s, nowhere near the ceiling. It cannot get
-there. Filling 256 SMs needs roughly 256 key splits, and flash-decoding writes a
-partial output per split, so merge traffic overtakes the cache read long before
-the machine is full. Counting bytes at the measured optimum gives a floor around
-5 us against the 7.4 achieved, and the ceiling that floor is chasing is 1.3 us.
-Breaking it needs the partials to stop going through global memory -- thread
-block clusters and distributed shared memory would do it, and that is the one
-structural idea left unexplored here.
+Batch 1 is a different story: 333 GB/s, nowhere near the ceiling. It cannot get
+there, and it is worth being precise about why. Skipping the merge entirely
+(wrong answers, timing only) gives 4.7 us, so the merge is 2.4 us of the 7.1 --
+34% at batch 1, but only 8% at batch 32. Of that, roughly 0.9 us is the second
+kernel launch itself: a trivial kernel replayed from a CUDA graph on this card
+costs 0.92 us, and there are two of them.
+
+That is the whole remaining structure. Filling 256 SMs needs roughly 256 key
+splits, and flash-decoding writes a partial per split, so merge cost overtakes
+the cache read long before the machine is full; the split count that balances
+the two is 11-64 depending on batch, which is 176-352 blocks -- fewer than the
+GPU has SMs. Nothing about that is fixable by making the inner loop faster.
+
+The one thing that would fix it is merging splits without going through global
+memory, and on this hardware that does not work. See below.
+
+**Thread block clusters and distributed shared memory.** This is the structural
+answer: a cluster of blocks covering consecutive key chunks merges its partials
+in DSMEM, so only one partial per cluster reaches global and split-k parallelism
+decouples from split-k merge cost. sm_120 supports it -- `clusterLaunch` is 1,
+`map_shared_rank` returns correct data, and it survives CUDA graph capture, all
+verified, and the implementation passed 108 configurations. It is also **2 to 3
+times slower**. Removing just the DSMEM reduction tree while keeping every
+cluster barrier brings it back to within 1.2x, so the barriers and the scheduling
+constraint are cheap and the tree is not: 66 KB of peer reads per block costs
+about 8 us, roughly 40x the rate of local shared memory on the same chip.
+Consumer Blackwell implements the cluster programming model without the fast
+interconnect that makes it worth using on datacenter parts.
 
 Things that did not work, all reverted:
+
+* **Register prefetch instead of a second shared K buffer**, to trade 18 KB of
+  shared for 18 registers and go from two resident blocks to four. Shared did
+  drop to 24 KB, but registers went 63 -> 127 and became the limiter instead, so
+  occupancy was unchanged. It would not have helped anyway: at the tuned split
+  count the grid is 176-352 blocks against 256 SMs, so most SMs hold one block
+  and per-SM occupancy is not what is binding.
 
 * `cp.async.cg` instead of `.ca` to keep the streamed cache out of L1. No change
   at batch 16, 3% worse at batch 32.
