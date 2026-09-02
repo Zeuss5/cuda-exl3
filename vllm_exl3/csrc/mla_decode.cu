@@ -16,6 +16,45 @@
 // axpy, both of which map to plain FMA and warp shuffles, so nothing depends on
 // wgmma/TMA and the kernel is portable to any SM80+ part.
 
+// Where the time actually goes (ncu, batch 1, topk 2048, 16 heads at TP=4):
+//
+//     duration 21.95 us   DRAM 6.9%   L1/TEX 59.8%   compute 23.8%
+//     warp cycles per issued instruction 10.08 -- warps stall ~90% of the time
+//     stalls/issue: mio_throttle 1.93, short_scoreboard 1.66,
+//                   long_scoreboard 1.52, wait 1.49, not_selected 1.10
+//     achieved occupancy 33.2% against a theoretical 66.7%
+//
+// So this is bound by the shared-memory/LSU pipe, not by DRAM (6.9%) and not by
+// math (23.8%). The cost is 18 separate 2-byte shared loads per key per lane:
+// each wastes half of the 128 B/cycle the pipe delivers and occupies a whole
+// MIO slot.
+//
+// Three fixes for that were tried and each made it slower; they are recorded so
+// the next pass does not repeat them:
+//
+//   * Hoisting the k row into registers once per key and reusing it across both
+//     heads and both projections (68 shared reads -> 18). 28.7 -> 30.8 us. It
+//     removes redundant reads but lengthens the live range enough to cost more
+//     than it saves.
+//   * 16 warps per block instead of 8 (one head per warp), which drops the
+//     kernel from 109 to 64 registers and doubles warps per SM. 28.7 -> 32.8 us:
+//     at batch 1 the grid is only ~64 blocks on 188 SMs, so occupancy per SM was
+//     never the binding constraint.
+//   * Vectorising the shared reads by giving each lane a contiguous 16-dim slice
+//     (18 scalar loads -> 3 int4/bf16x2 loads). 28.7 -> 35.6 us, because
+//     contiguous ownership makes lane L read shared word L*8, so lanes 0, 4,
+//     8 ... collide on bank 0 -- an 8-way conflict. The strided layout this
+//     kernel uses is conflict-free. Vectorising here needs an XOR swizzle of the
+//     16-byte chunks, the same trick gemm.cu applies to its A tiles.
+//
+// The structural answer is to stop doing QK as an FMA chain plus a warp-wide
+// shuffle reduction per key and make it an mma: a tile of keys is a matrix, so
+// S = Q @ K^T maps onto m16n8k16 with m = 16 heads exactly, reading K from
+// shared through ldmatrix (vectorised and conflict-free by construction), and
+// O += P @ V is a second mma. That also folds the reduce kernel's launch into
+// the same pass. It is a rewrite rather than a tweak, which is why it is not in
+// this version.
+
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
