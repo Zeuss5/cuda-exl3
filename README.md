@@ -368,6 +368,41 @@ gap needs a codebook that decodes into fp8/nvfp4 rather than bf16 -- a format
 change, not a kernel change. Note these are speed numbers at different bit
 budgets; no accuracy comparison was run.
 
+## GLM-5.3-Flash
+
+`brandonmusic/GLM-5.3-Flash-tr3-4bpw` is EXL3 in the ordinary sense -- 4-bit
+`mcg`, `written_suffixes: [trellis, suh, svh, mcg]`, multiplier 0xCBAC1FED --
+but it quantizes *only* the routed experts (`scope: glm53_routed_experts_only`),
+leaving attention, the shared experts and the head in bf16. 45 layers, 288
+experts, top-8, MLA with `qk_rope_head_dim: 0`.
+
+The model definition and its sparse-MLA attention are **not ours**: `Glm5Next*`
+is upstream Apache-2.0 vLLM (shipping in a pre-release, not yet on PyPI), and
+the SM120 sparse-MLA backend that makes it run at `pe_dim=0` is b12x. This
+plugin supplies the EXL3 quantization only. Stock vLLM cannot serve this model
+on SM120 by any configuration: the sparse path wants `fp8_ds_mla` (which asserts
+`pe_dim == 64`), and forcing dense MLA with `index_topk: null` then fails with
+no MLA prefill backend for `(qk_nope 256, rope 0, v 256)`.
+
+Measured on 4x RTX PRO 6000 Blackwell, TP=4, `nvfp4_ds_mla` KV, pure decode
+(TTFT excluded), 256 tokens on a code-agent prompt:
+
+| | pure decode tok/s |
+|---|---|
+| ours, no speculation | 109.7 |
+| **ours + MTP-5** | **214.7  (1.96x)** |
+
+For scale, the published community numbers for this model on 2x RTX PRO 6000 at
+a 400 W cap are 71.0 tok/s without speculation and 193-223 with a DFlash2 K5
+drafter. Different GPU count, power budget and bitrate, so treat it as a sanity
+check rather than a head-to-head.
+
+Two measurement traps, both of which cost real time here: a random-token dataset
+(`--dataset-name random`) destroys draft acceptance and makes speculation look
+like a regression, and counting *stream chunks* rather than the server's token
+count undercounts speculative decode by ~3x. Use a realistic prompt and
+`stream_options: {include_usage: true}`.
+
 ## MoE notes
 
 Two things worth knowing if you touch this path:
