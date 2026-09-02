@@ -55,6 +55,20 @@ class Exl3ModuleInfo:
         )
 
 
+# Layers left alone by online quantization. The router decides which experts
+# run at all, so its error is not averaged away like a projection's, and the
+# head is the last thing before the logits -- EXL3 checkpoints conventionally
+# keep both in high precision (this one records head_bits: 16).
+_ONLINE_EXCLUDE = ("lm_head", "gate", "router", "e_score_correction", "shared_head")
+
+
+def _is_online_excluded(prefix: str) -> bool:
+    tail = prefix.rsplit(".", 1)[-1]
+    if any(tail == e or tail.startswith(e) for e in _ONLINE_EXCLUDE):
+        return True
+    return "lm_head" in prefix
+
+
 @register_quantization_config("exl3")
 class Exl3Config(QuantizationConfig):
     """EXL3 trellis quantization.
@@ -399,12 +413,32 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
             if infos is not None:
                 return Exl3LinearMethod(self, infos, prefix)
-            if _DEBUG:
-                logger.info("EXL3: %s -> unquantized", prefix)
             # A linear layer with no EXL3 tensors is genuinely unquantized in
-            # this checkpoint (e.g. the bf16 vision tower). Embeddings take
-            # None so vLLM installs UnquantizedEmbeddingMethod itself.
+            # this checkpoint (e.g. the bf16 vision tower, or a checkpoint that
+            # only quantized its routed experts). Optionally encode it here
+            # instead of leaving it in bf16 -- see vllm_exl3.online.
             if isinstance(layer, LinearBase):
+                from vllm_exl3.online import (
+                    Exl3OnlineLinearMethod,
+                    online_bits,
+                    shape_supported,
+                )
+
+                bits = online_bits()
+                if bits is not None and not _is_online_excluded(prefix):
+                    k = getattr(layer, "input_size_per_partition", None)
+                    n = sum(getattr(layer, "output_partition_sizes", []) or [0])
+                    if k and n and shape_supported(k, n):
+                        logger.info_once(
+                            "EXL3: quantizing unquantized linears online at "
+                            "%d bits (VLLM_EXL3_ONLINE_BITS)", bits
+                        )
+                        return Exl3OnlineLinearMethod(self, prefix, bits)
+                    if _DEBUG:
+                        logger.info("EXL3 online: %s shape %sx%s unsupported",
+                                    prefix, k, n)
+                if _DEBUG:
+                    logger.info("EXL3: %s -> unquantized", prefix)
                 return UnquantizedLinearMethod()
             return None
 
