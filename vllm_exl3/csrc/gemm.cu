@@ -777,7 +777,7 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
         else             { VE3_ONE(BM_, WN_, ST32, 32) }                               \
         return;                                                                        \
     }
-    VE3_BM(16, 16, 3, 4) VE3_BM(32, 16, 3, 4) VE3_BM(64, 16, 3, 4) VE3_BM(128, 16, 2, 3)
+    VE3_BM(16, 16, 2, 4) VE3_BM(32, 16, 3, 4) VE3_BM(64, 16, 3, 4) VE3_BM(128, 16, 2, 3)
 #undef VE3_BM
 #undef VE3_ONE
 }
