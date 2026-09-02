@@ -138,10 +138,14 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     static_assert(NTHREADS >= MMA_M * TILE, "softmax pass needs one thread per score");
     static_assert(TILE % 16 == 0, "PV mma consumes 16 keys at a time");
 
+    // Q needs 16 x KS halves and a K tile needs TILE x KS. At TILE = 16 those
+    // are the same size, so Q is staged into the second K buffer, read out into
+    // register fragments, and the buffer is handed back to the pipeline. Double
+    // buffering therefore costs no shared memory at all.
     extern __shared__ __align__(16) char smem_raw[];
-    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // 16 x KS
-    __nv_bfloat16* k_s = q_s + MMA_M * KS;                                // TILE x KS
-    __nv_bfloat16* p_s = k_s + TILE * KS;                                 // 16 x PS
+    __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // 2 x TILE x KS
+    __nv_bfloat16* q_s = k_s + TILE * KS;                                 // aliases buffer 1
+    __nv_bfloat16* p_s = k_s + 2 * TILE * KS;                             // 16 x PS
     float* s_s = reinterpret_cast<float*>(p_s + MMA_M * PS);              // KSL x 16 x TILE
     float* m_s = s_s + KSL * MMA_M * TILE;                                // 16
     float* l_s = m_s + MMA_M;                                             // 16
@@ -171,6 +175,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         *reinterpret_cast<int4*>(q_s + r * KS + c) = v;
     }
     if (tid < MMA_M) { m_s[tid] = -INFINITY; l_s[tid] = 0.f; }
+    for (int i = tid; i < hi - lo; i += NTHREADS) sel_s[i] = sel[(size_t) b * topk + lo + i];
 
     // acc[t][n] holds C[dim][head] for m-tile (warp + t*NWARPS), n-tile n.
     FragC acc[MTPW][NT];
@@ -181,54 +186,69 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
 #pragma unroll
             for (int f = 0; f < 4; ++f) acc[t][nn][f] = 0.f;
 
-    // The selection list is a gather: reading it inside the staging loop puts a
-    // dependent global load in front of every cp.async, which pins the kernel on
-    // long_scoreboard. It is at most `chunk` ints, so hoist it.
-    for (int i = tid; i < hi - lo; i += NTHREADS) sel_s[i] = sel[(size_t) b * topk + lo + i];
+    __syncthreads();
+
+    // Q's A fragments never change, so read them once and free the buffer.
+    const int nb_w = warp % NBLK_E, ksl = warp / NBLK_E;
+    FragA q_f[KSTEPS];
+#pragma unroll
+    for (int ki = 0; ki < KSTEPS; ++ki)
+        ldsm4(q_f[ki], q_s + ((lane & 7) + 8 * ((lane >> 3) & 1)) * KS
+                            + (ksl * KSTEPS + ki) * 16 + (lane >> 4) * 8);
     __syncthreads();
 
     const int ntiles = (hi - lo + TILE - 1) / TILE;
 
-    for (int t = 0; t < ntiles; ++t) {
-        const int base = lo + t * TILE;
-        const int n = min(TILE, hi - base);
-
-        for (int i = tid; i < TILE * (D / 8); i += NTHREADS) {
-            const int r = i / (D / 8), c = (i % (D / 8)) * 8;
-            const int row = (r < n) ? sel_s[t * TILE + r] : -1;
-            void* dst = k_s + r * KS + c;
-            if (row >= 0) {
-                const __nv_bfloat16* src = kv + (size_t) row * D + c;
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                             :: "r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src));
-            } else {
-                *reinterpret_cast<int4*>(dst) = int4{0, 0, 0, 0};
+    // The selection list is a gather: reading it inside the staging loop would put
+    // a dependent global load in front of every cp.async, which pins the kernel on
+    // long_scoreboard. It was hoisted to shared above. Always commit a group, even
+    // past the last tile, so wait_group(1) names the tile about to be read.
+    auto stage = [&](int t) {
+        if (t < ntiles) {
+            __nv_bfloat16* dst_b = k_s + (t & 1) * (TILE * KS);
+            const int n = min(TILE, hi - lo - t * TILE);
+            for (int i = tid; i < TILE * (D / 8); i += NTHREADS) {
+                const int r = i / (D / 8), c = (i % (D / 8)) * 8;
+                const int row = (r < n) ? sel_s[t * TILE + r] : -1;
+                void* dst = dst_b + r * KS + c;
+                if (row >= 0) {
+                    const __nv_bfloat16* src = kv + (size_t) row * D + c;
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                                 :: "r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src));
+                } else {
+                    *reinterpret_cast<int4*>(dst) = int4{0, 0, 0, 0};
+                }
             }
         }
         asm volatile("cp.async.commit_group;\n" ::);
-        asm volatile("cp.async.wait_group 0;\n" ::);
+    };
+
+    stage(0);
+    for (int t = 0; t < ntiles; ++t) {
+        const int base = lo + t * TILE;
+        const int n = min(TILE, hi - base);
+        const __nv_bfloat16* k_cur = k_s + (t & 1) * (TILE * KS);
+        stage(t + 1);
+        asm volatile("cp.async.wait_group 1;\n" ::);
         __syncthreads();
 
         // S[16 heads][TILE keys] = Q @ K^T
         {
-            const int nb_w = warp % NBLK_E, ksl = warp / NBLK_E;
             for (int nb = nb_w; nb < NBLK; nb += NBLK_E) {
                 FragC c{};
 #pragma unroll
                 for (int f = 0; f < 4; ++f) c[f] = 0.f;
+#pragma unroll
                 for (int ki = 0; ki < KSTEPS; ++ki) {
                     const int k0 = (ksl * KSTEPS + ki) * 16;
-                    FragA fa;
-                    ldsm4(fa, q_s + ((lane & 7) + 8 * ((lane >> 3) & 1)) * KS
-                                  + k0 + (lane >> 4) * 8);
                     FragB fb;
-                    const __nv_bfloat16* krow = k_s + (nb * 8 + (lane >> 2)) * KS
+                    const __nv_bfloat16* krow = k_cur + (nb * 8 + (lane >> 2)) * KS
                                               + k0 + (lane & 3) * 2;
                     reinterpret_cast<uint32_t*>(&fb)[0] =
                         *reinterpret_cast<const uint32_t*>(krow);
                     reinterpret_cast<uint32_t*>(&fb)[1] =
                         *reinterpret_cast<const uint32_t*>(krow + 8);
-                    mma_m16n8k16_bf16(fa, fb, c);
+                    mma_m16n8k16_bf16(q_f[ki], fb, c);
                 }
                 const int cr = lane >> 2, cc = (lane & 3) * 2;
 #pragma unroll
@@ -296,7 +316,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             for (int mt = 0; mt < MTPW; ++mt) {
                 const int mbase = (warp + mt * NWARPS) * 16;
                 FragA fa;
-                ldsm4_trans(fa, k_s + (kb + 8 * (lane >> 4) + (lane & 7)) * KS
+                ldsm4_trans(fa, k_cur + (kb + 8 * (lane >> 4) + (lane & 7)) * KS
                                     + mbase + 8 * ((lane >> 3) & 1));
 #pragma unroll
                 for (int nn = 0; nn < NT; ++nn) mma_m16n8k16_bf16(fa, fb[nn], acc[mt][nn]);
@@ -569,7 +589,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
 #define MLA_LAUNCH(NW_, TILE_)                                                 \
     do {                                                                       \
         constexpr int KSL_ = (NW_) / ((TILE_) / 8);                            \
-        const size_t smem = (16 + (TILE_)) * (576 + 8) * sizeof(__nv_bfloat16) \
+        const size_t smem = 2 * (TILE_) * (576 + 8) * sizeof(__nv_bfloat16)     \
                           + 16 * ((TILE_) + 8) * sizeof(__nv_bfloat16)         \
                           + (size_t) KSL_ * 16 * (TILE_) * sizeof(float)       \
                           + 3 * 16 * sizeof(float)                             \
