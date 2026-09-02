@@ -4,24 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-exl3"
-version = "0.1.0"
+version = "1.0.0"
 description = "EXL3 (ExLlamaV3 trellis) quantization plugin for vLLM, with custom CUDA kernels"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "vllm-exl3 contributors" }]
 keywords = ["vllm", "exl3", "exllamav3", "quantization", "cuda", "llm"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: C++",
     "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["torch>=2.6", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest", "safetensors"]
 
 [project.urls]
-Homepage = "https://github.com/vllm-exl3/vllm-exl3"
+Homepage = "https://github.com/Zeuss5/vllm-exl3"
+Repository = "https://github.com/Zeuss5/vllm-exl3"
+Issues = "https://github.com/Zeuss5/vllm-exl3/issues"
+
 
 # vLLM discovers the plugin through this entry point group and calls the
 # function, which registers "exl3" as a quantization method.
