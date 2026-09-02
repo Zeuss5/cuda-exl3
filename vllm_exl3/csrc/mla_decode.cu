@@ -119,7 +119,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const __nv_bfloat16* __restrict__ kv,    // (rows, D) latent cache
     const int* __restrict__ sel,             // (B, topk) row ids, -1 = empty
     const int* __restrict__ seqlens,         // (B) valid entries of sel
-    float* __restrict__ part_o,              // (B, splits, H, DV)
+    __nv_bfloat16* __restrict__ part_o,      // (B, splits, H, DV)
     float* __restrict__ part_m,              // (B, splits, H)
     float* __restrict__ part_l,              // (B, splits, H)
     int H, int topk, int splits, int chunk, float scale, int hpb)
@@ -337,7 +337,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             const int hl = i / OSH, d = i % OSH;
             if (hl >= hpb || h0 + hl >= H) continue;
             part_o[(((size_t) b * splits + s) * H + h0 + hl) * DV + pass * OSH + d] =
-                osh[hl * OSS + d];
+                __float2bfloat16(osh[hl * OSS + d]);
         }
     }
 }
@@ -352,23 +352,27 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
 // machine mostly idle. Now the weights are computed once into shared, and the
 // split axis is spread over SG thread groups so there are SG independent loads
 // in flight per output element.
-template <int DV, int DIMS, int SG>
-__global__ __launch_bounds__(DIMS* SG) void mla_decode_reduce_kernel(
-    const float* __restrict__ part_o, const float* __restrict__ part_m,
+// DIMS output dims per block, VEC of them per thread, and SG groups splitting
+// the split axis so there are SG independent loads in flight per dim.
+template <int DV, int DIMS, int VEC, int SG>
+__global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
+    const __nv_bfloat16* __restrict__ part_o, const float* __restrict__ part_m,
     const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
     int H, int splits)
 {
-    constexpr int NT = DIMS * SG;
+    constexpr int TPG = DIMS / VEC;          // threads per split group
+    constexpr int NT = TPG * SG;
+    constexpr int NW = NT / 32;
     const int h = blockIdx.x;
     const int b = blockIdx.y;
     const int d0 = blockIdx.z * DIMS;
     const int tid = threadIdx.x;
-    const int di = tid % DIMS, sg = tid / DIMS;
+    const int g = tid / TPG, t = tid % TPG;
 
     extern __shared__ __align__(16) char red_raw[];
     float* w = reinterpret_cast<float*>(red_raw);       // splits
-    float* red = w + splits;                            // SG x DIMS
-    __shared__ float xchg[NT / 32];
+    float* red = w + splits;                            // NW x DIMS
+    __shared__ float xchg[NW];
     __shared__ float m_all, inv;
 
     float mx = -INFINITY;
@@ -379,14 +383,15 @@ __global__ __launch_bounds__(DIMS* SG) void mla_decode_reduce_kernel(
     if ((tid & 31) == 0) xchg[tid >> 5] = mx;
     __syncthreads();
     if (tid == 0) {
-        float t = xchg[0];
-        for (int i = 1; i < NT / 32; ++i) t = fmaxf(t, xchg[i]);
-        m_all = t;
+        float v = xchg[0];
+        for (int i = 1; i < NW; ++i) v = fmaxf(v, xchg[i]);
+        m_all = v;
     }
     __syncthreads();
 
     if (!isfinite(m_all)) {                       // no keys landed here
-        if (sg == 0) out[((size_t) b * H + h) * DV + d0 + di] = __float2bfloat16(0.f);
+        for (int d = tid; d < DIMS; d += NT)
+            out[((size_t) b * H + h) * DV + d0 + d] = __float2bfloat16(0.f);
         return;
     }
 
@@ -402,21 +407,44 @@ __global__ __launch_bounds__(DIMS* SG) void mla_decode_reduce_kernel(
     if ((tid & 31) == 0) xchg[tid >> 5] = ls;
     __syncthreads();
     if (tid == 0) {
-        float t = 0.f;
-        for (int i = 0; i < NT / 32; ++i) t += xchg[i];
-        inv = t > 0.f ? 1.f / t : 0.f;
+        float v = 0.f;
+        for (int i = 0; i < NW; ++i) v += xchg[i];
+        inv = v > 0.f ? 1.f / v : 0.f;
     }
     __syncthreads();
 
-    float v = 0.f;
-    for (int s = sg; s < splits; s += SG)
-        v += part_o[(((size_t) b * splits + s) * H + h) * DV + d0 + di] * w[s];
-    red[sg * DIMS + di] = v;
-    __syncthreads();
-    if (sg == 0) {
+    float acc[VEC];
 #pragma unroll
-        for (int t = 1; t < SG; ++t) v += red[t * DIMS + di];
-        out[((size_t) b * H + h) * DV + d0 + di] = __float2bfloat16(v * inv);
+    for (int e = 0; e < VEC; ++e) acc[e] = 0.f;
+    for (int sp = g; sp < splits; sp += SG) {
+        const uint4 r = *reinterpret_cast<const uint4*>(
+            part_o + (((size_t) b * splits + sp) * H + h) * DV + d0 + t * VEC);
+        const float ws = w[sp];
+        const uint32_t* u = reinterpret_cast<const uint32_t*>(&r);
+#pragma unroll
+        for (int e = 0; e < VEC; e += 2) {
+            float lo, hi;
+            bf16x2_f32(u[e >> 1], lo, hi);
+            acc[e] = fmaf(lo, ws, acc[e]);
+            acc[e + 1] = fmaf(hi, ws, acc[e + 1]);
+        }
+    }
+    // Lanes of one warp span 32/TPG groups; fold those with shuffles, then the
+    // NW warps through shared.
+#pragma unroll
+    for (int off = TPG; off < 32; off <<= 1)
+#pragma unroll
+        for (int e = 0; e < VEC; ++e) acc[e] += __shfl_xor_sync(0xffffffff, acc[e], off);
+    if ((tid & 31) < TPG) {
+#pragma unroll
+        for (int e = 0; e < VEC; ++e) red[(tid >> 5) * DIMS + t * VEC + e] = acc[e];
+    }
+    __syncthreads();
+    for (int d = tid; d < DIMS; d += NT) {
+        float v = red[d];
+#pragma unroll
+        for (int i = 1; i < NW; ++i) v += red[i * DIMS + d];
+        out[((size_t) b * H + h) * DV + d0 + d] = __float2bfloat16(v * inv);
     }
 }
 
@@ -532,7 +560,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     const int splits = (topk + chunk - 1) / chunk;
 
     auto dev = q.device();
-    auto& po = grow(g_po, (int64_t) B * splits * H * DV, at::kFloat, dev);
+    auto& po = grow(g_po, (int64_t) B * splits * H * DV, at::kBFloat16, dev);
     auto& pm = grow(g_pm, (int64_t) B * splits * H, at::kFloat, dev);
     auto& pl = grow(g_pl, (int64_t) B * splits * H, at::kFloat, dev);
     auto out = at::empty({B, H, DV}, q.options());
@@ -553,14 +581,15 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
         (const __nv_bfloat16*) q.data_ptr(),
         (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),
         seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,
-        po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+        (__nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(), pl.data_ptr<float>(),
         H, topk, splits, chunk, (float) scale, hpb);
 
-    constexpr int RED_DIMS = 64, RED_SG = 4;
-    const size_t red_smem = ((size_t) splits + RED_SG * RED_DIMS) * sizeof(float);
-    mla_decode_reduce_kernel<512, RED_DIMS, RED_SG>
-        <<<dim3(H, B, 512 / RED_DIMS), RED_DIMS * RED_SG, red_smem, stream>>>(
-        po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+    constexpr int RED_DIMS = 64, RED_VEC = 8, RED_SG = 32;
+    constexpr int RED_NT = RED_DIMS / RED_VEC * RED_SG;
+    const size_t red_smem = ((size_t) splits + RED_NT / 32 * RED_DIMS) * sizeof(float);
+    mla_decode_reduce_kernel<512, RED_DIMS, RED_VEC, RED_SG>
+        <<<dim3(H, B, 512 / RED_DIMS), RED_NT, red_smem, stream>>>(
+        (const __nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(), pl.data_ptr<float>(),
         (__nv_bfloat16*) out.data_ptr(), H, splits);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
