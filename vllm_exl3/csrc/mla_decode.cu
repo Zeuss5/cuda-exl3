@@ -61,6 +61,18 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <map>
+#include <algorithm>
+
+#include "exl3_common.cuh"
+
+// bf16 -> fp32 is a 16-bit shift, so a packed pair unpacks with two ALU ops and
+// no round trip through memory. Taking the address of a loaded int4 to read it
+// as bf16 would have spilled it to local.
+__device__ __forceinline__ void bf16x2_f32(uint32_t u, float& a, float& b)
+{
+    a = __uint_as_float(u << 16);
+    b = __uint_as_float(u & 0xffff0000u);
+}
 
 namespace vllm_exl3 {
 
@@ -86,7 +98,22 @@ __device__ __forceinline__ float warp_sum(float v) {
 // local memory (v1 did exactly that and ran 3.4x slower than the kernel it was
 // meant to beat). Keys are staged a tile at a time through cp.async so several
 // latent rows are in flight instead of one.
-template <int D, int DV, int NWARPS, int HPW, int TILE>
+// Both matmuls run on tensor cores. A tile of keys is a matrix, so
+// S = Q @ K^T is an mma with m = 16 heads exactly, and `row.col` wants B stored
+// [n][k] = [key][dim], which is already the cache layout. O += P @ V is a second
+// mma with the roles rotated -- m = dim, n = head, k = key -- so V arrives as an
+// A fragment through the transposing ldmatrix, and P, produced [head][key], is
+// the B fragment as-is.
+//
+// Softmax runs once per tile rather than once per key. That is what makes the
+// mma possible at all (the accumulator can only be rescaled between mmas) and it
+// also cuts the rescale traffic by a factor of TILE.
+//
+// The shared row stride is padded by 8 halves: at the natural 576 the stride is
+// 1152 B = 288 words, a multiple of 32, so every group of lanes reading down a
+// column would land on the same four banks -- an 8-way conflict. At 584 the rows
+// step by 4 banks and every ldmatrix covers all 32 exactly once.
+template <int D, int DV, int NWARPS, int TILE>
 __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const __nv_bfloat16* __restrict__ q,     // (B, H, D)
     const __nv_bfloat16* __restrict__ kv,    // (rows, D) latent cache
@@ -97,123 +124,202 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     float* __restrict__ part_l,              // (B, splits, H)
     int H, int topk, int splits, int chunk, float scale, int hpb)
 {
+    constexpr int KS = D + 8;                // padded shared row stride
+    constexpr int NTHREADS = NWARPS * 32;
+    constexpr int MMA_M = 16;                // heads per QK tile
+    constexpr int NBLK = TILE / 8;           // QK n-blocks of 8 keys
+    constexpr int NBLK_E = NBLK < NWARPS ? NBLK : NWARPS;
+    constexpr int KSL = NWARPS / NBLK_E;     // leftover warps split D instead
+    constexpr int KSTEPS = (D / 16) / KSL;
+    constexpr int MTILES = DV / 16;          // PV m-tiles (dims)
+    constexpr int MTPW = MTILES / NWARPS;    // m-tiles per warp
+    constexpr int NT = MMA_M / 8;            // PV n-tiles (heads)
+    constexpr int PS = TILE + 8;             // padded P row stride
+    static_assert(NTHREADS >= MMA_M * TILE, "softmax pass needs one thread per score");
+    static_assert(TILE % 16 == 0, "PV mma consumes 16 keys at a time");
+
     extern __shared__ __align__(16) char smem_raw[];
-    __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);   // 2 x TILE x D
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // 16 x KS
+    __nv_bfloat16* k_s = q_s + MMA_M * KS;                                // TILE x KS
+    __nv_bfloat16* p_s = k_s + TILE * KS;                                 // 16 x PS
+    float* s_s = reinterpret_cast<float*>(p_s + MMA_M * PS);              // KSL x 16 x TILE
+    float* m_s = s_s + KSL * MMA_M * TILE;                                // 16
+    float* l_s = m_s + MMA_M;                                             // 16
+    float* c_s = l_s + MMA_M;                                             // 16
+    int* sel_s = reinterpret_cast<int*>(c_s + MMA_M);                     // chunk
+
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int s = blockIdx.x;
-    const int hg = blockIdx.y;               // head group
+    const int hg = blockIdx.y;
     const int b = blockIdx.z;
-    const int h0 = hg * hpb;                 // first head this block owns
-    constexpr int NTHREADS = NWARPS * 32;
-    constexpr int VPT = DV / 32;             // v dims each lane owns
+    const int h0 = hg * hpb;
 
     const int lo = s * chunk;
     const int valid = seqlens ? seqlens[b] : topk;
     const int hi = min(lo + chunk, valid);
 
-    constexpr int QPT = D / 32;              // q dims each lane owns
-    float acc[HPW][VPT], q_r[HPW][QPT];
-    float m_run[HPW], l_run[HPW];
-#pragma unroll
-    for (int i = 0; i < HPW; ++i) {
-        m_run[i] = -INFINITY;
-        l_run[i] = 0.f;
-#pragma unroll
-        for (int d = 0; d < VPT; ++d) acc[i][d] = 0.f;
-        // q is loop-invariant: hold this lane's slice in registers rather than
-        // re-reading it from global for every key (v2 did, and paid ~2x for it).
-        const int h = h0 + warp * HPW + i;
-        const __nv_bfloat16* qh = q + ((size_t) b * H + (h < H ? h : 0)) * D;
-#pragma unroll
-        for (int d = 0; d < QPT; ++d) q_r[i][d] = __bfloat162float(qh[d * 32 + lane]);
+    // Q for this block's heads, staged once.
+    for (int i = tid; i < MMA_M * D; i += NTHREADS) {
+        const int r = i / D, c = i % D;
+        const int h = h0 + r;
+        q_s[r * KS + c] = (r < hpb && h < H) ? q[((size_t) b * H + h) * D + c]
+                                             : __float2bfloat16(0.f);
     }
+    if (tid < MMA_M) { m_s[tid] = -INFINITY; l_s[tid] = 0.f; }
 
-    // Stage one tile of latent rows into shared; rows that do not exist are
-    // left alone and masked out by `n` below.
-    auto stage = [&](int buf, int base) {
-        const int n = max(0, min(TILE, hi - base));
-        __nv_bfloat16* dst = k_s + buf * TILE * D;
-        for (int i = tid; i < n * (D / 8); i += NTHREADS) {
+    // acc[t][n] holds C[dim][head] for m-tile (warp + t*NWARPS), n-tile n.
+    FragC acc[MTPW][NT];
+#pragma unroll
+    for (int t = 0; t < MTPW; ++t)
+#pragma unroll
+        for (int nn = 0; nn < NT; ++nn)
+#pragma unroll
+            for (int f = 0; f < 4; ++f) acc[t][nn][f] = 0.f;
+
+    // The selection list is a gather: reading it inside the staging loop puts a
+    // dependent global load in front of every cp.async, which pins the kernel on
+    // long_scoreboard. It is at most `chunk` ints, so hoist it.
+    for (int i = tid; i < hi - lo; i += NTHREADS) sel_s[i] = sel[(size_t) b * topk + lo + i];
+    __syncthreads();
+
+    const int ntiles = (hi - lo + TILE - 1) / TILE;
+
+    for (int t = 0; t < ntiles; ++t) {
+        const int base = lo + t * TILE;
+        const int n = min(TILE, hi - base);
+
+        for (int i = tid; i < TILE * (D / 8); i += NTHREADS) {
             const int r = i / (D / 8), c = (i % (D / 8)) * 8;
-            const int row = sel[(size_t) b * topk + base + r];
-            void* d_ = dst + r * D + c;
+            const int row = (r < n) ? sel_s[t * TILE + r] : -1;
+            void* dst = k_s + r * KS + c;
             if (row >= 0) {
                 const __nv_bfloat16* src = kv + (size_t) row * D + c;
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                             :: "r"((uint32_t) __cvta_generic_to_shared(d_)), "l"(src));
+                             :: "r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src));
             } else {
-                *reinterpret_cast<int4*>(d_) = int4{0, 0, 0, 0};
+                *reinterpret_cast<int4*>(dst) = int4{0, 0, 0, 0};
             }
         }
         asm volatile("cp.async.commit_group;\n" ::);
-    };
-
-    stage(0, lo);
-    int buf = 0;
-    for (int base = lo; base < hi; base += TILE) {
-        const int n = min(TILE, hi - base);
-        // Always commit, even past the end (stage clamps to zero rows). The
-        // group count then stays predictable and wait_group(1) really does wait
-        // for the tile we are about to read.
-        stage(buf ^ 1, base + TILE);
-        asm volatile("cp.async.wait_group %0;\n" :: "n"(1));
+        asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();
 
-        const __nv_bfloat16* tile = k_s + buf * TILE * D;
-
-        // Score the whole tile before consuming it. Done key-by-key, each
-        // iteration is a dependent chain -- 18 FMAs, a five-deep shuffle
-        // reduction, two exps -- and the next key cannot start. Batching the
-        // partial dots first gives TILE*HPW independent chains to interleave.
-        float part[TILE][HPW];
+        // S[16 heads][TILE keys] = Q @ K^T
+        {
+            const int nb_w = warp % NBLK_E, ksl = warp / NBLK_E;
+            for (int nb = nb_w; nb < NBLK; nb += NBLK_E) {
+                FragC c{};
 #pragma unroll
-        for (int j = 0; j < TILE; ++j) {
-            const __nv_bfloat16* k = tile + j * D;
+                for (int f = 0; f < 4; ++f) c[f] = 0.f;
+                for (int ki = 0; ki < KSTEPS; ++ki) {
+                    const int k0 = (ksl * KSTEPS + ki) * 16;
+                    FragA fa;
+                    ldsm4(fa, q_s + ((lane & 7) + 8 * ((lane >> 3) & 1)) * KS
+                                  + k0 + (lane >> 4) * 8);
+                    FragB fb;
+                    const __nv_bfloat16* krow = k_s + (nb * 8 + (lane >> 2)) * KS
+                                              + k0 + (lane & 3) * 2;
+                    reinterpret_cast<uint32_t*>(&fb)[0] =
+                        *reinterpret_cast<const uint32_t*>(krow);
+                    reinterpret_cast<uint32_t*>(&fb)[1] =
+                        *reinterpret_cast<const uint32_t*>(krow + 8);
+                    mma_m16n8k16_bf16(fa, fb, c);
+                }
+                const int cr = lane >> 2, cc = (lane & 3) * 2;
 #pragma unroll
-            for (int i = 0; i < HPW; ++i) {
-                float dot = 0.f;
-#pragma unroll
-                for (int d = 0; d < QPT; ++d)
-                    dot += q_r[i][d] * __bfloat162float(k[d * 32 + lane]);
-                part[j][i] = dot;
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < TILE; ++j)
-#pragma unroll
-            for (int i = 0; i < HPW; ++i) part[j][i] = warp_sum(part[j][i]);
-
-        for (int j = 0; j < n; ++j) {
-            if (sel[(size_t) b * topk + base + j] < 0) continue;   // empty slot
-            const __nv_bfloat16* k = tile + j * D;
-#pragma unroll
-            for (int i = 0; i < HPW; ++i) {
-                if (h0 + warp * HPW + i >= H) break;
-                const float sc = part[j][i] * scale;
-                const float m_new = fmaxf(m_run[i], sc);
-                const float corr = __expf(m_run[i] - m_new);
-                const float p = __expf(sc - m_new);
-                l_run[i] = l_run[i] * corr + p;
-                m_run[i] = m_new;
-#pragma unroll
-                for (int d = 0; d < VPT; ++d)
-                    acc[i][d] = acc[i][d] * corr + p * __bfloat162float(k[d * 32 + lane]);
+                for (int f = 0; f < 2; ++f) {
+                    float* sp = s_s + ksl * (MMA_M * TILE) + nb * 8 + cc + f;
+                    sp[(cr + 0) * TILE] = c[f];
+                    sp[(cr + 8) * TILE] = c[2 + f];
+                }
             }
         }
         __syncthreads();
-        buf ^= 1;
+
+        // Tile softmax: one thread per (head, key), reduced across the TILE
+        // lanes that share a head.
+        for (int i = tid; i < MMA_M * TILE; i += NTHREADS) {
+            const int h = i / TILE, j = i % TILE;
+            float raw = s_s[h * TILE + j];
+#pragma unroll
+            for (int u = 1; u < KSL; ++u) raw += s_s[u * (MMA_M * TILE) + h * TILE + j];
+            float sc = (j < n && sel_s[t * TILE + j] >= 0) ? raw * scale : -INFINITY;
+
+            float mt = sc;
+#pragma unroll
+            for (int off = TILE >> 1; off; off >>= 1)
+                mt = fmaxf(mt, __shfl_xor_sync(0xffffffff, mt, off));
+            const float m_old = m_s[h];
+            const float m_new = fmaxf(m_old, mt);
+            const bool empty = !isfinite(m_new);
+            const float corr = empty ? 1.f : __expf(m_old - m_new);
+            const float p = empty ? 0.f : __expf(sc - m_new);
+            p_s[h * PS + j] = __float2bfloat16(p);
+
+            float ps = p;
+#pragma unroll
+            for (int off = TILE >> 1; off; off >>= 1)
+                ps += __shfl_xor_sync(0xffffffff, ps, off);
+            __syncwarp();
+            if (j == 0) { m_s[h] = m_new; l_s[h] = l_s[h] * corr + ps; c_s[h] = corr; }
+        }
+        __syncthreads();
+
+        // O = O * corr + P @ V, with V transposed on the way out of shared.
+#pragma unroll
+        for (int nn = 0; nn < NT; ++nn) {
+            const int hb = nn * 8 + (lane & 3) * 2;
+            const float c0 = c_s[hb], c1 = c_s[hb + 1];
+#pragma unroll
+            for (int mt = 0; mt < MTPW; ++mt) {
+                acc[mt][nn][0] *= c0; acc[mt][nn][1] *= c1;
+                acc[mt][nn][2] *= c0; acc[mt][nn][3] *= c1;
+            }
+        }
+        for (int kb = 0; kb < TILE; kb += 16) {
+            FragB fb[NT];
+#pragma unroll
+            for (int nn = 0; nn < NT; ++nn) {
+                const __nv_bfloat16* pr = p_s + (nn * 8 + (lane >> 2)) * PS
+                                        + kb + (lane & 3) * 2;
+                reinterpret_cast<uint32_t*>(&fb[nn])[0] =
+                    *reinterpret_cast<const uint32_t*>(pr);
+                reinterpret_cast<uint32_t*>(&fb[nn])[1] =
+                    *reinterpret_cast<const uint32_t*>(pr + 8);
+            }
+#pragma unroll
+            for (int mt = 0; mt < MTPW; ++mt) {
+                const int mbase = (warp + mt * NWARPS) * 16;
+                FragA fa;
+                ldsm4_trans(fa, k_s + (kb + 8 * (lane >> 4) + (lane & 7)) * KS
+                                    + mbase + 8 * ((lane >> 3) & 1));
+#pragma unroll
+                for (int nn = 0; nn < NT; ++nn) mma_m16n8k16_bf16(fa, fb[nn], acc[mt][nn]);
+            }
+        }
+        __syncthreads();
     }
 
+    if (tid < MMA_M && tid < hpb && h0 + tid < H) {
+        const size_t o = ((size_t) b * splits + s) * H + h0 + tid;
+        part_m[o] = m_s[tid]; part_l[o] = l_s[tid];
+    }
 #pragma unroll
-    for (int i = 0; i < HPW; ++i) {
-        const int h = h0 + warp * HPW + i;
-        if (h >= H) break;
-        const size_t base = (((size_t) b * splits + s) * H + h);
-        if (lane == 0) { part_m[base] = m_run[i]; part_l[base] = l_run[i]; }
+    for (int mt = 0; mt < MTPW; ++mt) {
+        const int mbase = (warp + mt * NWARPS) * 16;
 #pragma unroll
-        for (int d = 0; d < VPT; ++d) part_o[base * DV + d * 32 + lane] = acc[i][d];
+        for (int nn = 0; nn < NT; ++nn) {
+            const int hb = nn * 8 + (lane & 3) * 2;
+            const int d0 = mbase + (lane >> 2);
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                const int hl = hb + (f & 1), dd = d0 + 8 * (f >> 1);
+                if (hl >= hpb || h0 + hl >= H) continue;
+                part_o[(((size_t) b * splits + s) * H + h0 + hl) * DV + dd] = acc[mt][nn][f];
+            }
+        }
     }
 }
 
@@ -325,7 +431,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     TORCH_CHECK(D == 576 && DV == 512,
                 "mla_decode: built for head_dim 576 / v_head_dim 512, got ", D, "/", DV);
 
-    constexpr int TILE = 8;
+    constexpr int TILE = 16;
     int chunk = (int) split_chunk;
     int hpb_in = (int) heads_per_block;
     if (chunk <= 0 || hpb_in <= 0) {
@@ -333,16 +439,16 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
         auto& cache = mla_tune_cache();
         auto it = cache.find(key);
         if (it == cache.end()) {
-            std::pair<int, int> best{32, H};
+            std::pair<int, int> best{32, std::min(H, 16)};
             if (mla_tuning_enabled() &&
                 at::cuda::currentStreamCaptureStatusMayInitCtx() ==
                     at::cuda::CaptureStatus::None) {
                 float best_ms = 1e30f;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
-                for (int c : {16, 32, 64, 128}) {
-                    for (int hb : {H, H / 2, H / 4}) {
-                        if (hb < 1 || H % hb) continue;
+                for (int c : {16, 32, 64, 128, 256}) {
+                    const int hb = std::min(H, 16);
+                    {
                         mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, hb);
                         cudaEventRecord(beg);
                         for (int r = 0; r < 3; ++r)
@@ -363,16 +469,10 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // Splitting keys needs an LSE merge, so more splits means a bigger partial
     // buffer and a costlier reduce. Splitting *heads* costs nothing -- their
     // outputs are disjoint -- at the price of re-reading K once per head group.
-    // With DRAM at 8.9% and occupancy at 16.6%, that is the right trade.
-    int hpb = hpb_in;
-    if (hpb <= 0 || hpb > H) hpb = H;
-    TORCH_CHECK(H % hpb == 0, "mla_decode: heads_per_block must divide ", H);
-    const int hgroups = H / hpb;
-    // Warps follow the head count: with NWARPS pinned at 8, a 4-head block left
-    // half its warps with no head to own.
-    const int nwarps = hpb >= 8 ? 8 : hpb;
-    const int hpw = (hpb + nwarps - 1) / nwarps;
-    TORCH_CHECK(hpw <= 4, "mla_decode: at most 4 heads per warp");
+    // The mma tile is 16 heads wide, so that is the only useful group size.
+    const int hpb = std::min(H, 16);
+    const int hgroups = (H + hpb - 1) / hpb;
+    (void) hpb_in;
 
     const int splits = (topk + chunk - 1) / chunk;
 
@@ -383,31 +483,23 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     auto out = at::empty({B, H, DV}, q.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    const size_t smem = 2 * TILE * 576 * sizeof(__nv_bfloat16);
+    constexpr int NWARPS = 8;
+    constexpr int KSL = NWARPS / (TILE / 8);
+    const size_t smem = (16 + TILE) * (576 + 8) * sizeof(__nv_bfloat16)
+                      + 16 * (TILE + 8) * sizeof(__nv_bfloat16)
+                      + (size_t) KSL * 16 * TILE * sizeof(float)
+                      + 3 * 16 * sizeof(float)
+                      + (size_t) chunk * sizeof(int);
 
     dim3 grid(splits, hgroups, B);
-#define MLA_LAUNCH(NW_, HPW_)                                                  \
-    mla_decode_partial_kernel<576, 512, NW_, HPW_, TILE>                       \
-        <<<grid, NW_ * 32, smem, stream>>>(                                    \
-            (const __nv_bfloat16*) q.data_ptr(),                               \
-            (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),         \
-            seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,               \
-            po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),  \
-            H, topk, splits, chunk, (float) scale, hpb)
-
-    if (nwarps == 8) {
-        if (hpw <= 1) { MLA_LAUNCH(8, 1); }
-        else if (hpw == 2) { MLA_LAUNCH(8, 2); }
-        else if (hpw == 3) { MLA_LAUNCH(8, 3); }
-        else { MLA_LAUNCH(8, 4); }
-    } else if (nwarps == 4) {
-        MLA_LAUNCH(4, 1);
-    } else if (nwarps == 2) {
-        MLA_LAUNCH(2, 1);
-    } else {
-        MLA_LAUNCH(1, 1);
-    }
-#undef MLA_LAUNCH
+    auto kern = mla_decode_partial_kernel<576, 512, NWARPS, TILE>;
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, 101376);
+    kern<<<grid, NWARPS * 32, smem, stream>>>(
+        (const __nv_bfloat16*) q.data_ptr(),
+        (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),
+        seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,
+        po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+        H, topk, splits, chunk, (float) scale, hpb);
 
     constexpr int RED_DIMS = 64;
     mla_decode_reduce_kernel<512, RED_DIMS>

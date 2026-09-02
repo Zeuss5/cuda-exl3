@@ -100,6 +100,22 @@ __device__ __forceinline__ void cp_async_wait_all()
 }
 
 // Load four 8x8 b16 tiles straight into mma A-fragment layout.
+// bf16 inputs, fp32 accumulate. The fp16 form above cannot be reused for
+// attention: bf16 and fp16 have different exponent widths, so reinterpreting
+// one as the other silently rescales every value.
+__device__ __forceinline__ void mma_m16n8k16_bf16(const FragA& a, const FragB& b,
+                                                  FragC& c)
+{
+    const uint32_t* A = reinterpret_cast<const uint32_t*>(&a);
+    const uint32_t* B = reinterpret_cast<const uint32_t*>(&b);
+    float* C = reinterpret_cast<float*>(&c);
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]));
+}
+
 __device__ __forceinline__ void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
@@ -107,6 +123,16 @@ __device__ __forceinline__ void ldsm4(FragA& frag_a, const void* smem_ptr)
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                  : "r"(smem));
+}
+
+// Same, but transposing each 8x8 tile. O += P @ V wants V as [dim][key] while
+// the cache holds [key][dim]; .trans supplies the transpose for free.
+__device__ __forceinline__ void ldsm4_trans(FragA& frag_a, const void* smem_ptr)
+{
+    uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
 }
 
 // ---------------------------------------------------------------------------

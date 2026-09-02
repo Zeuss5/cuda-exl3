@@ -27,11 +27,11 @@ for B in (1,4,16):
     sel=torch.stack([torch.randperm(rows,device=dev)[:topk] for _ in range(B)]).int()
     sl=torch.full((B,),topk,device=dev,dtype=torch.int32)
     sol=B*topk*D*2/HBM*1e6; best=None
-    for chunk,hpb in itertools.product((16,24,32,64,128),(16,8,4,2)):
+    for chunk,hpb in itertools.product((16,32,64,128,256,512),(16,)):
         f=lambda c=chunk,h=hpb: torch.ops.vllm_exl3_C.mla_decode(q,kv,sel,sl,1.0/(D**0.5),DV,c,h)
         try: us=gt(f)
         except Exception: continue
-        blocks=((topk+chunk-1)//chunk)*(H//hpb)*B
+        blocks=((topk+chunk-1)//chunk)*((H+hpb-1)//hpb)*B
         if best is None or us<best[0]: best=(us,chunk,hpb,blocks)
     print(f"{B:>3d} {best[1]:>6d} {best[2]:>4d} {best[3]:>7d} {best[0]:>7.1f} {sol/best[0]*100:>5.1f}%"
           f"   [b12x {'20.5' if B==1 else '21.0' if B==4 else '30.6'}]")
