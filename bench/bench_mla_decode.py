@@ -1,7 +1,10 @@
 import torch, itertools
 from vllm_exl3 import ops as _ops
 _ops._try_native()
-dev="cuda"; torch.manual_seed(0); D,DV,HBM=576,512,1.79e12
+import sys
+dev="cuda"; torch.manual_seed(0)
+D=int(sys.argv[1]) if len(sys.argv)>1 else 576
+DV,HBM=512,1.79e12
 SMS=torch.cuda.get_device_properties(0).multi_processor_count
 def gt(f,reps=50,inner=20):
     for _ in range(5): f()
@@ -22,6 +25,7 @@ def gt(f,reps=50,inner=20):
     return a.elapsed_time(b)/reps/inner*1000
 H,topk,rows=16,2048,8192
 kv=torch.randn(rows,D,device=dev,dtype=torch.bfloat16)*0.05
+print(f"head_dim={D} v_head_dim={DV} heads={H} topk={topk}")
 print(f"{'B':>3s} {'chunk':>6s} {'wide':>5s} {'blocks':>7s} {'us':>7s} {'%roof':>6s}")
 for B in (1,4,16):
     q=torch.randn(B,H,D,device=dev,dtype=torch.bfloat16)*0.05

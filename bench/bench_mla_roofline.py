@@ -13,7 +13,9 @@ dev = torch.device("cuda")
 HBM = 1.79e12
 torch.manual_seed(0)
 
-HEAD_DIM, V_HEAD_DIM, PAGE = 576, 512, 64
+import os
+HEAD_DIM = int(os.environ.get("MLA_HEAD_DIM", 576))
+V_HEAD_DIM, PAGE = 512, 64
 TOPK = 2048                      # GLM index_topk
 HEADS_TP4 = 64 // 4              # 64 heads, TP=4
 
@@ -87,6 +89,7 @@ for batch in (1, 4, 16):
             f()
             us = tm(f)
         except Exception as e:
+            if os.environ.get('MLA_VERBOSE'): print('  ', backend, splits, type(e).__name__, str(e)[:200])
             continue
         tag = (backend or "default", "auto" if splits is None else splits)
         print(f"{batch:>6d} {str(tag[0]):>10s} {str(tag[1]):>7s} {us:>8.1f} "

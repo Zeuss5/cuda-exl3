@@ -531,8 +531,11 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     const int B = (int) q.size(0), H = (int) q.size(1), D = (int) q.size(2);
     const int topk = (int) sel.size(1);
     const int DV = (int) v_head_dim;
-    TORCH_CHECK(D == 576 && DV == 512,
-                "mla_decode: built for head_dim 576 / v_head_dim 512, got ", D, "/", DV);
+    // 576 is the DeepSeek latent (512 nope + 64 rope); 512 is GLM-5.3-Flash,
+    // which has qk_rope_head_dim = 0.
+    TORCH_CHECK((D == 576 || D == 512) && DV == 512,
+                "mla_decode: built for head_dim 576 or 512 with v_head_dim 512, got ",
+                D, "/", DV);
 
     int chunk = (int) split_chunk;
     int wide = (int) heads_per_block;  // 1: 8 warps x 16 keys, 2: 16 warps x 32
@@ -586,15 +589,15 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // Two block shapes. The wide one halves the block count for the same thread
     // count, which halves both the Q re-read and the partial write: those are
     // per block, not per key, and at low batch they outweigh the cache traffic.
-#define MLA_LAUNCH(NW_, TILE_)                                                 \
+#define MLA_LAUNCH(D_, NW_, TILE_)                                             \
     do {                                                                       \
         constexpr int KSL_ = (NW_) / ((TILE_) / 8);                            \
-        const size_t smem = 2 * (TILE_) * (576 + 8) * sizeof(__nv_bfloat16)     \
+        const size_t smem = 2 * (TILE_) * ((D_) + 8) * sizeof(__nv_bfloat16)   \
                           + 16 * ((TILE_) + 8) * sizeof(__nv_bfloat16)         \
                           + (size_t) KSL_ * 16 * (TILE_) * sizeof(float)       \
                           + 3 * 16 * sizeof(float)                             \
                           + (size_t) chunk * sizeof(int);                      \
-        auto kern = mla_decode_partial_kernel<576, 512, NW_, TILE_>;           \
+        auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_>;            \
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,\
                              101376);                                          \
         kern<<<grid, (NW_) * 32, smem, stream>>>(                              \
@@ -606,7 +609,11 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     } while (0)
 
     dim3 grid(splits, hgroups, B);
-    if (wide >= 2) { MLA_LAUNCH(16, 32); } else { MLA_LAUNCH(8, 16); }
+    if (D == 576) {
+        if (wide >= 2) { MLA_LAUNCH(576, 16, 32); } else { MLA_LAUNCH(576, 8, 16); }
+    } else {
+        if (wide >= 2) { MLA_LAUNCH(512, 16, 32); } else { MLA_LAUNCH(512, 8, 16); }
+    }
 #undef MLA_LAUNCH
 
     constexpr int RED_DIMS = 64, RED_VEC = 8, RED_SG = 32;
