@@ -514,15 +514,14 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     TORCH_CHECK(D == 576 && DV == 512,
                 "mla_decode: built for head_dim 576 / v_head_dim 512, got ", D, "/", DV);
 
-    constexpr int TILE = 16;
     int chunk = (int) split_chunk;
-    int hpb_in = (int) heads_per_block;
-    if (chunk <= 0 || hpb_in <= 0) {
+    int wide = (int) heads_per_block;  // 1: 8 warps x 16 keys, 2: 16 warps x 32
+    if (chunk <= 0 || wide <= 0) {
         const uint64_t key = mla_tune_key(B, H, topk);
         auto& cache = mla_tune_cache();
         auto it = cache.find(key);
         if (it == cache.end()) {
-            std::pair<int, int> best{32, std::min(H, 16)};
+            std::pair<int, int> best{32, 1};
             if (mla_tuning_enabled() &&
                 at::cuda::currentStreamCaptureStatusMayInitCtx() ==
                     at::cuda::CaptureStatus::None) {
@@ -530,16 +529,15 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
                 for (int c : {16, 32, 64, 128, 256}) {
-                    const int hb = std::min(H, 16);
-                    {
-                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, hb);
+                    for (int wd : {1, 2}) {
+                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
                         cudaEventRecord(beg);
                         for (int r = 0; r < 3; ++r)
-                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, hb);
+                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd);
                         cudaEventRecord(end);
                         cudaEventSynchronize(end);
                         float ms = 0.f; cudaEventElapsedTime(&ms, beg, end);
-                        if (ms < best_ms) { best_ms = ms; best = {c, hb}; }
+                        if (ms < best_ms) { best_ms = ms; best = {c, wd}; }
                     }
                 }
                 cudaEventDestroy(beg); cudaEventDestroy(end);
@@ -547,7 +545,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
             it = cache.emplace(key, best).first;
         }
         if (chunk <= 0) chunk = it->second.first;
-        if (hpb_in <= 0) hpb_in = it->second.second;
+        if (wide <= 0) wide = it->second.second;
     }
     // Splitting keys needs an LSE merge, so more splits means a bigger partial
     // buffer and a costlier reduce. Splitting *heads* costs nothing -- their
@@ -555,7 +553,6 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // The mma tile is 16 heads wide, so that is the only useful group size.
     const int hpb = std::min(H, 16);
     const int hgroups = (H + hpb - 1) / hpb;
-    (void) hpb_in;
 
     const int splits = (topk + chunk - 1) / chunk;
 
@@ -566,23 +563,31 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     auto out = at::empty({B, H, DV}, q.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    constexpr int NWARPS = 8;
-    constexpr int KSL = NWARPS / (TILE / 8);
-    const size_t smem = (16 + TILE) * (576 + 8) * sizeof(__nv_bfloat16)
-                      + 16 * (TILE + 8) * sizeof(__nv_bfloat16)
-                      + (size_t) KSL * 16 * TILE * sizeof(float)
-                      + 3 * 16 * sizeof(float)
-                      + (size_t) chunk * sizeof(int);
+    // Two block shapes. The wide one halves the block count for the same thread
+    // count, which halves both the Q re-read and the partial write: those are
+    // per block, not per key, and at low batch they outweigh the cache traffic.
+#define MLA_LAUNCH(NW_, TILE_)                                                 \
+    do {                                                                       \
+        constexpr int KSL_ = (NW_) / ((TILE_) / 8);                            \
+        const size_t smem = (16 + (TILE_)) * (576 + 8) * sizeof(__nv_bfloat16) \
+                          + 16 * ((TILE_) + 8) * sizeof(__nv_bfloat16)         \
+                          + (size_t) KSL_ * 16 * (TILE_) * sizeof(float)       \
+                          + 3 * 16 * sizeof(float)                             \
+                          + (size_t) chunk * sizeof(int);                      \
+        auto kern = mla_decode_partial_kernel<576, 512, NW_, TILE_>;           \
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,\
+                             101376);                                          \
+        kern<<<grid, (NW_) * 32, smem, stream>>>(                              \
+            (const __nv_bfloat16*) q.data_ptr(),                               \
+            (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),         \
+            seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,               \
+            (__nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(),              \
+            pl.data_ptr<float>(), H, topk, splits, chunk, (float) scale, hpb); \
+    } while (0)
 
     dim3 grid(splits, hgroups, B);
-    auto kern = mla_decode_partial_kernel<576, 512, NWARPS, TILE>;
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, 101376);
-    kern<<<grid, NWARPS * 32, smem, stream>>>(
-        (const __nv_bfloat16*) q.data_ptr(),
-        (const __nv_bfloat16*) kv.data_ptr(), sel.data_ptr<int>(),
-        seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,
-        (__nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(), pl.data_ptr<float>(),
-        H, topk, splits, chunk, (float) scale, hpb);
+    if (wide >= 2) { MLA_LAUNCH(16, 32); } else { MLA_LAUNCH(8, 16); }
+#undef MLA_LAUNCH
 
     constexpr int RED_DIMS = 64, RED_VEC = 8, RED_SG = 32;
     constexpr int RED_NT = RED_DIMS / RED_VEC * RED_SG;
