@@ -22,6 +22,9 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
                          at::IntArrayRef group_n, int64_t cb, int64_t block_m,
                          at::ScalarType out_dtype);
+at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
+                      const at::Tensor& sel, const at::Tensor& seqlens,
+                      double scale, int64_t v_head_dim, int64_t split_chunk);
 at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
                        const at::Tensor& suh, const at::Tensor& svh,
                        at::IntArrayRef group_n, int64_t cb, bool split_k);
@@ -54,6 +57,9 @@ TORCH_LIBRARY(vllm_exl3_C, m)
     m.def(
         "exl3_moe_combine(Tensor rows_out, Tensor sorted_ids, Tensor topk_weights, "
         "int num_tokens) -> Tensor");
+    m.def(
+        "mla_decode(Tensor q, Tensor kv, Tensor sel, Tensor seqlens, float scale, "
+        "int v_head_dim, int split_chunk) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
@@ -66,6 +72,7 @@ TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
     m.impl("exl3_moe_glu_had_in", &vllm_exl3::exl3_moe_glu_had_in);
     m.impl("exl3_moe_gemm", &vllm_exl3::exl3_moe_gemm);
     m.impl("exl3_moe_combine", &vllm_exl3::exl3_moe_combine);
+    m.impl("mla_decode", &vllm_exl3::mla_decode);
 }
 
 TORCH_LIBRARY_IMPL(vllm_exl3_C, CompositeExplicitAutograd, m)

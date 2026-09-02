@@ -39,6 +39,7 @@ sources = [
         "bindings.cpp",
         "hadamard.cu",
         "gemm.cu",
+        "mla_decode.cu",
     ]
 ]
 
