@@ -325,6 +325,43 @@ weights to dequantize into bf16 mma while NVFP4 feeds FP4 tensor cores directly:
 NVFP4 wins by 24% at c=32 and 42% at c=64. Prefill is the same effect at its
 extreme -- **2.3x**.
 
+### MoE: Qwen3.6-35B-A3B
+
+`nvidia/Qwen3.6-35B-A3B-NVFP4` vs `UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw`,
+same harness. Neither checkpoint ships a `kv_cache_scheme`, so both ran BF16 KV
+with nothing to match by hand. On SM120 the only NVFP4 MoE backends that load at
+all are `auto` and `flashinfer_b12x` -- `flashinfer_cutedsl` and `cutlass` both
+reject the scheme on this device.
+
+| tok/s | NVFP4 b12x | NVFP4 auto | EXL3 4.00bpw |
+|---|---|---|---|
+| prefill | **34,316** | 30,038 | 24,394 |
+| c=1 | 211.7 | **213.9** | 204.6 |
+| c=8 | **799.1** | 777.5 | 746.5 |
+| c=32 | **1390.4** | 1375.9 | 1185.3 |
+| c=64 | **1674.7** | 1632.9 | 1424.0 |
+
+Decode alone (concurrency / mean TPOT):
+
+| decode tok/s | NVFP4 b12x | NVFP4 auto | EXL3 4.00bpw |
+|---|---|---|---|
+| c=1 | 221.2 | **225.2** | 218.3 |
+| c=8 | **870.5** | 860.2 | 852.9 |
+| c=32 | 1607.2 | **1636.8** | 1451.9 |
+| c=64 | 2006.9 | **2017.0** | 1824.9 |
+
+The gap is far smaller than on the dense model: EXL3 is within **3% at c=1** and
+**2% at c=8** on decode, and 11-13% behind at c=32-64, against 2.3x on dense
+prefill and 42% on dense decode at c=64. MoE decode streams one expert slice per
+row-block and is weight-bound almost everywhere, which is the regime the trellis
+is competitive in -- there is much less compute-bound headroom for FP4 tensor
+cores to exploit. Prefill still favours NVFP4, but by 1.41x rather than 2.3x.
+
+EXL3 also leaves considerably more room for context: 65.44 GiB of KV against
+51.59 GiB at the same `--gpu-memory-utilization 0.9`, i.e. 2.56M vs 2.02M tokens
+(**+27%**), from an 18.07 GiB checkpoint against 21.85 GiB. For MoE, `auto` is
+already fine for decode; `flashinfer_b12x` is worth 14% on prefill.
+
 So EXL3 is the better choice for local, low-concurrency serving on this hardware,
 and NVFP4 for prefill-heavy or high-concurrency serving. Closing the compute-bound
 gap needs a codebook that decodes into fp8/nvfp4 rather than bf16 -- a format
