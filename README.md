@@ -576,20 +576,29 @@ about 8 us, roughly 40x the rate of local shared memory on the same chip.
 Consumer Blackwell implements the cluster programming model without the fast
 interconnect that makes it worth using on datacenter parts.
 
-**32 keys per tile on 8 warps with a single buffer**, to get twice the mma
-between barriers at the same occupancy. **1.8x slower.** Losing the `cp.async`
-prefetch costs far more than the barriers save, even at prefill where the cache
-is L2-resident and there are thousands of blocks: sixteen warps per SM cannot
-hide an L2 round trip when all of them stall at the same barrier.
+The tile geometry is a local optimum, and the whole neighbourhood was measured.
+Prefill runs at ~140 TFLOPS against this card's 417, with the tensor pipe at
+30%, so the question is what the other 70% waits for. Every neighbour is worse,
+each for a different reason:
 
-That result, plus the register and shared budgets, is the ceiling for this
-design and worth writing down. Two blocks per SM, capped by 43 KB of shared and
-122 registers per thread, so 16 warps and about 30% of the tensor pipe against
-cuBLAS's 417 TFLOPS. A 16-warp block lands in exactly the same place, because
-the register budget then halves the block count. Getting past it needs the K
-tile in shared to shrink, and double buffering plus a 16-bit `mma` between them
-forbid that -- an fp8 tile would halve it, but `ldmatrix` is 16-bit only and the
-PV fragment needs the transposing form.
+| variant | result | why |
+|---|---|---|
+| 8 warps, 32-key tile, **one** buffer | 1.8x slower | twice the mma between barriers, but losing the `cp.async` prefetch costs more than the barriers save |
+| **16 warps**, 16-key tile | 2.2x slower | halves per-thread accumulators and held Q fragments, so the compiler lands at **61 registers instead of 122** and occupancy doubles, **33% -> 66%** of peak warps. **The tensor pipe does not move off 30%.** |
+| 8 warps, 32-key tile, two buffers | 2.5x slower | keeps the prefetch and doubles mma per warp per barrier, but a 32-key tile forces the k-slices to two, so each warp holds 16 Q fragments -- 64 registers -- and the register file gives out |
+| 16 warps, 32-key tile | declined by the autotuner at every size | -- |
+
+The 16-warp row is the informative one: **occupancy is not what binds this
+kernel.** Doubling resident warps changed nothing, so the earlier reading in
+this README -- that two blocks per SM was the ceiling and more warps would help
+-- was wrong. Halving the work each warp does between the same four barriers
+costs more than the extra warps return.
+
+The two knobs that would raise mma-per-barrier both raise register pressure
+through the held Q fragments; the one that lowers register pressure lowers work
+per barrier instead. Moving past 30% needs the ratio of mma to
+softmax-and-staging work *inside* a tile to change, which is a different kernel
+rather than a different tiling of this one.
 
 One thing that did work, from the same investigation: the selection list used to
 be copied into shared a whole chunk at a time, which is 8 KB at chunk 2048 --

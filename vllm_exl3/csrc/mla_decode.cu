@@ -828,12 +828,32 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     } while (0)
 
     dim3 grid(splits, hgroups, B);
-// 32 keys per tile on 8 warps with a single buffer was tried here: twice the
-// mma between barriers for the same occupancy, at the price of the cp.async
-// prefetch. It is 1.8x slower. Losing the prefetch costs far more than the
-// barriers save, even at prefill where the cache is L2-resident and there are
-// thousands of blocks -- 16 warps per SM is not enough to hide an L2 round trip
-// when every one of them stalls at the same barrier.
+// This shape is a local optimum, and the search around it is worth recording
+// because every neighbour is worse for a different reason. Prefill sits at
+// ~150 TFLOPS against this card's 417, with the tensor pipe at 30%, so the
+// question was always what the other 70% is waiting for.
+//
+//   8 warps, 32-key tile, one buffer   1.8x slower. Twice the mma between
+//     barriers, but losing the cp.async prefetch costs more than the barriers
+//     save.
+//   16 warps, 16-key tile              2.2x slower, and the most informative.
+//     It halves per-thread accumulators and held Q fragments, so the compiler
+//     lands at 61 registers instead of 122 and occupancy doubles, 33% -> 66% of
+//     peak warps. The tensor pipe does not move off 30%. Occupancy is simply
+//     not what binds here; halving the work each warp does between the same
+//     four barriers costs more than the extra warps return.
+//   8 warps, 32-key tile, two buffers  2.5x slower. Keeps the prefetch and
+//     doubles the mma per warp per barrier, but a 32-key tile forces the
+//     k-slices down to two, so each warp holds 16 Q fragments instead of 8 --
+//     64 registers of them -- and the register file gives out.
+//   16 warps, 32-key tile              already in the search as shape 2, and
+//     the autotuner declines it at every size.
+//
+// So the tile geometry is boxed in: the two knobs that would raise mma per
+// barrier both raise register pressure through the held Q fragments, and the
+// one that lowers register pressure lowers work per barrier instead. Moving
+// past 30% needs the ratio of mma to softmax-and-staging work inside a tile to
+// change, which is a different kernel, not a different tiling of this one.
 #define MLA_PICK(D_, KT_)                                                      \
     do {                                                                       \
         if (wide == 2 || wide == 4) { MLA_LAUNCH(D_, 16, 32, KT_, 2); }        \
