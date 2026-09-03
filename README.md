@@ -668,7 +668,11 @@ And four in the kernel itself:
 
 ### Serving GLM-5.3-Flash on it
 
-Running this on **DGX Sparks** instead: **[docs/dgx-spark-glm53.md](docs/dgx-spark-glm53.md)**.
+Running this on **DGX Sparks** instead: **[docs/dgx-spark-glm53.md](docs/dgx-spark-glm53.md)**,
+which now carries measured GB10 numbers -- the MoE kernel at 3.3-4.2x over bf16
+and 90-91% of that machine's bandwidth, sparse-MLA at 95-96%, fp8 KV worth
+1.5-1.9x there. No separate kernel path is needed for sm_121; per-device tuning
+is, and `bench/calibrate.py` produces it.
 GB10 is the other machine these kernels were written for -- no `tcgen05`, 99 KB
 of shared memory, warp-level `mma` only -- so they build for sm_121 from the
 same source. That guide covers sizing across two nodes, the aarch64 image

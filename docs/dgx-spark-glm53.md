@@ -1,10 +1,15 @@
 # Running GLM-5.3-Flash on DGX Sparks
 
-**Status: untested by the author.** This plugin is developed and measured on
-4x RTX PRO 6000 Blackwell (sm_120). I do not have a DGX Spark. Everything below
-that is hardware-specific about GB10 is cited to a source, and everything that is
-a measurement of this plugin is labelled with the machine it was measured on.
-Treat it as a bring-up guide with the reasoning shown, not a validated recipe.
+**Status: the kernels are now measured on GB10; the end-to-end serving path is
+not.** This plugin is developed on 4x RTX PRO 6000 Blackwell (sm_120), and a
+tester brought it up on a DGX Spark and reported the kernel numbers in §1a. I do
+not have a Spark, so anything below about serving GLM end to end on one is still
+reasoning rather than a measurement, and is marked as such.
+
+**Does GB10 need a separate kernel path? No.** The same source builds for
+sm_121 and reaches 90-96% of that machine's bandwidth on the memory-bound paths.
+What it does need is per-device *tuning*, which `bench/calibrate.py` produces,
+and there is one genuine gap at large M on dense layers -- both in §1a.
 
 The best existing source on this deployment is
 [Reederey87/glm53-flash-exl3-2x-dgx-spark](https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark),
@@ -22,7 +27,7 @@ matter are the ones this plugin was written against from the start:
 |---|---|---|
 | `tcgen05` / TMEM | **absent** — warp-level `mma.sync` is the only tensor-core path ([CUTLASS #2947](https://github.com/NVIDIA/cutlass/issues/2947), NVIDIA staff) | uses `mma.m16n8k16`, `cp.async` and `ldmatrix` only. No wgmma, no TMA, no 2-SM MMA |
 | Shared memory | 101,376 B/CTA ([forum](https://forums.developer.nvidia.com/t/sm121-cutlass-kernel-optimization-results-nvfp4-356-tflops-moe-grouped-gemm-on-dgx-spark/359960)) — same as sm_120; SGLang-class 147 KB MoE configs fail | largest block is ~43 KB. The MLA kernel asks the driver for the device's own `MaxSharedMemoryPerBlockOptin` rather than assuming a number |
-| Memory bandwidth | **218 GB/s** measured LPDDR5X unified | see §4 -- this is the whole story on a Spark |
+| Memory bandwidth | **241 GB/s** measured by our tester (218 reported elsewhere) | see §4 -- this is the whole story on a Spark |
 | Toolchain | CUDA 13.x system `ptxas`; older bundled ptxas has no sm_121 | builds with CUDA 13; `setup.py` adds `12.1` to the arch list after asking `nvcc --list-gpu-arch` whether it knows `compute_121` |
 | Usable memory | ~121 GiB per node | the 4bpw checkpoint is 164 GB, so see §2 |
 
@@ -31,6 +36,57 @@ and the sources it cites.
 
 Nothing here needs a code change. The kernels were kept to the sm_80-era
 instruction set deliberately, which is the same intake rule that kit adopted.
+
+## 1a. Measured on GB10 (sm_121)
+
+Reported by a tester on a DGX Spark. Builds clean in 86 s with
+`TORCH_CUDA_ARCH_LIST=12.1`; the 29 model-free tests pass.
+
+| path | result |
+|---|---|
+| **MoE expert kernel**, full 288-expert bank | **3.3x vs bf16** at M=1, **3.7-4.2x** at M=8-1024, 2.8x at M=3584 |
+| MoE bandwidth attainment | 81% at M=1, **90-91% at M=8-128** (of 241 GB/s measured) |
+| **Sparse-MLA** | **86-91%** of bandwidth at B>=16, **95-96%** at B=64-512 |
+| fp8 KV cache | **+1.5-1.9x** (it is +1.3-1.8x on sm_120, so it matters more here, as expected on a sixth of the bandwidth) |
+| TP=3, head counts 1-64 | uniform 2.6e-3 relative error, no head-count anomaly |
+| **Dense non-MoE layers, M>=128** | **0.6-0.8x of cuBLAS bf16** |
+
+Two things to take from that. The memory-bound paths -- which is what this
+plugin is for -- are close to the machine, and **241 GB/s** is the bandwidth to
+plan against rather than the 218 quoted elsewhere.
+
+And the last row is the one real gap. On sm_120 the dense EXL3 GEMM beats cuBLAS
+bf16 comfortably; on GB10 at M>=128 it loses. The trellis decode is ALU work
+that does not shrink with the weights, and GB10 has proportionally less of it to
+spare, so above some M the 4-bit read stops paying for the decode. **The fix is
+a different path, not a different tiling:** reconstruct the weight to bf16 once
+and call cuBLAS, which is what ExLlamaV3 does at large M. It is not built here,
+and it should not be guessed at without a GB10 to measure on. Until then, on a
+Spark the quantisation is buying memory on dense layers rather than speed, while
+the MoE path -- where each weight is read once per expert and reused across
+hundreds of rows -- wins at 3.3-4.2x.
+
+The autotuner ports cleanly: it times candidates with `cudaEvent` on whatever
+device it is on and reads `MaxSharedMemoryPerBlockOptin` rather than assuming
+sm_120's. At B>=16 nothing beat its pick. At B=1 a manual `chunk=96` beat it by
+7-14%, which was a real bug -- a batch-1 decode is ~7 us and it was timing three
+reps, so 21 us, the same order as the timer measuring it. Short shapes now get
+20 reps.
+
+## 1b. Calibrate before benchmarking
+
+Three constants are tuned rather than derived, and their defaults were measured
+on 188 SMs, 128 MB of L2 and 1.46 TB/s. The GEMM's split-k thresholds and the
+MoE `block_m` ladder are the two that do not self-adjust:
+
+```
+python bench/calibrate.py
+```
+
+It sweeps them on the device it finds, needs no checkpoint (synthetic shapes;
+trellis decode is data-independent so the timings are real), and prints an
+export block if anything beats the defaults by more than 2%. `bench_gemm.py
+--synthetic k,n,bits` does the same for a single shape.
 
 ## 2. Sizing: two nodes, not one
 
