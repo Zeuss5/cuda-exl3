@@ -518,7 +518,7 @@ there, and it is worth being precise about why. Skipping the merge entirely
 kernel launch itself: a trivial kernel replayed from a CUDA graph on this card
 costs 0.92 us, and there are two of them.
 
-That is the whole remaining structure. Filling 256 SMs needs roughly 256 key
+That is the whole remaining structure. Filling 188 SMs needs roughly 190 key
 splits, and flash-decoding writes a partial per split, so merge cost overtakes
 the cache read long before the machine is full; the split count that balances
 the two is 11-64 depending on batch, which is 176-352 blocks -- fewer than the
@@ -569,7 +569,7 @@ Things that did not work, all reverted:
   shared for 18 registers and go from two resident blocks to four. Shared did
   drop to 24 KB, but registers went 63 -> 127 and became the limiter instead, so
   occupancy was unchanged. It would not have helped anyway: at the tuned split
-  count the grid is 176-352 blocks against 256 SMs, so most SMs hold one block
+  count the grid is 176-352 blocks against 188 SMs, so most SMs hold one block
   and per-SM occupancy is not what is binding.
 
 * `cp.async.cg` instead of `.ca` to keep the streamed cache out of L1. No change
@@ -597,6 +597,15 @@ And four in the kernel itself:
   there (3%).
 
 ### Serving GLM-5.3-Flash on it
+
+Running this on **DGX Sparks** instead: **[docs/dgx-spark-glm53.md](docs/dgx-spark-glm53.md)**.
+GB10 is the other machine these kernels were written for -- no `tcgen05`, 99 KB
+of shared memory, warp-level `mma` only -- so they build for sm_121 from the
+same source. That guide covers sizing across two nodes, the aarch64 image
+problem, why bytes rather than TFLOPS are the lever on a 218 GB/s machine, and
+an honest comparison against the existing 2x Spark kernel work. It is **not**
+tested by me; every hardware-specific claim in it is cited.
+
 
 The kernel and backend were run end to end on GLM-5.3-Flash (45 layers, 288
 experts, EXL3 4-bit routed experts) across 4x RTX PRO 6000, TP=4, with this

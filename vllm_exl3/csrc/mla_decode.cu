@@ -673,6 +673,18 @@ uint64_t mla_tune_key(int B, int H, int topk, int D, bool kv8) {
     return h;
 }
 
+// Ask the device rather than assuming sm_120's 99 KB: GB10 is the same major
+// version and this plugin is meant to build for it from the same source.
+int mla_max_dyn_smem() {
+    static const int cap = [] {
+        int dev = 0, v = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        return v;
+    }();
+    return cap;
+}
+
 bool mla_tuning_enabled() {
     static const bool on = [] {
         const char* e = getenv("VLLM_EXL3_MLA_TUNE");
@@ -804,7 +816,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                           + 17 * (TILE_) * sizeof(int);                        \
         auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_, KT_, NBUF_>;\
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,\
-                             101376);                                          \
+                             mla_max_dyn_smem());                              \
         kern<<<grid, (NW_) * 32, smem, stream>>>(                              \
             (const __nv_bfloat16*) q.data_ptr(),                               \
             (const KT_*) kv.data_ptr(), sel.data_ptr<int>(),                   \
