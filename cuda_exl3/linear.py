@@ -16,9 +16,9 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
 )
 
-from vllm_exl3 import ops
-from vllm_exl3.config import CB_3INST, CB_MCG, CB_MUL1
-from vllm_exl3.parameter import Exl3SuhParameter
+from cuda_exl3 import ops
+from cuda_exl3.config import CB_3INST, CB_MCG, CB_MUL1
+from cuda_exl3.parameter import Exl3SuhParameter
 
 logger = init_logger(__name__)
 

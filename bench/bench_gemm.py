@@ -65,7 +65,7 @@ def main():
     ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
 
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
     from exllamav3.ext import exllamav3_ext as ext
 
     for name in args.layers:

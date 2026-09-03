@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from cuda_exl3 import env as _env
 
 logger = init_logger(__name__)
 
@@ -24,7 +25,7 @@ CB_3INST = 0
 CB_MCG = 1
 CB_MUL1 = 2
 
-_DEBUG = bool(os.environ.get("VLLM_EXL3_DEBUG_NAMES"))
+_DEBUG = bool(_env.getenv("CUDA_EXL3_DEBUG_NAMES"))
 
 # Wrapper segments that different stacks nest in different orders.
 _WRAPPER_SEGMENTS = frozenset({"model", "language_model"})
@@ -102,7 +103,7 @@ class Exl3Config(QuantizationConfig):
             storage = full_config.get("tensor_storage")
         if not storage:
             raise ValueError(
-                "EXL3: could not find `tensor_storage`. vllm-exl3 needs the full "
+                "EXL3: could not find `tensor_storage`. cuda-exl3 needs the full "
                 "`quantization_config.json` written by exllamav3 (the copy inlined "
                 "into config.json is only a summary). Pass it explicitly with "
                 "--hf-overrides '{\"quantization_config_file\": \"/path/to/"
@@ -383,7 +384,7 @@ class Exl3Config(QuantizationConfig):
         return any(n.startswith(key) for n in self.modules_norm)
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
-        from vllm_exl3.linear import Exl3LinearMethod
+        from cuda_exl3.linear import Exl3LinearMethod
 
         infos = self.resolve(prefix)
 
@@ -399,7 +400,7 @@ class Exl3Config(QuantizationConfig):
         ):
             moe_infos = self.resolve_moe(prefix)
             if moe_infos is not None:
-                from vllm_exl3.moe import Exl3MoEMethod
+                from cuda_exl3.moe import Exl3MoEMethod
 
                 moe_cfg = getattr(layer, "moe_config", None)
                 return Exl3MoEMethod(moe_cfg, self, *moe_infos, prefix=prefix)
@@ -416,9 +417,9 @@ class Exl3Config(QuantizationConfig):
             # A linear layer with no EXL3 tensors is genuinely unquantized in
             # this checkpoint (e.g. the bf16 vision tower, or a checkpoint that
             # only quantized its routed experts). Optionally encode it here
-            # instead of leaving it in bf16 -- see vllm_exl3.online.
+            # instead of leaving it in bf16 -- see cuda_exl3.online.
             if isinstance(layer, LinearBase):
-                from vllm_exl3.online import (
+                from cuda_exl3.online import (
                     Exl3OnlineLinearMethod,
                     online_bits,
                     shape_supported,
@@ -431,7 +432,7 @@ class Exl3Config(QuantizationConfig):
                     if k and n and shape_supported(k, n):
                         logger.info_once(
                             "EXL3: quantizing unquantized linears online at "
-                            "%d bits (VLLM_EXL3_ONLINE_BITS)", bits
+                            "%d bits (CUDA_EXL3_ONLINE_BITS)", bits
                         )
                         return Exl3OnlineLinearMethod(self, prefix, bits)
                     if _DEBUG:

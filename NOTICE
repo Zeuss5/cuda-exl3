@@ -1,5 +1,5 @@
-vllm-exl3
-Copyright (c) 2026 vllm-exl3 contributors
+cuda-exl3
+Copyright (c) 2026 cuda-exl3 contributors
 
 This product includes software from the projects listed below. Their licence
 terms are reproduced in full as those licences require.
@@ -13,10 +13,10 @@ The EXL3 on-disk format is defined by ExLlamaV3, so the code that decodes it
 must match it exactly. These files are vendored from, or follow the structure
 of, ExLlamaV3 and carry per-file attribution:
 
-  vllm_exl3/csrc/exl3_dq.cuh        vendored -- trellis dequantisation
-  vllm_exl3/csrc/exl3_codebook.cuh  vendored -- procedural codebooks (3inst/mcg/mul1)
-  vllm_exl3/csrc/exl3_common.cuh    mma fragment layout and decoders follow it
-  vllm_exl3/csrc/exl3_had.cuh       structure follows its hadamard_inner.cuh
+  cuda_exl3/csrc/exl3_dq.cuh        vendored -- trellis dequantisation
+  cuda_exl3/csrc/exl3_codebook.cuh  vendored -- procedural codebooks (3inst/mcg/mul1)
+  cuda_exl3/csrc/exl3_common.cuh    mma fragment layout and decoders follow it
+  cuda_exl3/csrc/exl3_had.cuh       structure follows its hadamard_inner.cuh
 
 ExLlamaV3 is also imported by bench/bench_gemm.py and
 bench/bench_vs_spark_fat_gemm.py as a comparison baseline. It is not a runtime
@@ -52,11 +52,11 @@ This is a vLLM plugin: it imports vLLM's interfaces and subclasses them. No vLLM
 source is copied into this repository. Two places follow vLLM's structure
 closely enough to be worth naming:
 
-  vllm_exl3/attention.py   subclasses SparseMLACommonImpl and reuses
+  cuda_exl3/attention.py   subclasses SparseMLACommonImpl and reuses
                            FlashInferMLASparseMetadataBuilder unchanged; the
                            forward_mqa contract follows
                            vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-  vllm_exl3/moe.py         follows vLLM's fused-MoE weight-loading protocol
+  cuda_exl3/moe.py         follows vLLM's fused-MoE weight-loading protocol
 
 The full Apache 2.0 licence text is at https://www.apache.org/licenses/LICENSE-2.0
 

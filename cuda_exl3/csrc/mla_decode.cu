@@ -102,7 +102,7 @@ __device__ __forceinline__ uint32_t f32x2_bf16(float a, float b)
     return rx | (ry & 0xffff0000u);
 }
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 
 #ifndef MLA_MAX_HEADS
 #define MLA_MAX_HEADS 32
@@ -637,9 +637,9 @@ __global__ __launch_bounds__(DIMS / VEC* SG) void mla_decode_reduce_kernel(
     }
 }
 
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 
 // Which (chunk, block shape) wins is shape-dependent and not guessable:
 // splitting keys buys blocks but grows the partial buffer the reduce must read,
@@ -687,7 +687,7 @@ int mla_max_dyn_smem() {
 
 bool mla_tuning_enabled() {
     static const bool on = [] {
-        const char* e = getenv("VLLM_EXL3_MLA_TUNE");
+        const char* e = exl3_env("CUDA_EXL3_MLA_TUNE");
         return !(e && *e == '0');
     }();
     return on;
@@ -896,4 +896,4 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     return out;
 }
 
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3

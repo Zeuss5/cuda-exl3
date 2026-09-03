@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 void exl3_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh);
 void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t n,
                   int64_t groups);
@@ -29,13 +29,13 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
 at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
                        const at::Tensor& suh, const at::Tensor& svh,
                        at::IntArrayRef group_n, int64_t cb, bool split_k);
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3
 
 // Registered through torch.library rather than raw pybind so that torch.compile
 // / Dynamo can trace the call (a bare pybind function is opaque to it, which
 // blocks vLLM's CUDA graph capture). The op is functional -- it allocates and
 // returns its output -- which also keeps it easy to give a meta implementation.
-TORCH_LIBRARY(vllm_exl3_C, m)
+TORCH_LIBRARY(cuda_exl3_C, m)
 {
     m.def(
         "exl3_linear(Tensor x, Tensor trellis, Tensor suh, Tensor svh, "
@@ -63,26 +63,26 @@ TORCH_LIBRARY(vllm_exl3_C, m)
         "int v_head_dim, int split_chunk, int heads_per_block, float kv_scale) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(vllm_exl3_C, CUDA, m)
+TORCH_LIBRARY_IMPL(cuda_exl3_C, CUDA, m)
 {
-    m.impl("exl3_linear", &vllm_exl3::exl3_linear);
-    m.impl("exl3_had_in", &vllm_exl3::exl3_had_in);
-    m.impl("exl3_reserve", &vllm_exl3::exl3_reserve);
-    m.impl("exl3_reserve_acc", &vllm_exl3::exl3_reserve_acc);
-    m.impl("exl3_moe_had_in", &vllm_exl3::exl3_moe_had_in);
-    m.impl("exl3_moe_glu_had_in", &vllm_exl3::exl3_moe_glu_had_in);
-    m.impl("exl3_moe_gemm", &vllm_exl3::exl3_moe_gemm);
-    m.impl("exl3_moe_combine", &vllm_exl3::exl3_moe_combine);
-    m.impl("mla_decode", &vllm_exl3::mla_decode);
+    m.impl("exl3_linear", &cuda_exl3::exl3_linear);
+    m.impl("exl3_had_in", &cuda_exl3::exl3_had_in);
+    m.impl("exl3_reserve", &cuda_exl3::exl3_reserve);
+    m.impl("exl3_reserve_acc", &cuda_exl3::exl3_reserve_acc);
+    m.impl("exl3_moe_had_in", &cuda_exl3::exl3_moe_had_in);
+    m.impl("exl3_moe_glu_had_in", &cuda_exl3::exl3_moe_glu_had_in);
+    m.impl("exl3_moe_gemm", &cuda_exl3::exl3_moe_gemm);
+    m.impl("exl3_moe_combine", &cuda_exl3::exl3_moe_combine);
+    m.impl("mla_decode", &cuda_exl3::mla_decode);
 }
 
-TORCH_LIBRARY_IMPL(vllm_exl3_C, CompositeExplicitAutograd, m)
+TORCH_LIBRARY_IMPL(cuda_exl3_C, CompositeExplicitAutograd, m)
 {
-    m.impl("exl3_set_moe_acc_cap", &vllm_exl3::exl3_set_moe_acc_cap);
-    m.impl("exl3_get_moe_acc_cap", &vllm_exl3::exl3_get_moe_acc_cap);
+    m.impl("exl3_set_moe_acc_cap", &cuda_exl3::exl3_set_moe_acc_cap);
+    m.impl("exl3_get_moe_acc_cap", &cuda_exl3::exl3_get_moe_acc_cap);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.doc() = "EXL3 kernels; ops are registered under torch.ops.vllm_exl3_C";
+    m.doc() = "EXL3 kernels; ops are registered under torch.ops.cuda_exl3_C";
 }

@@ -2,7 +2,7 @@
 # sparse-MLA model (GLM-5.3-Flash's Glm5Next* is not in any released vLLM).
 #
 #   docker build -f docker/Dockerfile.sparse-mla \
-#     --build-arg BASE=<image with vllm + the model definition> -t vllm-exl3-glm53 .
+#     --build-arg BASE=<image with vllm + the model definition> -t cuda-exl3-glm53 .
 #
 # The plugin registers "exl3" (overriding a base image's own, if it has one) and
 # binds AttentionBackendEnum.CUSTOM to the sparse-MLA backend, so serve with
@@ -10,7 +10,7 @@
 ARG BASE
 FROM ${BASE}
 ENV TORCH_CUDA_ARCH_LIST=12.0
-COPY . /opt/vllm-exl3
-RUN cd /opt/vllm-exl3 && rm -rf build *.egg-info && \
+COPY . /opt/cuda-exl3
+RUN cd /opt/cuda-exl3 && rm -rf build *.egg-info && \
     MAX_JOBS=32 pip install . --no-build-isolation --no-deps && \
-    python3 -c "import vllm_exl3; print('vllm-exl3', vllm_exl3.__version__)"
+    python3 -c "import cuda_exl3; print('cuda-exl3', cuda_exl3.__version__)"

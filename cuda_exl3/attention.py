@@ -139,7 +139,7 @@ class Exl3MLASparseBackend(AttentionBackend):
 
 
 class Exl3MLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
-    """Decode through ``vllm_exl3_C.mla_decode``; prefill through the base."""
+    """Decode through ``cuda_exl3_C.mla_decode``; prefill through the base."""
 
     # The kernel merges its own splits and does not hand back an LSE, so it
     # cannot participate in decode-context parallelism.
@@ -243,7 +243,7 @@ class Exl3MLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if self._no_seqlens.device != q.device:
             self._no_seqlens = self._no_seqlens.to(q.device)
 
-        out = torch.ops.vllm_exl3_C.mla_decode(
+        out = torch.ops.cuda_exl3_C.mla_decode(
             q.contiguous(),
             rows,
             topk_slots.to(torch.int32).contiguous(),

@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 from vllm.model_executor.utils import set_weight_attrs
+from cuda_exl3 import env as _env
 
 logger = init_logger(__name__)
 
@@ -282,10 +283,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # caps its own split at this many elements and runs unsplit above it, so
         # reserving the cap makes growth impossible rather than merely unlikely.
         try:
-            cap = int(torch.ops.vllm_exl3_C.exl3_get_moe_acc_cap())
+            cap = int(torch.ops.cuda_exl3_C.exl3_get_moe_acc_cap())
             if cap <= 0:
                 return          # split-k off: no accumulator will ever be needed
-            torch.ops.vllm_exl3_C.exl3_reserve_acc(layer.w13_svh.data, cap)
+            torch.ops.cuda_exl3_C.exl3_reserve_acc(layer.w13_svh.data, cap)
         except Exception as e:  # pragma: no cover - lazy sizing is still correct
             logger.debug("EXL3 %s: MoE accumulator pre-reserve skipped (%s)",
                          self.prefix, e)
@@ -306,7 +307,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         """
         import os
 
-        forced = os.environ.get("VLLM_EXL3_MOE_BLOCK_M")
+        forced = _env.getenv("CUDA_EXL3_MOE_BLOCK_M")
         if forced:
             return int(forced)
         # Measured: doubling the block costs 8-25% at low concurrency and up to
@@ -363,7 +364,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         expert_ids = expert_ids[: rows // block_m]
 
         xc = x.contiguous()
-        ops = torch.ops.vllm_exl3_C
+        ops = torch.ops.cuda_exl3_C
 
         # gate/up: two transforms per routed row, one per shard's suh
         a13 = torch.empty((2, rows, H), dtype=torch.half, device=x.device)

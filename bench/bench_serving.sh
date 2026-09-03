@@ -32,7 +32,7 @@ sweep () {  # $1=port
 }
 
 start_vllm () {  # $1=tp $2=port $3=tag
-  VLLM_EXL3_BACKEND=native $VENV/vllm serve $M \
+  CUDA_EXL3_BACKEND=native $VENV/vllm serve $M \
     --port $2 --tensor-parallel-size $1 --dtype bfloat16 \
     --max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128 \
     --gpu-memory-utilization 0.90 --trust-remote-code --no-enable-prefix-caching \

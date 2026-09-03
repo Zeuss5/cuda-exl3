@@ -1,10 +1,10 @@
-# vllm-exl3
+# cuda-exl3
 
 EXL3 ([ExLlamaV3](https://github.com/turboderp-org/exllamav3) trellis quantization)
 support for vLLM, with custom CUDA kernels tuned for continuous batching.
 
 ```bash
-pip install -e .            # needs torch + nvcc; builds vllm_exl3._C
+pip install -e .            # needs torch + nvcc; builds cuda_exl3._C
 vllm serve TelperionAI/Qwen3.8-27B-EXL3-5.5bpw
 ```
 
@@ -30,7 +30,7 @@ no `k x n` fp16 scratch buffer.
 
 ## One op per layer
 
-`torch.ops.vllm_exl3_C.exl3_linear` does a whole quantized linear in one call:
+`torch.ops.cuda_exl3_C.exl3_linear` does a whole quantized linear in one call:
 
 * **Activation transform, fused.** `had(x * suh)` for every shard in a single
   launch, reading `x` once. bf16 -> fp16 conversion happens in the same load, so
@@ -98,12 +98,12 @@ Prefill, 8000-token prompt:
 | engine | prefill tok/s |
 |---|---|
 | exllamav3 / TabbyAPI, 1 GPU | ~3,050 (engine-reported) |
-| vllm-exl3, TP=1 | **4,816** (1.58x) |
-| vllm-exl3, TP=4 | **7,674** (2.52x) |
+| cuda-exl3, TP=1 | **4,816** (1.58x) |
+| cuda-exl3, TP=4 | **7,674** (2.52x) |
 
 Output token throughput, and per-token decode latency (TPOT):
 
-| conc | exllamav3 1 GPU | vllm-exl3 TP=1 | vllm-exl3 TP=4 |
+| conc | exllamav3 1 GPU | cuda-exl3 TP=1 | cuda-exl3 TP=4 |
 |---|---|---|---|
 | 1 | 25.3 tok/s (TPOT 17.9 ms) | 54.4 (16.8 ms) | 92.7 (9.8 ms) |
 | 4 | 38.7 (30.3 ms) | 150.7 (21.9 ms) | 249.7 (13.5 ms) |
@@ -180,7 +180,7 @@ One caveat:
   `language_model.model.layers.N` in vLLM), so names are matched exactly first
   and then with the `model`/`language_model` wrapper segments dropped. A model
   that renames layers more aggressively than that would need a mapping entry.
-  `VLLM_EXL3_DEBUG_NAMES=1` logs what resolved and what did not.
+  `CUDA_EXL3_DEBUG_NAMES=1` logs what resolved and what did not.
 
 ## VRAM
 
@@ -205,21 +205,21 @@ stride the kernel cannot recover -- hence the shard-map approach.
 ## Determinism
 
 Split-k reduces with fp32 atomics, so results are reproducible in value but not
-bit-exact run to run. `VLLM_EXL3_DETERMINISTIC=1` disables it: bit-exact
+bit-exact run to run. `CUDA_EXL3_DETERMINISTIC=1` disables it: bit-exact
 everywhere, slower for small batches and narrow layers.
 
 ## Environment variables
 
 | variable | meaning |
 |---|---|
-| `VLLM_EXL3_BACKEND` | `native` (default), or `exllamav3` to run upstream's kernels as an oracle |
-| `VLLM_EXL3_DETERMINISTIC` | `1` disables split-k for bit-exact output |
-| `VLLM_EXL3_DEBUG_NAMES` | log which modules resolve to EXL3 vs unquantized |
+| `CUDA_EXL3_BACKEND` | `native` (default), or `exllamav3` to run upstream's kernels as an oracle |
+| `CUDA_EXL3_DETERMINISTIC` | `1` disables split-k for bit-exact output |
+| `CUDA_EXL3_DEBUG_NAMES` | log which modules resolve to EXL3 vs unquantized |
 
 ## Tests
 
 ```bash
-VLLM_EXL3_TEST_MODEL=/path/to/exl3-model pytest tests/ -v
+CUDA_EXL3_TEST_MODEL=/path/to/exl3-model pytest tests/ -v
 ```
 
 Covers every BM tier, both epilogues, multi-shard equivalence, bf16 activations
@@ -405,7 +405,7 @@ count undercounts speculative decode by ~3x. Use a realistic prompt and
 
 ## Sparse-MLA decode
 
-`torch.ops.vllm_exl3_C.mla_decode` is a fused sparse-MLA decode kernel written
+`torch.ops.cuda_exl3_C.mla_decode` is a fused sparse-MLA decode kernel written
 for SM120. MLA shares one latent row across every query head, so a decode step
 reads `topk x head_dim` of cache no matter how many heads there are; that read
 is the roofline and everything above it is the kernel's own overhead.
@@ -431,11 +431,11 @@ source targets the RTX PRO 6000 and the DGX Spark.
   288 words, a multiple of 32, which puts every `ldmatrix` on the same four
   banks; at 584 the rows step by four banks and each one covers all 32.
 * The split size and block shape are autotuned per `(batch, heads, topk)` and
-  cached, skipped during graph capture (`VLLM_EXL3_MLA_TUNE=0` to disable).
+  cached, skipped during graph capture (`CUDA_EXL3_MLA_TUNE=0` to disable).
 
 ### Using it from vLLM
 
-`vllm_exl3.attention.Exl3MLASparseBackend` wires the kernel into vLLM as a
+`cuda_exl3.attention.Exl3MLASparseBackend` wires the kernel into vLLM as a
 sparse-MLA backend. vLLM's backends live in an enum that an out-of-tree package
 cannot add to, but `CUSTOM` is reserved for this, so the plugin binds that slot
 and you select it by name:
@@ -782,7 +782,7 @@ Multi-node. Bit-exact determinism under split-k (see above).
 
 The trellis bit packing, the procedural codebook and the mma fragment layout are
 part of the EXL3 on-disk format and follow ExLlamaV3 (MIT, (c) 2025 Turboderp);
-those headers are vendored with per-file attribution in `vllm_exl3/csrc/`, and
+those headers are vendored with per-file attribution in `cuda_exl3/csrc/`, and
 **[NOTICE](NOTICE)** reproduces the licence in full along with everything else
 this project borrows from. The GEMM tiling, split-k, fused epilogue, shard map,
 the sparse-MLA kernel and the vLLM integration are new.
@@ -822,7 +822,7 @@ That large L2 also mis-calibrated the split-k heuristic. Its cost is an extra
 read-modify-write of the fp32 accumulator, which the original heuristic charged
 against HBM weight bytes -- but at m<=256 that accumulator is only a few MB and
 stays in L2, so it is far cheaper than modelled. Discounting it when it fits
-(`VLLM_EXL3_L2_GAIN`, default 2) unblocked split-k exactly where the kernel is
+(`CUDA_EXL3_L2_GAIN`, default 2) unblocked split-k exactly where the kernel is
 block-starved, and was worth up to **1.5x** in the m=16..256 range (`up_proj`
 m=32: 59.4 -> 39.2 us). It is a discount, not a bypass -- treating the traffic as
 free over-splits and regresses (`down_proj` m=128 went 101 -> 121 us).
@@ -842,7 +842,7 @@ Seven things were tried and rejected against measurement:
   alignment the 58-bit window crosses three 32-bit words, so two loads cannot
   cover it. ExLlamaV3's `dq4` x2 for 6 bits is correct.
 
-* **fp16 accumulation** (`VLLM_EXL3_FP16_ACC=1`, opt-in, off by default). Halving
+* **fp16 accumulation** (`CUDA_EXL3_FP16_ACC=1`, opt-in, off by default). Halving
   the accumulator registers affords BM=256 and so twice the MMA work per
   dequantized weight -- the obvious lever against the issue pressure above. It
   does not pay off: BM=256 needs 145 registers and 69 KB of shared, which drops
@@ -866,7 +866,7 @@ Seven things were tried and rejected against measurement:
   more than the launch they save. A kernel boundary is simply a cheaper
   grid-wide barrier than one built by hand.
 
-* **Split-k for the MoE expert gemm** (`VLLM_EXL3_MOE_ACC_MAX_ELEMS`, off by
+* **Split-k for the MoE expert gemm** (`CUDA_EXL3_MOE_ACC_MAX_ELEMS`, off by
   default). The expert gemm is block-starved at low concurrency -- c=1 with
   top_k=8 gives 8 padded row-blocks, so w13 launches ~96 blocks against 188 SMs
   -- and splitting k is a real kernel win (rows=512, block_m=32: 33.0 -> 27.5 us,

@@ -78,7 +78,7 @@ def main():
 
     from exllamav3.ext import exllamav3_ext as ext
 
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     path = os.path.join(a.model, a.shard)
 

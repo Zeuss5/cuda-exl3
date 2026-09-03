@@ -20,7 +20,7 @@ def register() -> None:
         return
 
     # Importing the module runs the @register_quantization_config decorator.
-    from vllm_exl3 import config as _config  # noqa: F401
+    from cuda_exl3 import config as _config  # noqa: F401
 
     _register_attention_backend()
     _REGISTERED = True
@@ -45,7 +45,7 @@ def _register_attention_backend() -> None:
     if not hasattr(AttentionBackendEnum, "CUSTOM"):
         return
     register_backend(
-        AttentionBackendEnum.CUSTOM, "vllm_exl3.attention.Exl3MLASparseBackend"
+        AttentionBackendEnum.CUSTOM, "cuda_exl3.attention.Exl3MLASparseBackend"
     )
 
 

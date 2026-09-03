@@ -12,7 +12,7 @@ incoherence transform and the trellis search that ExLlamaV3 already falls back
 to when a layer has no captured activations. The result feeds exactly the same
 kernel as a checkpoint-quantized layer.
 
-Enable with VLLM_EXL3_ONLINE_BITS=<2..8>. Off by default: it changes the model's
+Enable with CUDA_EXL3_ONLINE_BITS=<2..8>. Off by default: it changes the model's
 numerics, and that is the user's call to make.
 """
 
@@ -30,7 +30,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.parameter import BasevLLMParameter
 
-from vllm_exl3 import ops
+from cuda_exl3 import ops
+from cuda_exl3 import env as _env
 
 logger = init_logger(__name__)
 
@@ -41,15 +42,15 @@ _MCG_MULTIPLIER = 0xCBAC1FED
 
 def online_bits() -> int | None:
     """Bitrate for online quantization, or None when the feature is off."""
-    raw = os.environ.get("VLLM_EXL3_ONLINE_BITS")
+    raw = _env.getenv("CUDA_EXL3_ONLINE_BITS")
     if not raw:
         return None
     try:
         bits = int(raw)
     except ValueError:
-        raise ValueError(f"VLLM_EXL3_ONLINE_BITS must be an integer, got {raw!r}")
+        raise ValueError(f"CUDA_EXL3_ONLINE_BITS must be an integer, got {raw!r}")
     if not 2 <= bits <= 8:
-        raise ValueError(f"VLLM_EXL3_ONLINE_BITS must be 2..8, got {bits}")
+        raise ValueError(f"CUDA_EXL3_ONLINE_BITS must be 2..8, got {bits}")
     return bits
 
 
@@ -64,7 +65,7 @@ def _load_quantizer():
     The package __init__ pulls in filter machinery (kbnf, formatron) that is
     unrelated to quantization and often absent, so load the one module directly.
     """
-    root = os.environ.get("VLLM_EXL3_EXLLAMAV3_PATH")
+    root = _env.getenv("CUDA_EXL3_EXLLAMAV3_PATH")
     if root is None:
         for cand in ("/opt/exllamav3-python", "/home/shadeform/vllm/exllamav3",
                      "/home/shadeform/exllamav3"):
@@ -81,8 +82,8 @@ def _load_quantizer():
             root = os.path.dirname(list(spec.submodule_search_locations)[0])
     if root is None:
         raise RuntimeError(
-            "VLLM_EXL3_ONLINE_BITS is set but ExLlamaV3 was not found. Install it, "
-            "or point VLLM_EXL3_EXLLAMAV3_PATH at a checkout."
+            "CUDA_EXL3_ONLINE_BITS is set but ExLlamaV3 was not found. Install it, "
+            "or point CUDA_EXL3_EXLLAMAV3_PATH at a checkout."
         )
 
     name = "exllamav3.modules.quant.exl3_lib.quantize"
@@ -110,7 +111,7 @@ def _load_quantizer():
 
 
 def _cache_path(w: torch.Tensor, bits: int, prefix: str) -> str | None:
-    d = os.environ.get("VLLM_EXL3_ONLINE_CACHE")
+    d = _env.getenv("CUDA_EXL3_ONLINE_CACHE")
     if not d:
         return None
     os.makedirs(d, exist_ok=True)

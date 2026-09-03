@@ -1,7 +1,7 @@
 """Kernel dispatch for EXL3.
 
 The fast path is a single fused op per linear layer,
-``torch.ops.vllm_exl3_C.exl3_linear``, which internally:
+``torch.ops.cuda_exl3_C.exl3_linear``, which internally:
 
 1. transforms the activations once per shard -- reading ``x`` a single time and
    converting bf16 -> fp16 in the same pass, so no separate ``.to()`` kernels;
@@ -13,7 +13,7 @@ The fast path is a single fused op per linear layer,
 It is registered through ``torch.library`` (not raw pybind) so that Dynamo can
 trace it, which is what makes vLLM's CUDA graph capture work.
 
-``VLLM_EXL3_BACKEND=exllamav3`` swaps in upstream's kernels as a correctness
+``CUDA_EXL3_BACKEND=exllamav3`` swaps in upstream's kernels as a correctness
 oracle and performance baseline.
 """
 
@@ -23,14 +23,15 @@ import os
 from typing import Any, Sequence
 
 import torch
+from cuda_exl3 import env as _env
 
-_BACKEND_ENV = os.environ.get("VLLM_EXL3_BACKEND", "auto").lower()
+_BACKEND_ENV = _env.getenv("CUDA_EXL3_BACKEND", "auto").lower()
 
 # Split-k reduces partial sums with fp32 atomics, so results are reproducible in
 # value but not bit-exact across runs (the summation order varies). Set
-# VLLM_EXL3_DETERMINISTIC=1 to disable it: slower for small batches and narrow
+# CUDA_EXL3_DETERMINISTIC=1 to disable it: slower for small batches and narrow
 # layers, bit-exact everywhere.
-DETERMINISTIC = os.environ.get("VLLM_EXL3_DETERMINISTIC", "0") not in ("0", "", "false")
+DETERMINISTIC = _env.getenv("CUDA_EXL3_DETERMINISTIC", "0") not in ("0", "", "false")
 
 _native: Any = None
 _exl: Any = None
@@ -41,9 +42,9 @@ def _try_native():
     global _native
     if _native is None:
         try:
-            from vllm_exl3 import _C  # noqa: F401  (registers torch.ops.vllm_exl3_C)
+            from cuda_exl3 import _C  # noqa: F401  (registers torch.ops.cuda_exl3_C)
 
-            _native = torch.ops.vllm_exl3_C
+            _native = torch.ops.cuda_exl3_C
         except Exception:
             _native = False
     return _native or None
@@ -68,11 +69,11 @@ def backend() -> str:
         return _backend
     if _BACKEND_ENV == "native":
         if _try_native() is None:
-            raise RuntimeError("VLLM_EXL3_BACKEND=native but vllm_exl3._C failed to import")
+            raise RuntimeError("CUDA_EXL3_BACKEND=native but cuda_exl3._C failed to import")
         _backend = "native"
     elif _BACKEND_ENV == "exllamav3":
         if _try_exllamav3() is None:
-            raise RuntimeError("VLLM_EXL3_BACKEND=exllamav3 but exllamav3_ext failed to import")
+            raise RuntimeError("CUDA_EXL3_BACKEND=exllamav3 but exllamav3_ext failed to import")
         _backend = "exllamav3"
     else:
         if _try_native() is not None:
@@ -81,7 +82,7 @@ def backend() -> str:
             _backend = "exllamav3"
         else:
             raise RuntimeError(
-                "vllm-exl3: no kernel backend available. Build this package's CUDA "
+                "cuda-exl3: no kernel backend available. Build this package's CUDA "
                 "extension, or install exllamav3."
             )
     return _backend
@@ -108,7 +109,7 @@ def exl3_linear(
     if backend() == "native":
         if not x.is_contiguous():
             x = x.contiguous()
-        return torch.ops.vllm_exl3_C.exl3_linear(
+        return torch.ops.cuda_exl3_C.exl3_linear(
             x, trellis, suh, svh, list(group_n), cb, not DETERMINISTIC
         )
     return _exl_reference(x, trellis, suh, svh, group_n, cb)
@@ -144,7 +145,7 @@ def reserve(like: torch.Tensor, max_tokens: int, k: int, n: int, groups: int) ->
     pointer -- which the caching allocator has by then handed to someone else.
     """
     if backend() == "native":
-        torch.ops.vllm_exl3_C.exl3_reserve(like, int(max_tokens), int(k), int(n),
+        torch.ops.cuda_exl3_C.exl3_reserve(like, int(max_tokens), int(k), int(n),
                                            int(groups))
 
 
@@ -154,7 +155,7 @@ def _register_fake():
         return
     try:
 
-        @torch.library.register_fake("vllm_exl3_C::exl3_linear")
+        @torch.library.register_fake("cuda_exl3_C::exl3_linear")
         def _(x, trellis, suh, svh, group_n, cb, split_k):
             shape = list(x.shape)
             shape[-1] = trellis.shape[1] * 16

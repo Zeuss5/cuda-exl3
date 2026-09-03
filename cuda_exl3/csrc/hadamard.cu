@@ -21,7 +21,7 @@
 #include "exl3_common.cuh"
 #include "exl3_had.cuh"
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 
 template <typename IN_T>
 __global__ void exl3_had_in_kernel(const IN_T* __restrict__ x, half* __restrict__ a_had,
@@ -326,4 +326,4 @@ void exl3_moe_glu_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor&
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3

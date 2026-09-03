@@ -6,6 +6,10 @@
 // are part of the on-disk format, so these have to match it exactly.
 #pragma once
 
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -20,6 +24,19 @@ struct Vec
     __device__ T& operator[](int i) { return elems[i]; }
     __device__ const T& operator[](int i) const { return elems[i]; }
 };
+
+// Knob lookup with a deprecation path: these were VLLM_EXL3_* when this was a
+// vLLM-only plugin, so the old spelling still resolves.
+inline const char* exl3_env(const char* name)
+{
+    if (const char* v = getenv(name)) return v;
+    if (strncmp(name, "CUDA_EXL3_", 10) == 0) {
+        char legacy[128];
+        snprintf(legacy, sizeof(legacy), "VLLM_EXL3_%s", name + 10);
+        return getenv(legacy);
+    }
+    return nullptr;
+}
 
 using FragA = Vec<half2, 4>;   // 16x16 A fragment
 using FragB = Vec<half2, 2>;   // 16x8  B fragment

@@ -1,5 +1,5 @@
 import os, sys, time, collections
-os.environ.setdefault("VLLM_EXL3_BACKEND", "native")
+os.environ.setdefault("CUDA_EXL3_BACKEND", "native")
 M = "/home/shadeform/vllm/models/Qwen3.8-27B-EXL3-5.5bpw"
 
 def main():

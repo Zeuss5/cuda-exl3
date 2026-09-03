@@ -7,11 +7,11 @@ glue: that the top-k list vLLM hands us -- per-request logical token ids with
 import pytest
 import torch
 
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 
 _ops._try_native()
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not hasattr(torch.ops, "vllm_exl3_C"),
+    not torch.cuda.is_available() or not hasattr(torch.ops, "cuda_exl3_C"),
     reason="needs the compiled kernel on a GPU",
 )
 
@@ -26,7 +26,7 @@ class _Meta:
 
 
 def _impl(topk_buf, kv_lora_rank, scale, fp8=False):
-    from vllm_exl3.attention import Exl3MLASparseImpl
+    from cuda_exl3.attention import Exl3MLASparseImpl
 
     o = object.__new__(Exl3MLASparseImpl)
     o.topk_indices_buffer = topk_buf
@@ -129,7 +129,7 @@ def test_forward_mqa_with_an_fp8_cache(head_size):
 
 
 def test_rejects_an_unreadable_cache_layout():
-    from vllm_exl3.attention import Exl3MLASparseImpl
+    from cuda_exl3.attention import Exl3MLASparseImpl
 
     with pytest.raises(NotImplementedError, match="bfloat16 or e4m3"):
         Exl3MLASparseImpl(
@@ -171,7 +171,7 @@ def test_constructs_the_way_vllm_constructs_it(_vllm_world):
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.linear import ColumnParallelLinear
 
-    from vllm_exl3.attention import Exl3MLASparseImpl
+    from cuda_exl3.attention import Exl3MLASparseImpl
 
     with set_current_vllm_config(VllmConfig()):
         kv_b_proj = ColumnParallelLinear(
@@ -194,11 +194,11 @@ def test_constructs_the_way_vllm_constructs_it(_vllm_world):
 
 
 def test_plugin_binds_the_custom_backend_slot():
-    import vllm_exl3
+    import cuda_exl3
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    vllm_exl3.register()
+    cuda_exl3.register()
     assert (
         AttentionBackendEnum.CUSTOM.get_path()
-        == "vllm_exl3.attention.Exl3MLASparseBackend"
+        == "cuda_exl3.attention.Exl3MLASparseBackend"
     )

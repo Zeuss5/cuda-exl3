@@ -2,7 +2,7 @@
 
 Run against a real EXL3 checkpoint:
 
-    VLLM_EXL3_TEST_MODEL=/path/to/model pytest tests/ -v
+    CUDA_EXL3_TEST_MODEL=/path/to/model pytest tests/ -v
 
 Without a checkpoint the tests are skipped: EXL3 trellis data cannot be
 meaningfully synthesized, since the codebook and bit packing are part of the
@@ -16,7 +16,7 @@ import pytest
 import torch
 
 MODEL = os.environ.get(
-    "VLLM_EXL3_TEST_MODEL", "/home/shadeform/vllm/models/Qwen3.8-27B-EXL3-5.5bpw"
+    "CUDA_EXL3_TEST_MODEL", "/home/shadeform/vllm/models/Qwen3.8-27B-EXL3-5.5bpw"
 )
 
 pytestmark = pytest.mark.skipif(
@@ -67,7 +67,7 @@ def _reference(trellis, suh, svh, x):
 @pytest.mark.parametrize("m", [1, 7, 16, 31, 32, 64, 128, 129, 256, 512, 1024])
 def test_gemm_matches_dense_reference(tensors, name, m):
     """Covers every BM tier and both the fused and split-k epilogues."""
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     trellis, suh, svh = _load(tensors, name)
     k, n = trellis.shape[0] * 16, trellis.shape[1] * 16
@@ -89,7 +89,7 @@ def test_multi_shard_matches_single(tensors, name):
     Fused layers rely on this: one trellis spanning every shard, each shard
     addressed by offset with its own suh row, all in one launch.
     """
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     trellis, suh, svh = _load(tensors, name)
     k, n = trellis.shape[0] * 16, trellis.shape[1] * 16
@@ -114,7 +114,7 @@ def test_multi_shard_matches_single(tensors, name):
 @pytest.mark.parametrize("name", LAYERS)
 def test_bf16_activations(tensors, name):
     """bf16 in -> bf16 out, converted inside the kernels."""
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     trellis, suh, svh = _load(tensors, name)
     k, n = trellis.shape[0] * 16, trellis.shape[1] * 16
@@ -131,7 +131,7 @@ def test_bf16_activations(tensors, name):
 
 def test_deterministic_mode_is_bit_exact(tensors, monkeypatch):
     """With split-k disabled every call must be bit-identical."""
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     monkeypatch.setattr(ops, "DETERMINISTIC", True)
     trellis, suh, svh = _load(tensors, LAYERS[2])
@@ -149,7 +149,7 @@ def test_accumulator_is_left_zeroed(tensors):
 
     If it did not, the second call would add to stale partial sums.
     """
-    from vllm_exl3 import ops
+    from cuda_exl3 import ops
 
     trellis, suh, svh = _load(tensors, LAYERS[2])  # down_proj: narrow n -> splits
     k, n = trellis.shape[0] * 16, trellis.shape[1] * 16

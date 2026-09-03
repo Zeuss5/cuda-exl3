@@ -19,7 +19,7 @@ import os
 
 import torch
 
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 
 _ops._try_native()
 
@@ -68,7 +68,7 @@ def bench_ours(kv, q, sels, seqlens):
     for chunk, wide in itertools.product(
             (16, 32, 48, 64, 96, 128, 192, 256), (1, 2, 3, 4)):
         us = graph_us([
-            (lambda s=s, c=chunk, w=wide: torch.ops.vllm_exl3_C.mla_decode(
+            (lambda s=s, c=chunk, w=wide: torch.ops.cuda_exl3_C.mla_decode(
                 q, kv, s, seqlens, 1.0 / d**0.5, DV, c, w, 1.0))
             for s in sels
         ])

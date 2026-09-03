@@ -34,7 +34,7 @@
 #include "exl3_dq.cuh"
 #include "exl3_had.cuh"
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 
 // Output Hadamard block size; BN must equal this so a block owns whole blocks.
 constexpr int HAD_N = 128;
@@ -459,7 +459,7 @@ __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict_
     had128_warp_acc<OUT_T>(acc + off, C + off, svh + n_off + blk * HAD_N, threadIdx.x & 31);
 }
 
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3
 
 // ---------------------------------------------------------------------------
 // Host launcher
@@ -467,8 +467,8 @@ __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict_
 
 namespace {
 
-using vllm_exl3::HAD_N;
-using vllm_exl3::ShardMap;
+using cuda_exl3::HAD_N;
+using cuda_exl3::ShardMap;
 
 constexpr int BN_ = 128;   // must equal HAD_N: a block owns whole Hadamard blocks
 constexpr int BK_ = 32;
@@ -495,11 +495,11 @@ bool raise_smem(const void* fn, int smem)
     return true;
 }
 
-// VLLM_EXL3_FP16_ACC=1 enables fp16 accumulation in the GEMM (see Acc<>).
+// CUDA_EXL3_FP16_ACC=1 enables fp16 accumulation in the GEMM (see Acc<>).
 bool h_acc_enabled()
 {
     static const bool v = [] {
-        const char* e = getenv("VLLM_EXL3_FP16_ACC");
+        const char* e = exl3_env("CUDA_EXL3_FP16_ACC");
         return e && *e && *e != '0';
     }();
     return v;
@@ -509,7 +509,7 @@ int pick_bm(int m)
 {
     // Override for tuning sweeps; 0 = use the heuristic.
     static const int forced = [] {
-        const char* e = getenv("VLLM_EXL3_FORCE_BM");
+        const char* e = exl3_env("CUDA_EXL3_FORCE_BM");
         return e && *e ? atoi(e) : 0;
     }();
     if (forced) return forced;
@@ -545,7 +545,7 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
     // target serves both; wave occupancy is what separates them.
     if (weight_mult > 1 && blocks >= sms) return 1;
     static const double target_mult = [] {
-        const char* e = getenv("VLLM_EXL3_SPLIT_TARGET");
+        const char* e = exl3_env("CUDA_EXL3_SPLIT_TARGET");
         return e && *e ? atof(e) : 3.0;
     }();
     long long target = (long long) (target_mult * sms);
@@ -568,11 +568,11 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
     double acc_bytes = 4.0 * (double) m * n;
     int by_traffic;
     static const double budget = [] {
-        const char* e = getenv("VLLM_EXL3_SPLIT_BUDGET");
+        const char* e = exl3_env("CUDA_EXL3_SPLIT_BUDGET");
         return e && *e ? atof(e) : 0.30;
     }();
     static const double l2_gain = [] {
-        const char* e = getenv("VLLM_EXL3_L2_GAIN");
+        const char* e = exl3_env("CUDA_EXL3_L2_GAIN");
         return e && *e ? atof(e) : 2.0;
     }();
     // Split-k is charged against the weight bytes it is trying to stream
@@ -601,8 +601,8 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
             int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
             const int* n_rows = nullptr)
 {
-    using Cfg = vllm_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
-    auto fn = vllm_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
+    using Cfg = cuda_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
+    auto fn = cuda_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
                                             WARP_N_, H_ACC>;
     raise_smem((const void*) fn, Cfg::SMEM);
     int kt_total = k / BK;
@@ -650,7 +650,7 @@ std::map<uint64_t, int>& tune_cache()
 bool tuning_enabled()
 {
     static const bool v = [] {
-        const char* e = getenv("VLLM_EXL3_AUTOTUNE");
+        const char* e = exl3_env("CUDA_EXL3_AUTOTUNE");
         return !(e && *e == '0');
     }();
     return v;
@@ -791,7 +791,7 @@ void launch_epilogue(float* acc, OUT_T* C, const half* svh, int m, int ldc, int 
     long long warps = (long long) m * (n_size / HAD_N);
     const int threads = 256;
     long long blocks = (warps + threads / 32 - 1) / (threads / 32);
-    vllm_exl3::exl3_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0, stream>>>(
+    cuda_exl3::exl3_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0, stream>>>(
         acc, C, svh, m, ldc, n_off, n_size, expert_ids, n_rows, block_m,
         svh_expert_stride);
 }
@@ -880,7 +880,7 @@ at::Tensor& get_ws(at::Tensor* pool, int64_t numel, at::ScalarType dt,
     {
         TORCH_CHECK(
             at::cuda::currentStreamCaptureStatusMayInitCtx() == at::cuda::CaptureStatus::None,
-            "vllm-exl3: workspace must grow (", (t.defined() ? t.numel() : 0), " -> ", numel,
+            "cuda-exl3: workspace must grow (", (t.defined() ? t.numel() : 0), " -> ", numel,
             ") during CUDA graph capture. This should not happen: call "
             "exl3_reserve() at load time.");
         if (t.defined()) g_retired.push_back(t);
@@ -892,7 +892,7 @@ at::Tensor& get_ws(at::Tensor* pool, int64_t numel, at::ScalarType dt,
 
 }  // namespace
 
-namespace vllm_exl3 {
+namespace cuda_exl3 {
 
 // Defined in hadamard.cu.
 void exl3_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh);
@@ -928,7 +928,7 @@ void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t
 int64_t& moe_acc_cap_ref()
 {
     static int64_t v = [] {
-        const char* e = getenv("VLLM_EXL3_MOE_ACC_MAX_ELEMS");
+        const char* e = exl3_env("CUDA_EXL3_MOE_ACC_MAX_ELEMS");
         return e && *e ? (int64_t) atoll(e) : (8ll << 20);   // 32 MiB of fp32
     }();
     return v;
@@ -1149,4 +1149,4 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     return out;
 }
 
-}  // namespace vllm_exl3
+}  // namespace cuda_exl3

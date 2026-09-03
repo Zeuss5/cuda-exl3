@@ -7,7 +7,7 @@ and holes in the selection (-1 rows the indexer left empty).
 import pytest
 import torch
 
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 D, DV = 576, 512
@@ -38,7 +38,7 @@ def _run(B, H, topk, chunk, holes=False, rows=4096, seed=0):
         sel[:, ::7] = -1
     sl = torch.full((B,), topk, device=dev, dtype=torch.int32)
     scale = 1.0 / (D ** 0.5)
-    got = torch.ops.vllm_exl3_C.mla_decode(q, kv, sel, sl, scale, DV, chunk, 0, 1.0)
+    got = torch.ops.cuda_exl3_C.mla_decode(q, kv, sel, sl, scale, DV, chunk, 0, 1.0)
     ref = _reference(q, kv, sel, sl, scale)
     return ((ref - got.float()).norm() / ref.norm()).item()
 

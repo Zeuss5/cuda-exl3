@@ -1,8 +1,8 @@
 MIT License
 
-Copyright (c) 2026 vllm-exl3 contributors
+Copyright (c) 2026 cuda-exl3 contributors
 
-Portions of vllm_exl3/csrc/ (exl3_codebook.cuh, exl3_dq.cuh, and the fragment /
+Portions of cuda_exl3/csrc/ (exl3_codebook.cuh, exl3_dq.cuh, and the fragment /
 PTX / Hadamard primitives in exl3_common.cuh and exl3_had.cuh) are derived from
 ExLlamaV3, Copyright (c) turboderp, also MIT licensed:
 https://github.com/turboderp-org/exllamav3

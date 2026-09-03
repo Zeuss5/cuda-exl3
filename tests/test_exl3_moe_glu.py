@@ -8,7 +8,7 @@ that is no worse.
 import pytest
 import torch
 
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -17,7 +17,7 @@ SHAPES = [(768, 8, 32, 5), (1536, 4, 16, 7), (2048, 3, 64, 3)]
 
 def _run(dt, I, E, block_m, nblk):
     _ops._try_native()
-    ops = torch.ops.vllm_exl3_C
+    ops = torch.ops.cuda_exl3_C
     dev = "cuda"
     rows = nblk * block_m
     torch.manual_seed(0)

@@ -5,7 +5,7 @@ warm-cache case and are optimistic. For a real comparison against b12x with a
 cold cache and a fresh selection per call, use bench_mla_headtohead.py.
 """
 import torch, itertools
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 _ops._try_native()
 import sys
 dev="cuda"; torch.manual_seed(0)
@@ -39,7 +39,7 @@ for B in (1,4,16):
     sl=torch.full((B,),topk,device=dev,dtype=torch.int32)
     sol=B*topk*D*2/HBM*1e6; best=None
     for chunk,hpb in itertools.product((16,32,48,64,96,128,256),(1,2)):
-        f=lambda c=chunk,h=hpb: torch.ops.vllm_exl3_C.mla_decode(q,kv,sel,sl,1.0/(D**0.5),DV,c,h, 1.0)
+        f=lambda c=chunk,h=hpb: torch.ops.cuda_exl3_C.mla_decode(q,kv,sel,sl,1.0/(D**0.5),DV,c,h, 1.0)
         try: us=gt(f)
         except Exception: continue
         blocks=((topk+chunk-1)//chunk)*((H+15)//16)*B

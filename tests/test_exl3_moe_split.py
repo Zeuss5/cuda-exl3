@@ -7,7 +7,7 @@ left zeroed so a second call does not add to stale partials.
 import pytest
 import torch
 
-from vllm_exl3 import ops as _ops
+from cuda_exl3 import ops as _ops
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -17,7 +17,7 @@ E, H, I, BITS, CB = 32, 2048, 768, 4, 1
 @pytest.fixture
 def gemm():
     _ops._try_native()
-    return torch.ops.vllm_exl3_C
+    return torch.ops.cuda_exl3_C
 
 
 def _operands(rows, block_m, dev="cuda"):
