@@ -540,6 +540,29 @@ about 8 us, roughly 40x the rate of local shared memory on the same chip.
 Consumer Blackwell implements the cluster programming model without the fast
 interconnect that makes it worth using on datacenter parts.
 
+**32 keys per tile on 8 warps with a single buffer**, to get twice the mma
+between barriers at the same occupancy. **1.8x slower.** Losing the `cp.async`
+prefetch costs far more than the barriers save, even at prefill where the cache
+is L2-resident and there are thousands of blocks: sixteen warps per SM cannot
+hide an L2 round trip when all of them stall at the same barrier.
+
+That result, plus the register and shared budgets, is the ceiling for this
+design and worth writing down. Two blocks per SM, capped by 43 KB of shared and
+122 registers per thread, so 16 warps and about 30% of the tensor pipe against
+cuBLAS's 417 TFLOPS. A 16-warp block lands in exactly the same place, because
+the register budget then halves the block count. Getting past it needs the K
+tile in shared to shrink, and double buffering plus a 16-bit `mma` between them
+forbid that -- an fp8 tile would halve it, but `ldmatrix` is 16-bit only and the
+PV fragment needs the transposing form.
+
+One thing that did work, from the same investigation: the selection list used to
+be copied into shared a whole chunk at a time, which is 8 KB at chunk 2048 --
+exactly enough to push a prefill block from 43 to 50.6 KB and from two resident
+blocks per SM down to one. A 1 KB rolling slab with one tile of lookahead costs
+one barrier every sixteen tiles and restores it, worth 12% at head_dim 576
+(2365 -> 2086 us at 4096 rows). head_dim 512, which is what GLM uses, was
+already under the cliff and does not move.
+
 Things that did not work, all reverted:
 
 * **Register prefetch instead of a second shared K buffer**, to trade 18 KB of
