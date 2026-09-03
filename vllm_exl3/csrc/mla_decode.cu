@@ -64,6 +64,7 @@
 #include <type_traits>
 #include <map>
 #include <algorithm>
+#include <vector>
 
 #include "exl3_common.cuh"
 
@@ -149,8 +150,12 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     // (B, H, splits, DV): splits contiguous, so the merge walks them 1 KB apart
     // instead of H * DV * 2 = 16 KB apart, which is a different page every time.
     __nv_bfloat16* __restrict__ part_o,
-    float* __restrict__ part_m,              // (B, splits, H)
-    float* __restrict__ part_l,              // (B, splits, H)
+    float* __restrict__ part_m,              // (B, H, splits)
+    float* __restrict__ part_l,              // (B, H, splits)
+    // Set when splits == 1: there is nothing to merge, so normalise here and
+    // write the answer straight out. At prefill that removes a round trip of
+    // hundreds of megabytes through the partial buffer, and a kernel launch.
+    __nv_bfloat16* __restrict__ out_direct, float out_scale,
     int H, int topk, int splits, int chunk, float scale, int hpb)
 {
     constexpr int KS = D + 8;                // padded shared row stride
@@ -315,11 +320,32 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         // S[16 heads][TILE keys] = Q @ K^T
         {
             for (int nb = nb_w; nb < NBLK; nb += NBLK_E) {
-                FragC c{};
+                // Two accumulators, not one. Every mma in this loop reads the
+                // accumulator the previous one wrote, so a single fragment makes
+                // the whole k-loop one dependency chain and `wait` becomes the
+                // top stall. Two independent chains cost four registers.
+                FragC c{}, c2{};
 #pragma unroll
-                for (int f = 0; f < 4; ++f) c[f] = 0.f;
+                for (int f = 0; f < 4; ++f) { c[f] = 0.f; c2[f] = 0.f; }
+                // One ldmatrix feeds two mmas. A B fragment for m16n8k16 is
+                // eight keys by sixteen dims, which is two of ldmatrix's 8x8
+                // tiles in exactly the register order it produces, so an x4 load
+                // covers 32 dims: four scalar shared loads become one, and the
+                // eight rows it reads are KS apart, which the D+8 pad makes
+                // conflict-free.
+                constexpr int PAIRS = KSTEPS / 2;
 #pragma unroll
-                for (int ki = 0; ki < KSTEPS; ++ki) {
+                for (int kp = 0; kp < PAIRS; ++kp) {
+                    const int k0 = (ksl * KSTEPS + kp * 2) * 16;
+                    FragA kb4;
+                    ldsm4(kb4, k_cur + (nb * 8 + (lane & 7)) * KS
+                                     + k0 + 8 * (lane >> 3));
+                    const FragB* fb2 = reinterpret_cast<const FragB*>(&kb4);
+                    mma_m16n8k16_bf16(q_f[kp * 2], fb2[0], c);
+                    mma_m16n8k16_bf16(q_f[kp * 2 + 1], fb2[1], c2);
+                }
+                if (KSTEPS & 1) {                 // odd tail, D = 576 only
+                    const int ki = KSTEPS - 1;
                     const int k0 = (ksl * KSTEPS + ki) * 16;
                     FragB fb;
                     const __nv_bfloat16* krow = k_cur + (nb * 8 + (lane >> 2)) * KS
@@ -330,6 +356,8 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
                         *reinterpret_cast<const uint32_t*>(krow + 8);
                     mma_m16n8k16_bf16(q_f[ki], fb, c);
                 }
+#pragma unroll
+                for (int f = 0; f < 4; ++f) c[f] += c2[f];
                 const int cr = lane >> 2, cc = (lane & 3) * 2;
 #pragma unroll
                 for (int f = 0; f < 2; ++f) {
@@ -405,10 +433,13 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         __syncthreads();
     }
 
-    if (tid < MMA_M && tid < hpb && h0 + tid < H) {
+    if (out_direct == nullptr && tid < MMA_M && tid < hpb && h0 + tid < H) {
         const size_t o = ((size_t) b * H + h0 + tid) * splits + s;
         part_m[o] = m_s[tid]; part_l[o] = l_s[tid];
     }
+    if (out_direct != nullptr && tid < MMA_M)
+        c_s[tid] = l_s[tid] > 0.f ? out_scale / l_s[tid] : 0.f;
+    __syncthreads();
 
     // The accumulator layout puts consecutive lanes on different heads at the
     // same dim, so writing it straight out is 32 scattered dwords per lane. Bounce
@@ -442,13 +473,17 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             const int hl = i / (OSH / 8), d = (i % (OSH / 8)) * 8;
             if (hl >= hpb || h0 + hl >= H) continue;
             const float* src = osh + hl * OSS + d;
-            __nv_bfloat16* dst = part_o
-                + (((size_t) b * H + h0 + hl) * splits + s) * DV + pass * OSH + d;
+            const float w = out_direct ? c_s[hl] : 1.f;
+            __nv_bfloat16* dst =
+                out_direct ? out_direct + ((size_t) b * H + h0 + hl) * DV
+                                        + pass * OSH + d
+                           : part_o + (((size_t) b * H + h0 + hl) * splits + s) * DV
+                                    + pass * OSH + d;
             asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1,%2,%3,%4}, %5;\n"
-                         :: "l"(dst), "r"(f32x2_bf16(src[0], src[1])),
-                            "r"(f32x2_bf16(src[2], src[3])),
-                            "r"(f32x2_bf16(src[4], src[5])),
-                            "r"(f32x2_bf16(src[6], src[7])), "l"(keep)
+                         :: "l"(dst), "r"(f32x2_bf16(src[0] * w, src[1] * w)),
+                            "r"(f32x2_bf16(src[2] * w, src[3] * w)),
+                            "r"(f32x2_bf16(src[4] * w, src[5] * w)),
+                            "r"(f32x2_bf16(src[6] * w, src[7] * w)), "l"(keep)
                          : "memory");
         }
     }
@@ -590,9 +625,21 @@ std::map<uint64_t, std::pair<int, int>>& mla_tune_cache() {
     return c;
 }
 
-uint64_t mla_tune_key(int B, int H, int topk) {
+// Decode batches are small and the optimum moves between them, so they are
+// keyed exactly. Prefill arrives as whatever the scheduler chunked to, the
+// optimum is flat across it, and tuning a 4k-row shape costs hundreds of
+// milliseconds -- so above 32 rows the key is bucketed to a power of two.
+int mla_tune_bucket(int B) {
+    if (B <= 32) return B;
+    int b = 32;
+    while (b < B) b <<= 1;
+    return b;
+}
+
+uint64_t mla_tune_key(int B, int H, int topk, int D, bool kv8) {
     uint64_t h = 1469598103934665603ull;
-    for (uint64_t v : {(uint64_t) B, (uint64_t) H, (uint64_t) topk}) {
+    for (uint64_t v : {(uint64_t) mla_tune_bucket(B), (uint64_t) H, (uint64_t) topk,
+                       (uint64_t) D, (uint64_t) kv8}) {
         h ^= v; h *= 1099511628211ull;
     }
     return h;
@@ -639,22 +686,37 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     int chunk = (int) split_chunk;
     int wide = (int) heads_per_block;  // 1: 8 warps x 16 keys, 2: 16 warps x 32
     if (chunk <= 0 || wide <= 0) {
-        const uint64_t key = mla_tune_key(B, H, topk);
+        const uint64_t key = mla_tune_key(B, H, topk, D, kv8);
         auto& cache = mla_tune_cache();
         auto it = cache.find(key);
         if (it == cache.end()) {
-            std::pair<int, int> best{32, 1};
+            std::pair<int, int> best{B >= 64 ? 512 : 32, 1};
             if (mla_tuning_enabled() &&
                 at::cuda::currentStreamCaptureStatusMayInitCtx() ==
                     at::cuda::CaptureStatus::None) {
+                // Two regimes, and searching the wrong one is expensive. Few
+                // rows means the machine is starved and the split count is what
+                // fills it, so search small chunks and the half-head shapes.
+                // Many rows -- prefill -- already has all the parallelism it
+                // needs from the rows themselves, and every extra split is pure
+                // partial-buffer traffic, so search large chunks only. One timed
+                // rep there instead of three: a 4k-row candidate is milliseconds.
+                const bool many = B >= 64;
+                const std::vector<int> chunks =
+                    many ? std::vector<int>{256, 384, 512, 768, 1024, 2048}
+                         : std::vector<int>{16, 32, 48, 64, 96, 128, 192, 256, 384};
+                const std::vector<int> shapes =
+                    many ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3, 4};
+                const int reps = many ? 1 : 3;
                 float best_ms = 1e30f;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
-                for (int c : {16, 32, 48, 64, 96, 128, 192, 256, 384}) {
-                    for (int wd : {1, 2, 3, 4}) {
+                for (int c : chunks) {
+                    for (int wd : shapes) {
+                        if (c > topk && c != chunks.front()) continue;
                         mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
                         cudaEventRecord(beg);
-                        for (int r = 0; r < 3; ++r)
+                        for (int r = 0; r < reps; ++r)
                             mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
                         cudaEventRecord(end);
                         cudaEventSynchronize(end);
@@ -694,6 +756,9 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     auto pm = at::empty({(int64_t) B * splits * H}, fopt);
     auto pl = at::empty({(int64_t) B * splits * H}, fopt);
     auto out = at::empty({B, H, DV}, q.options());
+    // Only when a single block owns every head of a row: with head groups the
+    // heads are disjoint, so each still writes its own slice, which is fine.
+    const bool direct = (splits == 1);
 
     auto stream = at::cuda::getCurrentCUDAStream();
     // Two block shapes. The wide one halves the block count for the same thread
@@ -717,8 +782,9 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
             (const KT_*) kv.data_ptr(), sel.data_ptr<int>(),                   \
             seqlens.numel() ? seqlens.data_ptr<int>() : nullptr,               \
             (__nv_bfloat16*) po.data_ptr(), pm.data_ptr<float>(),              \
-            pl.data_ptr<float>(), H, topk, splits, chunk, (float) sscale,      \
-            hpb);                                                              \
+            pl.data_ptr<float>(),                                              \
+            direct ? (__nv_bfloat16*) out.data_ptr() : nullptr,                \
+            (float) oscale, H, topk, splits, chunk, (float) sscale, hpb);      \
     } while (0)
 
     dim3 grid(splits, hgroups, B);
@@ -754,7 +820,8 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 splits, (float) oscale);                                       \
     } while (0)
 
-    if (splits >= 24) { MLA_REDUCE(32); }
+    if (direct) { /* the partial kernel already wrote the answer */ }
+    else if (splits >= 24) { MLA_REDUCE(32); }
     else if (splits >= 12) { MLA_REDUCE(16); }
     else if (splits >= 6) { MLA_REDUCE(8); }
     else { MLA_REDUCE(4); }
