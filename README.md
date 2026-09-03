@@ -489,15 +489,31 @@ per-GPU compute, which is a net loss for TTFT. The `VLLM_ENABLE_PCIE_ALLREDUCE`
 path the reference recipe uses does not engage at TP=4 -- it is gated to two
 GPUs, which is presumably why that recipe runs TP=2 in the first place.
 
-**The MoE GEMM is close to hardware-bound, not far from it.** The fused path
-measures **264-275 TFLOPS at 63-66% of speed-of-light** for this layer, which is
-compute-bound (1.93 ms of compute against 0.62 ms of weight reads). An earlier
-version of this section claimed it ran at ~100 TFLOPS and 25% of SoL and was the
-dominant prefill cost. That figure came from timing **one expert in isolation**
-with `exl3_linear` -- a 64-block launch on 188 SMs -- which is not how it runs.
-Production batches all 288 experts into a single grid. The block size matters a
-lot and 128 is the best available (16 / 32 / 64 / 128 give 147 / 201 / 224 / 264
-TFLOPS; 256 is not supported).
+**The MoE GEMM is hardware-bound at block 128**, and this was checked rather
+than assumed. Profiling the fused kernel at GLM's TP=4 shape:
+
+| | |
+|---|---|
+| tensor pipe | **79.0% of peak** |
+| throughput on rows it actually computes | **345 TFLOPS** |
+| against cuBLAS bf16 on ideal square GEMMs | 417 TFLOPS, so **83%** |
+| row padding (blocks rounded to 128) | 13% |
+| net useful throughput | 299 TFLOPS |
+
+79% of the tensor pipe, for a kernel that also decodes a 4-bit trellis and fuses
+a Hadamard epilogue, is not a kernel with headroom in it. The only remaining
+loss is the 13% of computed rows that are block padding, and **trading block
+size for it makes things worse, not better** -- measured on rows actually
+computed, block 128 / 64 / 32 give 345 / 289 / 237 TFLOPS while padding only
+falls 13% / 13% / 7%. Tensor efficiency is lost faster than padding is saved.
+A mixed-block scheme could in principle recover part of that 13%, which is 13%
+of the 20% the MoE costs: under 3% of TTFT, for a change to both the kernel and
+vLLM's block alignment. Not worth it.
+
+An earlier version of this section claimed the MoE ran at ~100 TFLOPS and 25% of
+SoL and was the dominant prefill cost. That figure came from timing **one expert
+in isolation** with `exl3_linear` -- a 64-block launch on 188 SMs -- which is not
+how it runs. Production batches all 288 experts into a single grid.
 
 So the ranked prefill levers on *this* machine are: the interconnect, which is a
 hardware property; then attention and the MoE at roughly equal weight, one at
