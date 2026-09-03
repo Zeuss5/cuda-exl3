@@ -465,6 +465,42 @@ at GLM-5.3-Flash's exact attention dimensions. What is **not** verified is a
 served model, because `Glm5Next*` is not in a released vLLM and the only build
 that has it is inside the community Docker image.
 
+### What prefill is bound by
+
+Compute, and mostly the MoE. A FLOP budget for an 8000-token prefill at TP=4,
+with every rate measured on this card at the shape it actually runs at, closes
+to 81% of the observed 779 ms TTFT (the rest is TP all-reduce, launch overhead,
+scheduling and sampling):
+
+| component | % of FLOPs | TFLOPS achieved | ms | % of accounted time |
+|---|---|---|---|---|
+| **MoE experts** (top-8 + shared) | 47.0% | **100** | 408 | **64%** |
+| **sparse MLA attention** | 24.3% | 141 | 149 | 24% |
+| attention projections | 24.3% | 330 | 64 | 10% |
+| indexer projections | 3.6% | 360 | 9 | 1.4% |
+| indexer scoring (causal) | 0.8% | ~200 | 4 | 0.6% |
+
+The MoE line is the whole story, and **not because the GEMM is slow**: it does
+232–285 TFLOPS at large M and beats every other EXL3 kernel measured here. It is
+slow because **top-8 routing over 288 experts shatters an 8000-token batch into
+288 GEMMs of about 222 rows each**, and at 222 rows it reaches ~100 TFLOPS —
+roughly a quarter of speed-of-light for that shape. Prefill has thousands of
+tokens and still runs its dominant kernel in a small-M regime.
+
+Attention is second at 24%, disproportionate to its FLOPs because it runs at
+141 TFLOPS against the projections' 330. That is the part already improved 1.22x
+above, which is why TTFT moved 1.77x.
+
+**The indexer is 2%.** An earlier version of this README blamed it for
+long-context cost, reasoning from TPOT at two context lengths without measuring.
+Two things falsify that: the budget above, and the fact that prefill is nearly
+linear in context — 8k runs at 10,270 tok/s and 24k at 9,874, a 4% drop for 3.1x
+the context. A quadratic scoring term would be visible there and is not.
+
+So the ranked prefill levers are: small-M efficiency in the EXL3 MoE GEMM
+(64% of the time, at ~25% of SoL), then the attention kernel (24%, at ~34% of
+this card's bf16 GEMM rate), then nothing else worth touching.
+
 ### Measurements
 
 Two things flatter a sparse-MLA benchmark, and both of them fooled this one
