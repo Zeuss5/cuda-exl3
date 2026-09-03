@@ -592,47 +592,49 @@ whatever the backend.
 
 Measured against b12x on **the same image, the same weights, the same
 everything but the attention backend and its cache dtype** (`vllm bench serve`,
-random 512-token inputs, 256 outputs, output token throughput):
+`--ignore-eos`, output token throughput):
 
-| concurrency | ours (bf16 KV) | b12x (nvfp4 KV) |
-|---|---|---|
-| 1 | 104.7 tok/s | 105.7 |
-| 2 | 175.2 | 173.3 |
-| 4 | 302.2 | 313.2 |
-| 8 | 499.8 | 515.9 |
-| 16 | 721.2 | 773.1 |
+**8000 in / 1000 out**, the shape most agent workloads look like:
 
-At 24k-token inputs, where top-k 2048 actually bites, per-token decode latency:
+| conc | TTFT ours | TTFT b12x | out tok/s ours | out tok/s b12x | TPOT ours | TPOT b12x |
+|---|---|---|---|---|---|---|
+| 1 | 0.78 s | 0.79 s | 100.8 | 101.6 | 9.15 ms | 9.06 ms |
+| 2 | 1.16 s | 1.16 s | 161.9 | 162.6 | 11.20 | 11.15 |
+| 4 | 1.91 s | 1.83 s | 263.3 | 265.4 | 13.28 | 13.24 |
+| 8 | 2.91 s | 2.99 s | 402.0 | 397.1 | 16.99 | 17.15 |
+| 16 | 4.65 s | 4.67 s | 526.2 | 523.9 | 25.73 | 25.85 |
 
-| concurrency | ours | b12x |
-|---|---|---|
-| 1 | 9.26 ms | 9.27 ms |
-| 4 | 29.3 ms | 24.3 ms |
-| 8 | 94.7 ms | 80.3 ms |
+**24k in / 256 out**:
 
-An fp8 cache (`--kv-cache-dtype fp8`) also serves correctly and doubles the KV
-capacity, 1.8M tokens to 3.0M. It changes none of these numbers, and that turns
-out to be the most useful measurement in this section.
+| conc | TTFT ours | TTFT b12x | TPOT ours | TPOT b12x |
+|---|---|---|---|---|
+| 1 | 2.49 s | 2.51 s | 9.28 ms | 9.27 ms |
+| 4 | 6.11 s | 6.33 s | 24.44 ms | 24.27 ms |
+| 8 | 9.99 s | 9.75 s | 80.17 ms | 80.29 ms |
 
-**Sparse-MLA decode is not where GLM's decode time goes.** Attention here reads
-`topk = 2048` keys no matter how long the context is, so its cost is fixed;
-anything that grows with context is the indexer. Same batch, same weights, same
-MoE work, only the context differs:
+So the `CUSTOM` backend is level with b12x end to end, on our own kernels
+throughout. Getting there took the prefill work above: before it, TTFT at
+8k/1000 was 1.38 s against b12x's 0.79, and TPOT at 24k/c=4 was 30.2 ms against
+24.3. **Prefill is 1.77x faster than it was**, which is more than the 1.22x the
+kernel itself gained -- the rest was the autotuner, which had been re-searching
+from scratch for every distinct prefill chunk size.
 
-| concurrency | TPOT @ 512 ctx | TPOT @ 24k ctx | grows with context |
-|---|---|---|---|
-| 1 | 9.11 ms | 9.41 ms | 0.30 ms |
-| 8 | 14.06 ms | 98.70 ms | **84.6 ms** |
+That last point corrects something this README previously claimed. Measuring
+TPOT at 512 tokens of context against 24k and attributing the difference to the
+DSA indexer was wrong: with chunked prefill those decode steps carry prefill
+chunks from other requests in the batch, so most of what grows with context is
+prefill, not indexing. Making prefill 1.77x faster moved that "decode" number
+19%, which is not something an indexer theory predicts.
 
-Against that, 45 layers of this kernel is 0.33 ms/token at batch 1 and 0.58 at
-batch 8 -- 3.5% and **under 1%** of a token. The DSA indexer, which scores every
-key in the context to choose the 2048, is essentially the entire long-context
-decode cost. The 15-17% b12x lead at 24k is in that same region, not in the
-attention: b12x also runs a different indexer path (`VLLM_B12X_GLM_NOPE_NVFP4`).
+An fp8 cache (`--kv-cache-dtype fp8`) also serves correctly and doubles KV
+capacity, 1.8M tokens to 3.0M. It changes the end-to-end numbers very little,
+which is the honest reading of a kernel that is already fast enough not to be
+the bottleneck: 45 layers of it is 0.33 ms of a token at batch 1.
 
-So the kernel is comfortably the fastest of the three in isolation, and it is
-the wrong thing to keep optimising for this model. The indexer is next, and the
-bf16 GEMMs after it.
+One caveat on the base image: roughly half the time, startup dies during CUDA
+graph capture with an illegal address inside a TVM kernel (grid 4x1x1, block
+96x1x1 -- flashinfer/b12x territory, reproduced with b12x's own backend
+selected). Identical flags start fine on retry.
 
 ## MoE notes
 
