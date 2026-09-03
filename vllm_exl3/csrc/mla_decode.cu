@@ -141,7 +141,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 // 1152 B = 288 words, a multiple of 32, so every group of lanes reading down a
 // column would land on the same four banks -- an 8-way conflict. At 584 the rows
 // step by 4 banks and every ldmatrix covers all 32 exactly once.
-template <int D, int DV, int NWARPS, int TILE, typename KT>
+template <int D, int DV, int NWARPS, int TILE, typename KT, int NBUF>
 __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     const __nv_bfloat16* __restrict__ q,     // (B, H, D)
     const KT* __restrict__ kv,               // (rows, D) latent cache
@@ -175,10 +175,13 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     // registers instead. The dequant scale never appears here: it folds into
     // the softmax scale for QK and into the merged output for PV.
     constexpr bool KV8 = !std::is_same<KT, __nv_bfloat16>::value;
-    constexpr int NBUF = KV8 ? 1 : 2;
+    static_assert(!KV8 || NBUF == 1, "the fp8 path widens through registers");
     constexpr int EPL = KV8 ? 16 : 8;        // cache elements per 16-byte load
     constexpr int NPF = (TILE * (D / EPL) + NWARPS * 32 - 1) / (NWARPS * 32);
-    static_assert(NTHREADS >= MMA_M * TILE, "softmax pass needs one thread per score");
+    // The softmax pass is grid-strided over 16 x TILE scores and reduces across
+    // the threads that share a head, so a head must not straddle a warp.
+    static_assert(TILE == 16 || TILE == 32, "softmax reduction assumes 16 or 32 keys");
+    static_assert((MMA_M * TILE) % NTHREADS == 0, "softmax pass must tile evenly");
     static_assert(TILE % 16 == 0, "PV mma consumes 16 keys at a time");
 
     // Q needs 16 x KS halves and a K tile needs TILE x KS. At TILE = 16 those
@@ -193,7 +196,14 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     float* m_s = s_s + KSL * MMA_M * TILE;                                // 16
     float* l_s = m_s + MMA_M;                                             // 16
     float* c_s = l_s + MMA_M;                                             // 16
-    int* sel_s = reinterpret_cast<int*>(c_s + MMA_M);                     // chunk
+    // The selection list is held a slab at a time, not a whole chunk. A whole
+    // chunk is 8 KB at chunk 2048, and that is exactly what pushed the block
+    // over 50 KB and down to one resident block per SM. A slab is 1 KB and costs
+    // one extra barrier every SLAB_T tiles. One tile of lookahead, because
+    // staging runs a tile ahead of compute.
+    constexpr int SLAB_T = 16;
+    constexpr int SLAB = (SLAB_T + 1) * TILE;
+    int* sel_s = reinterpret_cast<int*>(c_s + MMA_M);                     // SLAB
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -218,7 +228,15 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         *reinterpret_cast<int4*>(q_s + r * KS + c) = v;
     }
     if (tid < MMA_M) { m_s[tid] = -INFINITY; l_s[tid] = 0.f; }
-    for (int i = tid; i < hi - lo; i += NTHREADS) sel_s[i] = sel[(size_t) b * topk + lo + i];
+    int slab0 = 0;                                    // first tile held by the slab
+    auto load_slab = [&](int t0) {
+        slab0 = t0;
+        for (int i = tid; i < SLAB; i += NTHREADS) {
+            const int g = lo + t0 * TILE + i;
+            sel_s[i] = g < hi ? sel[(size_t) b * topk + g] : -1;
+        }
+    };
+    load_slab(0);
 
     // acc[t][n] holds C[dim][head] for m-tile (warp + t*NWARPS), n-tile n.
     FragC acc[MTPW][NT];
@@ -248,11 +266,11 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     // past the last tile, so wait_group(1) names the tile about to be read.
     auto stage = [&](int t) {
         if (t < ntiles) {
-            __nv_bfloat16* dst_b = k_s + (t & 1) * (TILE * KS);
+            __nv_bfloat16* dst_b = k_s + (NBUF > 1 ? (t & 1) : 0) * (TILE * KS);
             const int n = min(TILE, hi - lo - t * TILE);
             for (int i = tid; i < TILE * (D / 8); i += NTHREADS) {
                 const int r = i / (D / 8), c = (i % (D / 8)) * 8;
-                const int row = (r < n) ? sel_s[t * TILE + r] : -1;
+                const int row = (r < n) ? sel_s[(t - slab0) * TILE + r] : -1;
                 void* dst = dst_b + r * KS + c;
                 if (row >= 0) {
                     const __nv_bfloat16* src =
@@ -276,7 +294,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             if (i >= TILE * (D / EPL)) break;
             const int r = i / (D / EPL), c = (i % (D / EPL)) * EPL;
             const int row = (t < ntiles && r < min(TILE, hi - lo - t * TILE))
-                          ? sel_s[t * TILE + r] : -1;
+                          ? sel_s[(t - slab0) * TILE + r] : -1;
             pf[u] = (row >= 0) ? *reinterpret_cast<const uint4*>(kv + (size_t) row * D + c)
                                : uint4{0, 0, 0, 0};
         }
@@ -302,18 +320,28 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
         }
     };
 
-    if constexpr (KV8) fetch(0); else stage(0);
+    if constexpr (KV8) fetch(0);
+    else if constexpr (NBUF > 1) stage(0);
     for (int t = 0; t < ntiles; ++t) {
+        if (t > 0 && (t - slab0) == SLAB_T) {
+            __syncthreads();                          // the old slab is still being read
+            load_slab(t);
+            __syncthreads();
+        }
         const int base = lo + t * TILE;
         const int n = min(TILE, hi - base);
-        const __nv_bfloat16* k_cur = k_s + (KV8 ? 0 : (t & 1) * (TILE * KS));
+        const __nv_bfloat16* k_cur = k_s + (NBUF > 1 ? (t & 1) * (TILE * KS) : 0);
         if constexpr (KV8) {
             widen();
             __syncthreads();
             fetch(t + 1);
-        } else {
+        } else if constexpr (NBUF > 1) {
             stage(t + 1);
             asm volatile("cp.async.wait_group 1;\n" ::);
+            __syncthreads();
+        } else {
+            stage(t);
+            asm volatile("cp.async.wait_group 0;\n" ::);
             __syncthreads();
         }
 
@@ -376,7 +404,7 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
             float raw = s_s[h * TILE + j];
 #pragma unroll
             for (int u = 1; u < KSL; ++u) raw += s_s[u * (MMA_M * TILE) + h * TILE + j];
-            float sc = (j < n && sel_s[t * TILE + j] >= 0) ? raw * scale : -INFINITY;
+            float sc = (j < n && sel_s[(t - slab0) * TILE + j] >= 0) ? raw * scale : -INFINITY;
 
             float mt = sc;
 #pragma unroll
@@ -764,17 +792,17 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     // Two block shapes. The wide one halves the block count for the same thread
     // count, which halves both the Q re-read and the partial write: those are
     // per block, not per key, and at low batch they outweigh the cache traffic.
-#define MLA_LAUNCH(D_, NW_, TILE_, KT_)                                             \
+#define MLA_LAUNCH(D_, NW_, TILE_, KT_, NB_)                                             \
     do {                                                                       \
         constexpr int KSL_ = (NW_) / ((TILE_) / 8);                            \
-        constexpr int NBUF_ = std::is_same<KT_, __nv_bfloat16>::value ? 2 : 1; \
+        constexpr int NBUF_ = std::is_same<KT_, __nv_bfloat16>::value ? (NB_) : 1;\
         const size_t smem = NBUF_ * (TILE_) * ((D_) + 8)                       \
                               * sizeof(__nv_bfloat16)                          \
                           + 16 * ((TILE_) + 8) * sizeof(__nv_bfloat16)         \
                           + (size_t) KSL_ * 16 * (TILE_) * sizeof(float)       \
                           + 3 * 16 * sizeof(float)                             \
-                          + (size_t) chunk * sizeof(int);                      \
-        auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_, KT_>;       \
+                          + 17 * (TILE_) * sizeof(int);                        \
+        auto kern = mla_decode_partial_kernel<D_, 512, NW_, TILE_, KT_, NBUF_>;\
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,\
                              101376);                                          \
         kern<<<grid, (NW_) * 32, smem, stream>>>(                              \
@@ -788,10 +816,16 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
     } while (0)
 
     dim3 grid(splits, hgroups, B);
+// 32 keys per tile on 8 warps with a single buffer was tried here: twice the
+// mma between barriers for the same occupancy, at the price of the cp.async
+// prefetch. It is 1.8x slower. Losing the prefetch costs far more than the
+// barriers save, even at prefill where the cache is L2-resident and there are
+// thousands of blocks -- 16 warps per SM is not enough to hide an L2 round trip
+// when every one of them stalls at the same barrier.
 #define MLA_PICK(D_, KT_)                                                      \
     do {                                                                       \
-        if (wide == 2 || wide == 4) { MLA_LAUNCH(D_, 16, 32, KT_); }           \
-        else { MLA_LAUNCH(D_, 8, 16, KT_); }                                   \
+        if (wide == 2 || wide == 4) { MLA_LAUNCH(D_, 16, 32, KT_, 2); }        \
+        else { MLA_LAUNCH(D_, 8, 16, KT_, 2); }                                \
     } while (0)
 
     if (D == 576) {
