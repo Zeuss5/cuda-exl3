@@ -56,20 +56,25 @@ instruction. With no `TORCH_CUDA_ARCH_LIST` set and no GPU visible, `setup.py`
 falls back to `8.0;8.6;8.9;9.0;12.0` plus `12.1` when nvcc reports
 `compute_121`.
 
-**The blocker is not this plugin, it is the model definition.**
-`Glm5NextForConditionalGeneration` is in no released or nightly vLLM — I
-checked: `glm5_next.py` 404s on `main` and the architecture is absent from the
-registry. It exists in community images as an out-of-tree `vllm.models.glm5next`
-package. Those images are **x86_64**, and a Spark is aarch64, so you cannot
-simply reuse the one this repo's own Docker guide points at. You need a vLLM
-build for arm64 that carries the model definition — which is what the
-Reederey87 kit's `Dockerfile` produces, and the reason it builds its own image.
+**You need a base image that carries the model definition.**
+`Glm5NextForConditionalGeneration` is in no *released or nightly* vLLM —
+`glm5_next.py` 404s on `main` and the architecture is absent from the registry —
+but there is an **official day-0 preview image**, and it is multi-arch:
 
-Once you have such an image, `docker/Dockerfile.sparse-mla` in this repo layers
-the plugin onto it:
+```
+vllm/vllm-openai:glm53-flash              # amd64 + arm64
+vllm/vllm-openai:glm53-flash-arm64-cu130  # what the 2x Spark kit pins
+vllm/vllm-openai:glm53-flash-x86_64-cu130
+```
+
+So aarch64 is not the obstacle it would otherwise be. Pin by digest; the 2x
+Spark kit pins `glm53-flash-arm64-cu130@sha256:905c0293…`.
+
+`docker/Dockerfile.sparse-mla` in this repo layers the plugin onto any of them:
 
 ```bash
-docker build -f docker/Dockerfile.sparse-mla --build-arg BASE=<your arm64 image> \
+docker build -f docker/Dockerfile.sparse-mla \
+  --build-arg BASE=vllm/vllm-openai:glm53-flash-arm64-cu130 \
   -t glm53-exl3-spark .
 ```
 
@@ -110,46 +115,66 @@ this plugin binds that slot to its sparse-MLA implementation. See the main
 README for what that backend does and does not cover (decode is ours; prefill
 runs through it too, because vLLM has no MLA prefill backend for this model).
 
-## 5. How the kernels compare — honestly
+## 5. How the kernels compare — measured
 
-The Reederey87 kit replaced ExLlamaV3's kernels with its own `exl3_fat_gemm.cu`
-for the MoE path. So did this plugin, independently. Both report against their
-own machine:
+The Reederey87 kit replaced ExLlamaV3's large-M expert path with its own
+`overlay/exl3_fat_gemm.cu`. So did this plugin, independently. Their kernel
+compiles for sm_120 **unchanged** — same intake constraints, same instruction
+set — so the comparison neither project could make from its own numbers is
+actually available: same GPU, same trellis tensor, same shapes.
 
-| | their GB10 fat kernel | this plugin, sm_120 |
-|---|---|---|
-| Measured | **73.5 TFLOP/s** (up from 52, +41%) | **317–327 TFLOPS** at m ≥ 512 |
-| Their machine's ceiling | ~92 TFLOP/s for that op | ~400 TFLOPS |
-| Fraction of ceiling | ~80% | ~79–82% |
-| Versus ExLlamaV3's own kernel | not stated in those terms | **3.9–5.0x** at m ≥ 512 |
+`bench/bench_vs_spark_fat_gemm.py` runs it. Their kernel is not vendored here;
+point it at a checkout. Both kernels take the identical K4 MCG trellis straight
+from `GLM-5.3-Flash-tr3-4bpw`, and their outputs agree to **~6e-4 relative**,
+which cross-validates both implementations.
 
-**Both kernels sit at about 80% of what their respective machine can do.** That
-is the honest read, and it means there is no basis for claiming this plugin
-would be faster on a Spark — the two numbers are measured on machines a factor
-of four apart in compute and nearly seven apart in bandwidth, and neither
-project has run the other's kernel on the other's hardware.
+RTX PRO 6000 Blackwell (sm_120), GLM expert shapes, layer 10 expert 0:
 
-What *is* fair to say is narrower and more useful:
+**gate_proj, k=4096 n=2048**
 
-1. Neither kernel is leaving much on the table against its own hardware, so a
-   swap is unlikely to be transformative either way. That kit reached the same
-   conclusion when it evaluated b12x's `trellis3_t256` EXL3 kernel and parked it:
-   the bar was to beat its own 73.5 TFLOP/s, and it computed the end-to-end
-   ceiling for a perfect replacement at +4–5%.
-2. The discriminating experiment is cheap and nobody has run it: build this
-   plugin for sm_121 and microbenchmark `exl3_linear` / `exl3_moe_gemm` on the
-   rank-sliced GLM shapes (hidden 4096, moe_intermediate 2048; under TP=2 that
-   is gate/up 4096→1024 and down 1024→4096) against the incumbent, in a stopped
-   window. `bench/bench_gemm.py` does exactly this and prints achieved TFLOPS
-   against a measured speed-of-light, so it transfers unchanged.
-3. The attention side is a genuinely different question and is *not* covered by
-   either kit's GEMM work. This plugin's sparse-MLA decode kernel sustains about
-   92% of its machine's stream-copy bandwidth at batch 32 and beats b12x by
-   2.5x at batch 1. On a bandwidth-starved machine, a bandwidth-efficient
-   attention kernel plus an fp8 cache is the part most likely to transfer.
+| m | ours | fat | ours TFLOPS | fat TFLOPS | ours/fat |
+|---|---|---|---|---|---|
+| 128 | 24.9 us | 117.8 | 86.3 | 18.2 | **4.73x** |
+| 512 | 57.6 | 126.2 | 149.1 | 68.1 | **2.19x** |
+| 1024 | 95.1 | 136.9 | 180.6 | 125.5 | 1.44x |
+| 2048 | 152.5 | 224.4 | 225.3 | 153.1 | 1.47x |
+| 3584 | 245.1 | 353.1 | 245.3 | 170.3 | 1.44x |
+| 4096 | 296.6 | 364.2 | 231.7 | 188.7 | 1.23x |
 
-If you run any of this, the numbers would be welcome — particularly (2), which
-would settle a question two projects have now both left open.
+**down_proj, k=2048 n=4096**
+
+| m | ours | fat | ours TFLOPS | fat TFLOPS | ours/fat |
+|---|---|---|---|---|---|
+| 128 | 24.7 us | 65.6 | 87.0 | 32.7 | **2.66x** |
+| 1024 | 82.1 | 113.0 | 209.3 | 152.0 | 1.38x |
+| 3584 | 213.0 | 263.8 | 282.3 | 227.9 | 1.24x |
+| 4096 | 251.1 | 309.5 | 273.7 | 222.0 | 1.23x |
+
+So on identical silicon **this plugin's kernel is ahead everywhere, by 1.23x at
+the largest batches and 2.7-4.7x at small M**, and by 1.44x at M=3584, the batch
+size their kit tunes for. That replaces the "both at about 80% of their own
+machine" reading in an earlier draft of this document, which was an inference
+from two numbers measured on different hardware and turned out to be the wrong
+conclusion.
+
+**What this does not establish.** Their tile configuration -- 128x16x128, three
+cp.async stages -- was chosen for GB10: far fewer SMs and 218 GB/s. Running it
+on 188 SMs at 1.46 TB/s tests their *tile choice on our machine*, not their
+kernel on its own. A loss here is not proof that this plugin wins on a Spark,
+and the honest experiment is still the one in §4: build both for sm_121 and run
+this same benchmark there. It is now a script rather than a plan.
+
+One number is suggestive, though. Their kernel reaches 170-228 TFLOPS here
+against the 73.5 TFLOP/s they measure on GB10 -- a factor of 2.3-3.1, well short
+of the ~4.5x compute ratio between the two parts. That is consistent with their
+own finding that GB10 is bandwidth-bound rather than MMA-bound, and it means
+neither kernel's sm_120 result should be extrapolated to a Spark by scaling.
+
+A note on the third column the benchmark prints: stock ExLlamaV3's `exl3_gemm`
+measures 19-27 TFLOPS at these batch sizes, but that is not the baseline the fat
+kernel replaced and it is not a fair use of it. `exl3_gemm` is a small-M decode
+kernel; at large M the ExLlamaV3 stack reconstructs the weight and calls cuBLAS,
+which is what both fat kernels are actually competing with.
 
 ## 6. Reference points from the 2x Spark kit
 
