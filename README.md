@@ -467,39 +467,48 @@ that has it is inside the community Docker image.
 
 ### What prefill is bound by
 
-Compute, and mostly the MoE. A FLOP budget for an 8000-token prefill at TP=4,
-with every rate measured on this card at the shape it actually runs at, closes
-to 81% of the observed 779 ms TTFT (the rest is TP all-reduce, launch overhead,
-scheduling and sampling):
+**The interconnect, then the kernels.** This took two wrong answers to get
+right, both from timing something unrepresentative, so the numbers below are all
+measured on the path that actually runs.
 
-| component | % of FLOPs | TFLOPS achieved | ms | % of accounted time |
-|---|---|---|---|---|
-| **MoE experts** (top-8 + shared) | 47.0% | **100** | 408 | **64%** |
-| **sparse MLA attention** | 24.3% | 141 | 149 | 24% |
-| attention projections | 24.3% | 330 | 64 | 10% |
-| indexer projections | 3.6% | 360 | 9 | 1.4% |
-| indexer scoring (causal) | 0.8% | ~200 | 4 | 0.6% |
+For an 8000-token prefill at TP=4, against a measured TTFT of 779 ms:
 
-The MoE line is the whole story, and **not because the GEMM is slow**: it does
-232–285 TFLOPS at large M and beats every other EXL3 kernel measured here. It is
-slow because **top-8 routing over 288 experts shatters an 8000-token batch into
-288 GEMMs of about 222 rows each**, and at 222 rows it reaches ~100 TFLOPS —
-roughly a quarter of speed-of-light for that shape. Prefill has thousands of
-tokens and still runs its dominant kernel in a small-M regime.
+| component | ms | % of TTFT | how it was measured |
+|---|---|---|---|
+| **TP all-reduce** | **294** | **38%** | NCCL, 90 all-reduces of 65.5 MB at a measured 21 GB/s |
+| MoE GEMM | 154 | 20% | the fused `exl3_moe_gemm` path, 288 experts in one launch |
+| sparse MLA attention | 149 | 19% | this kernel, at prefill shapes |
+| attention projections | 64 | 8% | cuBLAS bf16 at the sharded shapes |
+| indexer | 12 | 2% | projections plus causal scoring |
+| **accounted** | **675** | **87%** | |
 
-Attention is second at 24%, disproportionate to its FLOPs because it runs at
-141 TFLOPS against the projections' 330. That is the part already improved 1.22x
-above, which is why TTFT moved 1.77x.
+**This box has no NVLink.** A 4-GPU all-reduce runs at 21 GB/s and a 2-GPU one at
+28.7; GLM does two per layer, so 90 of them at 65.5 MB each is 294 ms that no
+kernel can touch. Dropping to TP=2 buys 1.37x on comms and pays double the
+per-GPU compute, which is a net loss for TTFT. The `VLLM_ENABLE_PCIE_ALLREDUCE`
+path the reference recipe uses does not engage at TP=4 -- it is gated to two
+GPUs, which is presumably why that recipe runs TP=2 in the first place.
 
-**The indexer is 2%.** An earlier version of this README blamed it for
-long-context cost, reasoning from TPOT at two context lengths without measuring.
-Two things falsify that: the budget above, and the fact that prefill is nearly
-linear in context — 8k runs at 10,270 tok/s and 24k at 9,874, a 4% drop for 3.1x
-the context. A quadratic scoring term would be visible there and is not.
+**The MoE GEMM is close to hardware-bound, not far from it.** The fused path
+measures **264-275 TFLOPS at 63-66% of speed-of-light** for this layer, which is
+compute-bound (1.93 ms of compute against 0.62 ms of weight reads). An earlier
+version of this section claimed it ran at ~100 TFLOPS and 25% of SoL and was the
+dominant prefill cost. That figure came from timing **one expert in isolation**
+with `exl3_linear` -- a 64-block launch on 188 SMs -- which is not how it runs.
+Production batches all 288 experts into a single grid. The block size matters a
+lot and 128 is the best available (16 / 32 / 64 / 128 give 147 / 201 / 224 / 264
+TFLOPS; 256 is not supported).
 
-So the ranked prefill levers are: small-M efficiency in the EXL3 MoE GEMM
-(64% of the time, at ~25% of SoL), then the attention kernel (24%, at ~34% of
-this card's bf16 GEMM rate), then nothing else worth touching.
+So the ranked prefill levers on *this* machine are: the interconnect, which is a
+hardware property; then attention and the MoE at roughly equal weight, one at
+34% of the card's GEMM rate and the other at 63%. The attention kernel has the
+larger relative gap, and the neighbourhood search above says it is not reachable
+by retiling.
+
+**The indexer is 2%** -- a claim this README carried for a while, blamed for
+long-context cost on the basis of TPOT at two context lengths, and wrong. Prefill
+is nearly linear in context (10,270 tok/s at 8k against 9,874 at 24k), which a
+quadratic scoring term would not allow.
 
 ### Measurements
 
