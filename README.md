@@ -781,9 +781,16 @@ Multi-node. Bit-exact determinism under split-k (see above).
 ## Attribution
 
 The trellis bit packing, the procedural codebook and the mma fragment layout are
-part of the EXL3 on-disk format and follow ExLlamaV3 (MIT, (c) turboderp); those
-headers are vendored with attribution in `vllm_exl3/csrc/`. The GEMM tiling,
-split-k, fused epilogue, shard map and vLLM integration are new.
+part of the EXL3 on-disk format and follow ExLlamaV3 (MIT, (c) 2025 Turboderp);
+those headers are vendored with per-file attribution in `vllm_exl3/csrc/`, and
+**[NOTICE](NOTICE)** reproduces the licence in full along with everything else
+this project borrows from. The GEMM tiling, split-k, fused epilogue, shard map,
+the sparse-MLA kernel and the vLLM integration are new.
+
+Nothing else is vendored. The plugin subclasses vLLM's interfaces (Apache 2.0)
+without copying its source, and the 2x DGX Spark kit that
+`bench/bench_vs_spark_fat_gemm.py` measures against is built from a checkout the
+user supplies rather than redistributed here.
 
 ## Where the time goes
 

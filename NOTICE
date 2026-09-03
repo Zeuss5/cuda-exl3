@@ -1,0 +1,72 @@
+vllm-exl3
+Copyright (c) 2026 vllm-exl3 contributors
+
+This product includes software from the projects listed below. Their licence
+terms are reproduced in full as those licences require.
+
+================================================================================
+ExLlamaV3 -- https://github.com/turboderp-org/exllamav3
+MIT licence, (c) 2025 Turboderp
+================================================================================
+
+The EXL3 on-disk format is defined by ExLlamaV3, so the code that decodes it
+must match it exactly. These files are vendored from, or follow the structure
+of, ExLlamaV3 and carry per-file attribution:
+
+  vllm_exl3/csrc/exl3_dq.cuh        vendored -- trellis dequantisation
+  vllm_exl3/csrc/exl3_codebook.cuh  vendored -- procedural codebooks (3inst/mcg/mul1)
+  vllm_exl3/csrc/exl3_common.cuh    mma fragment layout and decoders follow it
+  vllm_exl3/csrc/exl3_had.cuh       structure follows its hadamard_inner.cuh
+
+ExLlamaV3 is also imported by bench/bench_gemm.py and
+bench/bench_vs_spark_fat_gemm.py as a comparison baseline. It is not a runtime
+dependency of the plugin.
+
+MIT License
+
+Copyright (c) 2025 Turboderp
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+================================================================================
+vLLM -- https://github.com/vllm-project/vllm
+Apache Licence 2.0
+================================================================================
+
+This is a vLLM plugin: it imports vLLM's interfaces and subclasses them. No vLLM
+source is copied into this repository. Two places follow vLLM's structure
+closely enough to be worth naming:
+
+  vllm_exl3/attention.py   subclasses SparseMLACommonImpl and reuses
+                           FlashInferMLASparseMetadataBuilder unchanged; the
+                           forward_mqa contract follows
+                           vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+  vllm_exl3/moe.py         follows vLLM's fused-MoE weight-loading protocol
+
+The full Apache 2.0 licence text is at https://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+GLM-5.3-Flash 2x DGX Spark serving kit
+https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark (Apache 2.0),
+based on the MIT-licensed kit by MiaAI-Lab
+================================================================================
+
+No code from this project is used or redistributed here. It is cited in
+docs/dgx-spark-glm53.md for its GB10 hardware measurements, and
+bench/bench_vs_spark_fat_gemm.py builds its exl3_fat_gemm.cu from a checkout the
+user supplies in order to benchmark against it. Nothing is vendored.
