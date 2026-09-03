@@ -37,4 +37,10 @@ Issues = "https://github.com/Zeuss5/cuda-exl3/issues"
 cuda_exl3 = "cuda_exl3:register"
 
 [tool.setuptools]
+# src layout: running pytest from the repo root must not shadow the installed
+# package with the source tree, which has no compiled extension in it.
+package-dir = { "" = "src" }
 packages = ["cuda_exl3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

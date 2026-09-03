@@ -6,7 +6,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-CSRC = os.path.join(THIS_DIR, "cuda_exl3", "csrc")
+CSRC = os.path.join(THIS_DIR, "src", "cuda_exl3", "csrc")
 
 
 def _default_arch_list() -> str:
@@ -44,11 +44,42 @@ def _default_arch_list() -> str:
     return ";".join(archs)
 
 
+def _extra_include_dirs() -> list:
+    """Fall back to the pip-installed CUDA headers only if the toolkit lacks them.
+
+    Some base images ship torch against nvidia-* wheels and leave their include
+    directories off the search path, so a build needing cusparse.h fails until
+    CPATH is set by hand. Adding those directories unconditionally is worse than
+    the disease -- it puts cusparselt's headers ahead of the toolkit's and the
+    build breaks differently -- so this only looks when the header is genuinely
+    missing, and only adds the one directory that supplies it.
+    """
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    want = "cusparse.h"
+    toolkit = os.path.join(CUDA_HOME or "/usr/local/cuda", "include")
+    if os.path.exists(os.path.join(toolkit, want)):
+        return []
+    import site
+    roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+    for root in roots:
+        nv = os.path.join(root, "nvidia")
+        if not os.path.isdir(nv):
+            continue
+        for entry in sorted(os.listdir(nv)):
+            inc = os.path.join(nv, entry, "include")
+            if os.path.exists(os.path.join(inc, want)):
+                print(f"[cuda-exl3] {want} not in the toolkit; using {inc}")
+                return [inc]
+    print(f"[cuda-exl3] warning: {want} not found; set CPATH if the build fails")
+    return []
+
+
 os.environ["TORCH_CUDA_ARCH_LIST"] = _default_arch_list()
 print(f"[cuda-exl3] building for TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 sources = [
-    os.path.join("cuda_exl3", "csrc", f)
+    os.path.join("src", "cuda_exl3", "csrc", f)
     for f in [
         "bindings.cpp",
         "hadamard.cu",
@@ -85,6 +116,7 @@ else:
         CUDAExtension(
             name="cuda_exl3._C",
             sources=sources,
+            include_dirs=_extra_include_dirs(),
             extra_compile_args={"cxx": ["-O3", "-std=c++17"], "nvcc": nvcc_flags},
         )
     ]

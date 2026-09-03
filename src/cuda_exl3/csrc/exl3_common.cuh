@@ -25,6 +25,25 @@ struct Vec
     __device__ const T& operator[](int i) const { return elems[i]; }
 };
 
+// Device properties, cached per device. These used to be queried on device 0
+// on every call: wrong on a multi-GPU job where the ranks are not device 0, and
+// a driver round trip in the split-k decision path.
+inline int exl3_dev_attr(cudaDeviceAttr attr, int fallback)
+{
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return fallback;
+    static int cache[16][2] = {};
+    const int slot = (attr == cudaDevAttrMultiProcessorCount) ? 0 : 1;
+    if (dev < 16 && cache[dev][slot]) return cache[dev][slot];
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, attr, dev) != cudaSuccess || v <= 0) v = fallback;
+    if (dev < 16) cache[dev][slot] = v;
+    return v;
+}
+
+inline int exl3_dev_sms() { return exl3_dev_attr(cudaDevAttrMultiProcessorCount, 128); }
+inline int exl3_dev_l2()  { return exl3_dev_attr(cudaDevAttrL2CacheSize, 8 << 20); }
+
 // Knob lookup with a deprecation path: these were VLLM_EXL3_* when this was a
 // vLLM-only plugin, so the old spelling still resolves.
 inline const char* exl3_env(const char* name)

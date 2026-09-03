@@ -529,9 +529,7 @@ int pick_bm(int m)
 int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_mult = 1)
 {
     if (!allowed) return 1;
-    int sms = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-    if (sms <= 0) sms = 128;
+    const int sms = exl3_dev_sms();
 
     long long blocks = (long long) (n / BN_) * ((m + bm - 1) / bm);
     if (blocks <= 0) return 1;
@@ -560,11 +558,7 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
     // is block-starved and split-k is exactly what it needs. Not free, though:
     // treating it as free over-splits and regresses (down_proj m=128 went
     // 101 -> 121 us), so the discount is a factor, not a bypass.
-    static const double l2_bytes = [] {
-        int v = 0;
-        cudaDeviceGetAttribute(&v, cudaDevAttrL2CacheSize, 0);
-        return v > 0 ? (double) v : 8.0 * 1024 * 1024;
-    }();
+    const double l2_bytes = (double) exl3_dev_l2();
     double acc_bytes = 4.0 * (double) m * n;
     int by_traffic;
     static const double budget = [] {

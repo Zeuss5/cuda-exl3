@@ -747,7 +747,11 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                          : std::vector<int>{16, 32, 48, 64, 96, 128, 192, 256, 384};
                 const std::vector<int> shapes =
                     many ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3, 4};
-                const int reps = many ? 1 : 3;
+                // A batch-1 decode is ~7 us, so three timed reps is 21 us --
+                // the same order as the cudaEvent pair measuring it, and the
+                // winner came out wrong by 7-14% on a GB10. Time short shapes
+                // for long enough to see past the timer.
+                const int reps = many ? 1 : 20;
                 float best_ms = 1e30f;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);

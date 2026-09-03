@@ -20,6 +20,21 @@ PEAK_GBS = 1520.0
 MODEL = "/home/shadeform/vllm/models/Qwen3.8-27B-EXL3-5.5bpw"
 
 
+def synth_tensor(k, n, bits):
+    """Random trellis of the right shape, for machines with no checkpoint.
+
+    Trellis decode is data-independent, so timings are the real thing; the
+    decoded values are noise, which only matters for the relerr column -- and
+    that column still means something, because both kernels decode the same
+    noise and must agree.
+    """
+    t = torch.randint(-32768, 32767, (k // 16, n // 16, bits * 16),
+                      dtype=torch.int16, device="cuda")
+    suh = (torch.randn(k, device="cuda") * 0.1).half()
+    svh = (torch.randn(n, device="cuda") * 0.1).half()
+    return t, suh, svh
+
+
 def load_tensor(model, name):
     idx = json.load(open(f"{model}/model.safetensors.index.json"))["weight_map"]
     cache = {}
@@ -63,17 +78,30 @@ def main():
     ap.add_argument("--m", nargs="*", type=int,
                     default=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096])
     ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--synthetic", nargs="*", metavar="K,N,BITS",
+                    help="benchmark these shapes with random trellis instead of a "
+                         "checkpoint, e.g. --synthetic 4096,2048,4 512,4096,4")
     args = ap.parse_args()
 
     from cuda_exl3 import ops
     from exllamav3.ext import exllamav3_ext as ext
 
-    for name in args.layers:
-        t, suh, svh = load_tensor(args.model, name)
+    if args.synthetic is not None:
+        shapes = args.synthetic or ["4096,2048,4", "2048,4096,4", "4096,4096,4"]
+        work = [(f"synthetic {sh}", tuple(int(v) for v in sh.split(","))) for sh in shapes]
+    else:
+        work = [(n, None) for n in args.layers]
+
+    for name, shape in work:
+        if shape is not None:
+            t, suh, svh = synth_tensor(*shape)
+        else:
+            t, suh, svh = load_tensor(args.model, name)
         bits = t.shape[2] // 16
         k, n = t.shape[0] * 16, t.shape[1] * 16
         wmb = t.numel() * 2 / 1e6
-        print(f"\n=== {name.split('layers.')[1]}  k={k} n={n} bits={bits} "
+        label = name if shape is not None else name.split("layers.")[1]
+        print(f"\n=== {label}  k={k} n={n} bits={bits} "
               f"trellis={wmb:.1f}MB ===")
         print(f"{'m':>6} {'ours us':>9} {'exl3 us':>9} {'speedup':>8} "
               f"{'TFLOPS':>8} {'GB/s':>8} {'SoL us':>8} {'%SoL':>6} {'relerr':>9}")
