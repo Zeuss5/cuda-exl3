@@ -44,22 +44,31 @@ def _default_arch_list() -> str:
     return ";".join(archs)
 
 
-def _extra_include_dirs() -> list:
-    """Fall back to the pip-installed CUDA headers only if the toolkit lacks them.
+def _fallback_include_dir():
+    """The pip-installed CUDA headers, if and only if the toolkit lacks some.
 
-    Some base images ship torch against nvidia-* wheels and leave their include
-    directories off the search path, so a build needing cusparse.h fails until
-    CPATH is set by hand. Adding those directories unconditionally is worse than
-    the disease -- it puts cusparselt's headers ahead of the toolkit's and the
-    build breaks differently -- so this only looks when the header is genuinely
-    missing, and only adds the one directory that supplies it.
+    Base images that ship torch against nvidia-* wheels can leave those include
+    directories off the search path, so a build fails on a header the toolkit
+    does not have. The trap is that such a wheel directory is not a few extra
+    headers -- it is a *complete* CUDA header tree at a different patch level,
+    so putting it on the include path ahead of the toolkit makes nvcc generate
+    its device stub against one crt/host_runtime.h and compile it against the
+    other ("__cudaLaunch passed 2 arguments, but takes just 1").
+
+    So it goes on CPATH, which is searched after every -I, applies to both the
+    device and host passes, and is exactly what a hand-set CPATH was doing. The
+    toolkit wins every header it has; the wheel fills only genuine gaps.
+    (nvcc rejects -idirafter outright, and passing it only via -Xcompiler would
+    leave nvcc's own front-end search unfixed.)
     """
     from torch.utils.cpp_extension import CUDA_HOME
 
-    want = "cusparse.h"
+    # torch needs both of these; a toolkit can have one and not the other.
+    wanted = ("cusparse.h", "cusolverDn.h")
     toolkit = os.path.join(CUDA_HOME or "/usr/local/cuda", "include")
-    if os.path.exists(os.path.join(toolkit, want)):
-        return []
+    missing = [h for h in wanted if not os.path.exists(os.path.join(toolkit, h))]
+    if not missing:
+        return None
     import site
     roots = list(site.getsitepackages()) + [site.getusersitepackages()]
     for root in roots:
@@ -68,15 +77,22 @@ def _extra_include_dirs() -> list:
             continue
         for entry in sorted(os.listdir(nv)):
             inc = os.path.join(nv, entry, "include")
-            if os.path.exists(os.path.join(inc, want)):
-                print(f"[cuda-exl3] {want} not in the toolkit; using {inc}")
-                return [inc]
-    print(f"[cuda-exl3] warning: {want} not found; set CPATH if the build fails")
-    return []
+            if all(os.path.exists(os.path.join(inc, h)) for h in missing):
+                print(f"[cuda-exl3] toolkit lacks {', '.join(missing)}; "
+                      f"adding {inc} with -idirafter")
+                return inc
+    print(f"[cuda-exl3] warning: {', '.join(missing)} not found anywhere; "
+          f"set CPATH if the build fails")
+    return None
 
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = _default_arch_list()
 print(f"[cuda-exl3] building for TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']}")
+
+_fallback_inc = _fallback_include_dir()
+if _fallback_inc:
+    _cpath = os.environ.get("CPATH", "")
+    os.environ["CPATH"] = f"{_cpath}:{_fallback_inc}" if _cpath else _fallback_inc
 
 sources = [
     os.path.join("src", "cuda_exl3", "csrc", f)
@@ -104,6 +120,8 @@ nvcc_flags = [
 if os.environ.get("CUDA_EXL3_DEBUG"):
     nvcc_flags += ["-g", "-G", "-DCUDA_EXL3_DEBUG"]
 
+cxx_flags = ["-O3", "-std=c++17"]
+
 missing = [s for s in sources if not os.path.exists(s)]
 if missing:
     # Lets the pure-Python plugin be installed before the kernels are written;
@@ -116,8 +134,7 @@ else:
         CUDAExtension(
             name="cuda_exl3._C",
             sources=sources,
-            include_dirs=_extra_include_dirs(),
-            extra_compile_args={"cxx": ["-O3", "-std=c++17"], "nvcc": nvcc_flags},
+            extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
         )
     ]
     cmdclass = {"build_ext": BuildExtension}

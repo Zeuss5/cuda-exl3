@@ -747,24 +747,46 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                          : std::vector<int>{16, 32, 48, 64, 96, 128, 192, 256, 384};
                 const std::vector<int> shapes =
                     many ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3, 4};
-                // A batch-1 decode is ~7 us, so three timed reps is 21 us --
-                // the same order as the cudaEvent pair measuring it, and the
-                // winner came out wrong by 7-14% on a GB10. Time short shapes
-                // for long enough to see past the timer.
-                const int reps = many ? 1 : 20;
-                float best_ms = 1e30f;
+                // A batch-1 decode is a few microseconds, so a fixed rep count
+                // times something the same order as the timer and the launch
+                // overhead around it -- on a GB10 that left the winner 4-6% off
+                // the grid optimum. Size the window to the kernel instead:
+                // probe, run enough reps to fill ~400 us, and take the best of
+                // three so one scheduling hiccup cannot decide it.
+                int reps = 1;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
+                if (!many) {
+                    mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
+                               chunks.front(), shapes.front(), kv_scale);
+                    cudaEventRecord(beg);
+                    for (int r = 0; r < 8; ++r)
+                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
+                                   chunks.front(), shapes.front(), kv_scale);
+                    cudaEventRecord(end);
+                    cudaEventSynchronize(end);
+                    float probe = 0.f; cudaEventElapsedTime(&probe, beg, end);
+                    const float per_call_us = probe * 1000.f / 8.f;
+                    reps = per_call_us > 0.f ? (int) (400.f / per_call_us) : 40;
+                    reps = std::min(std::max(reps, 20), 400);
+                }
+                const int trials = many ? 1 : 3;
+                float best_ms = 1e30f;
                 for (int c : chunks) {
                     for (int wd : shapes) {
                         if (c > topk && c != chunks.front()) continue;
                         mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
-                        cudaEventRecord(beg);
-                        for (int r = 0; r < reps; ++r)
-                            mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
-                        cudaEventRecord(end);
-                        cudaEventSynchronize(end);
-                        float ms = 0.f; cudaEventElapsedTime(&ms, beg, end);
+                        float ms = 1e30f;
+                        for (int tr = 0; tr < trials; ++tr) {
+                            cudaEventRecord(beg);
+                            for (int r = 0; r < reps; ++r)
+                                mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
+                                           c, wd, kv_scale);
+                            cudaEventRecord(end);
+                            cudaEventSynchronize(end);
+                            float one = 0.f; cudaEventElapsedTime(&one, beg, end);
+                            ms = std::min(ms, one);
+                        }
                         if (ms < best_ms) { best_ms = ms; best = {c, wd}; }
                     }
                 }

@@ -32,12 +32,13 @@ inline int exl3_dev_attr(cudaDeviceAttr attr, int fallback)
 {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return fallback;
-    static int cache[16][2] = {};
+    static int cache[64][2] = {};
     const int slot = (attr == cudaDevAttrMultiProcessorCount) ? 0 : 1;
-    if (dev < 16 && cache[dev][slot]) return cache[dev][slot];
+    const bool cacheable = dev >= 0 && dev < 64;
+    if (cacheable && cache[dev][slot]) return cache[dev][slot];
     int v = 0;
     if (cudaDeviceGetAttribute(&v, attr, dev) != cudaSuccess || v <= 0) v = fallback;
-    if (dev < 16) cache[dev][slot] = v;
+    if (cacheable) cache[dev][slot] = v;
     return v;
 }
 

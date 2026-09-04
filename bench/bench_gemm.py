@@ -69,6 +69,7 @@ def sol_us(m, k, n, bits):
 
 
 def main():
+    global PEAK_TFLOPS, PEAK_GBS
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", nargs="*", default=[
         "model.language_model.layers.3.self_attn.q_proj",
@@ -81,10 +82,28 @@ def main():
     ap.add_argument("--synthetic", nargs="*", metavar="K,N,BITS",
                     help="benchmark these shapes with random trellis instead of a "
                          "checkpoint, e.g. --synthetic 4096,2048,4 512,4096,4")
+    ap.add_argument("--peak-tflops", type=float, default=PEAK_TFLOPS,
+                    help="this machine's dense bf16 peak; the default is an RTX "
+                         "PRO 6000's and %%SoL is meaningless elsewhere")
+    ap.add_argument("--peak-gbs", type=float, default=PEAK_GBS,
+                    help="this machine's measured HBM bandwidth")
+    ap.add_argument("--bank", type=int, default=1, metavar="N",
+                    help="cycle N distinct weight tensors so the trellis does not "
+                         "sit in L2. On a small-L2 device (GB10 has 24 MB) a "
+                         "single tensor is resident and %%SoL reads over 100%%")
     args = ap.parse_args()
+    PEAK_TFLOPS, PEAK_GBS = args.peak_tflops, args.peak_gbs
+    print(f"speed-of-light reference: {PEAK_TFLOPS:.0f} TFLOPS / {PEAK_GBS:.0f} GB/s"
+          + ("  (defaults -- pass --peak-tflops/--peak-gbs for this machine)"
+             if (PEAK_TFLOPS, PEAK_GBS) == (400.0, 1520.0) else ""))
 
     from cuda_exl3 import ops
-    from exllamav3.ext import exllamav3_ext as ext
+    try:
+        from exllamav3.ext import exllamav3_ext as ext
+    except ImportError:
+        ext = None
+        print("exllamav3 not installed: skipping the reference column. Its kernels "
+              "are the comparison baseline, not a dependency of this plugin.")
 
     if args.synthetic is not None:
         shapes = args.synthetic or ["4096,2048,4", "2048,4096,4", "4096,4096,4"]
@@ -98,6 +117,8 @@ def main():
         else:
             t, suh, svh = load_tensor(args.model, name)
         bits = t.shape[2] // 16
+        bank = [t] + ([synth_tensor(t.shape[0] * 16, t.shape[1] * 16, bits)[0]
+                       for _ in range(args.bank - 1)] if args.bank > 1 else [])
         k, n = t.shape[0] * 16, t.shape[1] * 16
         wmb = t.numel() * 2 / 1e6
         label = name if shape is not None else name.split("layers.")[1]
@@ -112,19 +133,33 @@ def main():
             c_ref = torch.empty((m, n), dtype=torch.half, device="cuda")
             suh2 = suh.view(1, -1)
 
-            ext.exl3_gemm(x, t, c_ref, suh, xh, svh, -1, False, True, 0)
             c_ours = ops.exl3_linear(x, t, suh2, svh, [n], 2)
-            torch.cuda.synchronize()
+            if ext is not None:
+                ext.exl3_gemm(x, t, c_ref, suh, xh, svh, -1, False, True, 0)
+                torch.cuda.synchronize()
+                denom = c_ref.float().abs().mean().item()
+                err = (c_ours.float() - c_ref.float()).abs().mean().item() / max(denom, 1e-9)
+            else:
+                # No reference kernel: check ours against itself in m=32 chunks,
+                # which still catches a batch-dependent bug.
+                ref = torch.cat([ops.exl3_linear(x[i:i + 32], t, suh2, svh, [n], 2)
+                                 for i in range(0, m, 32)])
+                denom = ref.float().abs().mean().item()
+                err = (c_ours.float() - ref.float()).abs().mean().item() / max(denom, 1e-9)
 
-            denom = c_ref.float().abs().mean().item()
-            err = (c_ours.float() - c_ref.float()).abs().mean().item() / max(denom, 1e-9)
-
-            t_ours = bench(lambda: ops.exl3_linear(x, t, suh2, svh, [n], 2))
-            t_ref = bench(lambda: ext.exl3_gemm(x, t, c_ref, suh, xh, svh, -1, False, True, 0))
+            # Cycle distinct weights so the trellis is not simply L2-resident.
+            t_ours = bench(lambda i=[0]: (
+                ops.exl3_linear(x, bank[(i.__setitem__(0, i[0] + 1) or i[0]) % len(bank)],
+                                suh2, svh, [n], 2)))
+            t_ref = (bench(lambda: ext.exl3_gemm(x, t, c_ref, suh, xh, svh, -1,
+                                                 False, True, 0))
+                     if ext is not None else float("nan"))
 
             s, wbytes, flops = sol_us(m, k, n, bits)
             us = t_ours * 1e6
-            print(f"{m:6d} {us:9.1f} {t_ref*1e6:9.1f} {t_ref/t_ours:7.2f}x "
+            ref_us = f"{t_ref * 1e6:9.1f}" if ext is not None else f"{'-':>9}"
+            spd = f"{t_ref / t_ours:7.2f}x" if ext is not None else f"{'-':>8}"
+            print(f"{m:6d} {us:9.1f} {ref_us} {spd} "
                   f"{flops/t_ours/1e12:8.1f} {wbytes/t_ours/1e9:8.0f} {s:8.1f} "
                   f"{100*s/us:5.0f}% {err:9.2e}")
 

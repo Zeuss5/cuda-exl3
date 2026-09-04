@@ -53,13 +53,16 @@ def child_splitk(shapes, ms):
     print(json.dumps({"us": total}))
 
 
-def child_blockm(bm):
+def child_blockm(bm, inter):
     import time, torch
     from cuda_exl3 import ops  # noqa: F401
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size)
     ops_ = torch.ops.cuda_exl3_C
-    M, H, I, E, TOPK = 4096, 4096, 512, 288, 8
+    # GLM-5.3-Flash's expert intermediate is 2048; the block_m optimum moves
+    # with it, so calibrating at a narrower shape can recommend the wrong
+    # override. Per-rank width under TP=N is inter/N.
+    M, H, I, E, TOPK = 4096, 4096, inter, 288, 8
     w = torch.randint(-32768, 32767, (E, H // 16, (2 * I) // 16, 64),
                       dtype=torch.int16, device="cuda")
     suh = (torch.randn(E, 2, H, device="cuda") * .1).half()
@@ -94,12 +97,15 @@ def run_child(env, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["splitk", "blockm"])
+    ap.add_argument("--inter", type=int, default=2048,
+                    help="MoE expert intermediate width per rank (GLM-5.3-Flash "
+                         "is 2048; divide by the TP size for a sharded run)")
     ap.add_argument(CHILD, dest="child", nargs="*")
     a, rest = ap.parse_known_args()
 
     if a.child is not None:
         if a.child and a.child[0] == "blockm":
-            return child_blockm(int(a.child[1]))
+            return child_blockm(int(a.child[1]), int(a.child[2]))
         return child_splitk([(4096, 2048, 4), (2048, 4096, 4), (4096, 4096, 4)],
                             [16, 64, 256, 1024])
 
@@ -127,14 +133,17 @@ def main():
             print("  defaults are within 2% of the best combination -- keep them")
 
     if a.only in (None, "blockm"):
-        print("\nMoE block_m ladder (4096 tokens, top-8 of 288 experts)")
-        res = {bm: run_child({}, ["blockm", str(bm)]) for bm in (16, 32, 64, 128)}
+        print(f"\nMoE block_m ladder (4096 tokens, top-8 of 288 experts, "
+              f"inter={a.inter})")
+        res = {bm: run_child({}, ["blockm", str(bm), str(a.inter)])
+               for bm in (16, 32, 64, 128)}
         for bm, us in res.items():
             print(f"  block_m {bm:>3}: {us:>9.0f} us")
         best_bm = min(res, key=res.get)
         print(f"  best at this token count: {best_bm}")
         print("  (the shipped heuristic scales block_m with tokens per expert;"
-              " override only if this disagrees badly)")
+              " override only if this disagrees badly, and only after checking"
+              " --inter matches your model)")
 
     if out:
         print("\nexport " + " ".join(f"{k}={v}" for k, v in out.items()))
