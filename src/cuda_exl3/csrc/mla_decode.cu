@@ -517,6 +517,27 @@ __global__ __launch_bounds__(NWARPS * 32) void mla_decode_partial_kernel(
     }
 }
 
+// Eviction for the autotuner: streams a buffer through L2 by reading it.
+//
+// Doing this with a memset is worse than useless. Dirty lines have to be
+// written back, and those write-backs contend with the kernel's own reads, so
+// the inflation is not uniform -- measured 1.57x at chunk 96 against 1.33x at
+// chunk 256. That is a gradient, and a gradient re-ranks: it favours large
+// chunks, and it compresses the landscape from a 20% spread to 3%, back inside
+// the timer's resolution. Reads leave the cache just as cold with no write-back
+// traffic, and are what a real model streams between two decode steps anyway.
+__global__ void exl3_evict_kernel(const int4* __restrict__ p, size_t n, int* sink)
+{
+    int4 acc = {0, 0, 0, 0};
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n;
+         i += (size_t) gridDim.x * blockDim.x) {
+        const int4 v = p[i];
+        acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+    }
+    // Never true; exists so the loads cannot be optimised away.
+    if (acc.x == 0x7fffffff && acc.y == 0x7ffffffe) sink[0] = acc.z ^ acc.w;
+}
+
 // Merge the per-split partials. Standard log-sum-exp combine: rescale each
 // split's output by exp(m_s - m*) and divide by the summed weight.
 //
@@ -827,19 +848,27 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 if (!many) {
                     const int64_t l2 = exl3_dev_l2();
                     const int64_t span = std::min<int64_t>(l2, 32 << 20);
-                    evict_passes = (int) ((2 * l2 + span - 1) / span);
-                    evict_buf = at::empty({span}, at::TensorOptions()
+                    // 1.5x L2 of distinct lines is enough to clear it; 2x only
+                    // costs tuning time, which on a 48-SM part is already the
+                    // dominant term.
+                    evict_passes = (int) ((3 * l2 / 2 + span - 1) / span);
+                    evict_buf = at::zeros({span}, at::TensorOptions()
                                                       .dtype(at::kByte).device(q.device()));
                 }
                 auto stream = at::cuda::getCurrentCUDAStream();
-                auto evict = [&](int tag) {
+                auto evict = [&]() {
+                    const size_t n16 = (size_t) evict_buf.numel() / 16;
+                    const int threads = 256;
+                    const int blocks = (int) std::min<size_t>((n16 + threads - 1) / threads,
+                                                              (size_t) exl3_dev_sms() * 8);
                     for (int i = 0; i < evict_passes; ++i)
-                        cudaMemsetAsync(evict_buf.data_ptr(), (tag + i) & 0xff,
-                                        evict_buf.numel(), stream);
+                        exl3_evict_kernel<<<blocks, threads, 0, stream>>>(
+                            (const int4*) evict_buf.data_ptr(), n16,
+                            (int*) evict_buf.data_ptr());
                 };
 
                 const int reps = many ? 1 : 8;
-                const int trials = many ? 1 : 2;
+                const int trials = many ? 1 : 3;
                 std::vector<cudaEvent_t> ev_b(reps), ev_e(reps);
                 for (int i = 0; i < reps; ++i) {
                     cudaEventCreate(&ev_b[i]); cudaEventCreate(&ev_e[i]);
@@ -850,10 +879,10 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                         if (c > topk && c != chunks.front()) continue;
                         mla_decode(q, kv, pick_sel(0), seqlens, scale, v_head_dim,
                                    c, wd, kv_scale);
-                        float ms = 1e30f;
+                        float samples[8];
                         for (int tr = 0; tr < trials; ++tr) {
                             for (int r = 0; r < reps; ++r) {
-                                if (evict_passes) evict(r + tr);
+                                if (evict_passes) evict();
                                 cudaEventRecord(ev_b[r], stream);
                                 mla_decode(q, kv, pick_sel(r + tr * reps), seqlens,
                                            scale, v_head_dim, c, wd, kv_scale);
@@ -866,8 +895,10 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                                 cudaEventElapsedTime(&one, ev_b[r], ev_e[r]);
                                 sum += one;
                             }
-                            ms = std::min(ms, sum);
+                            samples[tr] = sum;
                         }
+                        std::sort(samples, samples + trials);
+                        const float ms = samples[trials / 2];
                         if (ms < best_ms) { best_ms = ms; best = {c, wd}; }
                     }
                 }
