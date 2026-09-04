@@ -27,8 +27,10 @@ logger = init_logger(__name__)
 
 TILE = 16
 
-_SMS = torch.cuda.get_device_properties(0).multi_processor_count \
-    if torch.cuda.is_available() else 1
+# CUDA_EXL3_MOE_SKIP_PAD=0/1 forces the padding-row skip, for measuring both
+# arms inside one binary -- which is how the gate above turned out to be wrong.
+_SKIP_PAD_ENV = _env.getenv("CUDA_EXL3_MOE_SKIP_PAD")
+_SKIP_PAD_OVERRIDE = None if not _SKIP_PAD_ENV else _SKIP_PAD_ENV not in ("0", "", "false")
 
 
 # vLLM has two MoE weight-loading protocols and which one runs depends on the
@@ -385,14 +387,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         ops = torch.ops.cuda_exl3_C
 
         # A routed block is block_m rows but decode routes about one row per
-        # expert, so most rows are padding carrying zeros. The gemm can skip
-        # fetching them (cp.async zero-fills what it does not read) and then the
-        # transform need not write them. Worth +5 to +6.6% at M = 8 to 64, but a
-        # loss at one or two tokens: there the grid is too small to fill the
-        # machine, so the layer is latency-bound rather than bandwidth-bound and
-        # removing traffic buys nothing while the predicate still costs. Same
-        # grid-size test as elsewhere, and both sides must agree on it.
-        skip_pad = (2 * I // 128) * max(rows // block_m, 1) >= 2 * _SMS
+        # expert, so most rows are padding carrying zeros. The gemm skips
+        # fetching them -- cp.async zero-fills a row it is not given -- and the
+        # transform then need not write them.
+        #
+        # This was gated on grid size for a while, on the strength of a 3.6% loss
+        # at one token. That number came from comparing two separately built
+        # packages; forcing both arms inside one binary shows the skip winning
+        # there too. Whole MoE layer, TP=4 shapes, 42 layers:
+        #   M=1 +2.5%   M=2 +0.4%   M=4 +1.1%   M=8 +6.0%
+        #   M=16 +9.7%  M=32 +9.7%  M=64 +11.1%  M=256 +5.5%
+        # and on a 48-SM part (#1): +1.9 to +3.2% at every M, no crossover. So
+        # the gate only ever turned off a win, on both parts. One fewer constant
+        # fitted to one card.
+        skip_pad = True
+        if _SKIP_PAD_OVERRIDE is not None:
+            skip_pad = _SKIP_PAD_OVERRIDE
 
         # gate/up: two transforms per routed row, one per shard's suh
         a13 = torch.empty((2, rows, H), dtype=torch.half, device=x.device)
