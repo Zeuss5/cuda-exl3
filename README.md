@@ -543,10 +543,29 @@ padded width:
 
 | batch | b12x (nvfp4) | ours, bf16 | ours, fp8 | | at head_dim 512 |
 |---|---|---|---|---|---|
-| 1 | 18.5 us | 7.1 us | **7.4 us** | 2.50x | 6.9 us |
-| 4 | 19.5 us | 12.8 us | **9.8 us** | 1.99x | 9.2 us |
-| 16 | 31.1 us | 31.7 us | **19.9 us** | 1.56x | 18.0 us |
-| 32 | 56.3 us | 56.0 us | **31.6 us** | 1.78x | 28.2 us |
+| 1 | 18.4 us | 8.3 us | **7.6 us** | 2.42x | 7.1 us |
+| 4 | 19.5 us | 13.3 us | **10.6 us** | 1.84x | 9.7 us |
+| 16 | 31.1 us | 31.6 us | **19.4 us** | 1.60x | 17.9 us |
+| 32 | 56.2 us | 56.1 us | **31.9 us** | 1.76x | 27.9 us |
+
+These are **cold**, and getting that right took a correction. The selection set
+is now sized per shape so the rows it touches overrun L2 twice over; a fixed 20
+selections leaves batch 1 warm (40 MB against a 128 MB L2) and understated it by
+14%. It does not change batch 16 or 32, where 20 selections were already 755 MB
+and well past the cache.
+
+**Why cold is the regime that matters, and why the obvious argument for warm is
+wrong.** A sequence's top-k list changes by about one row in 2048 per decode
+step, so consecutive steps re-touch almost exactly the same rows -- which looks
+like a strong argument that decode runs warm, and it is the argument this README
+used to make. It is wrong, because row overlap is only half of what decides
+residency. Between one layer's call and that same layer's next call, the whole
+rest of the model streams through: gigabytes against tens of megabytes of L2,
+turning it over a hundred times or more. Nothing survives, so the overlap buys
+nothing. Modelled properly, warm, drifting and independent selections all
+collapse onto one curve, and the difference is worth up to **1.9x at batch 16**
+on this card -- with the optimum two chunk tiers away from where the warm
+measurement puts it.
 
 The cache is the whole cost here, so the way to go faster is to read less of
 it. An e4m3 cache stores `k / kv_scale`, and **both matmuls are linear in that

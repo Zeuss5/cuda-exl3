@@ -753,29 +753,44 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 // the grid optimum. Size the window to the kernel instead:
                 // probe, run enough reps to fill ~400 us, and take the best of
                 // three so one scheduling hiccup cannot decide it.
-                // Which cache regime should the tuner measure? It times one
-                // selection repeatedly, so from the second rep the rows are
-                // L2-resident, and the warm and cold optima differ -- on a 24 MB
-                // L2 the warm winner was chunk=48 and the cold one chunk=96.
+                // Which cache regime should the tuner measure? It used to time
+                // one selection repeatedly, so from the second rep the rows were
+                // L2-resident. That is not what decode does, and the reason is
+                // not the one I first argued. A sequence's top-k list really does
+                // change by only about a row in 2048 per step, so consecutive
+                // steps re-touch almost the same rows -- but between layer L at
+                // step t and layer L at step t+1 the whole rest of the model
+                // streams through, gigabytes against tens of megabytes of L2.
+                // Nothing survives, so the overlap buys nothing.
                 //
-                // Warm is the better model of decode, which is the surprise. A
-                // sequence's top-k list changes by about one row in 2048 per
-                // step as its context grows, so consecutive steps re-touch
-                // ~99.95% of the same rows; one selection at topk=2048 is 2 MB,
-                // 8% of a GB10's L2 and 2% of this card's. A benchmark that
-                // replays independent random selections is measuring a regime
-                // decode does not run in -- prefill and many-independent-sequence
-                // batches are colder, but those take the `many` path.
+                // Measured: with that traffic modelled, warm, drifting and
+                // independent selections all collapse onto the same curve, and
+                // on this card the evicted optimum at batch 16 is two chunk
+                // tiers away from the warm one (c96 -> c192) at 1.85x the time.
                 //
-                // So the ring is opt-in rather than default. Set
-                // CUDA_EXL3_MLA_TUNE_RING=N to tune against N rotating
-                // selections; 0 (the default) keeps the warm model.
+                // So rotate enough distinct selections that the rows they touch
+                // overrun the L2 twice over, which costs only the index tensors
+                // -- the rows themselves are already in the cache tensor.
+                // CUDA_EXL3_MLA_TUNE_RING overrides the count; 0 restores the
+                // old warm behaviour for A/B.
+                // Rotate only when it can change the answer. If one selection's
+                // rows are a small fraction of L2 they stay resident whatever
+                // else runs, the warm and evicted curves coincide, and rotating
+                // only adds noise -- measured 1.00x either way at batch 1 on a
+                // 128 MB L2, and mixed results at batch 1 on a 24 MB one. The
+                // threshold is an eighth of L2, which turns rotation on exactly
+                // where both machines show the regimes diverging: batch 16 here
+                // (30% of L2, evicted optimum two chunk tiers away at 1.85x) and
+                // batch 4 on a GB10 (33%).
                 std::vector<at::Tensor> sel_ring;
                 if (!many) {
+                    const int64_t per_sel = (int64_t) B * topk * D * (kv8 ? 1 : 2);
+                    const int64_t l2 = exl3_dev_l2();
+                    int nsel = per_sel * 8 >= l2
+                             ? (int) ((2.0 * (double) l2) / (double) per_sel) : 0;
+                    if (nsel) nsel = std::min(std::max(nsel, 8), 64);
                     const char* e = exl3_env("CUDA_EXL3_MLA_TUNE_RING");
-                    int nsel = e && *e ? atoi(e) : 0;
-                    if (nsel < 0) nsel = 0;
-                    nsel = std::min(nsel, 64);
+                    if (e && *e) nsel = std::max(0, std::min(atoi(e), 256));
                     sel_ring.reserve(nsel);
                     for (int i = 0; i < nsel; ++i)
                         sel_ring.push_back(

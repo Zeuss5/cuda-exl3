@@ -28,7 +28,23 @@ DV = 512
 TOPK = 2048
 HEADS = 16              # 64 heads at TP=4
 ROWS = 1 << 20          # 1 GiB of latent cache at head_dim 512
-INNER = 20              # distinct selections per graph
+def n_selections(batch, d):
+    """Enough distinct selections that their rows overrun L2 twice over.
+
+    A decode step does not run with its rows in cache: between one layer's call
+    and that layer's next call the whole rest of the model streams through,
+    gigabytes against tens of megabytes of L2. Replaying a handful of selections
+    measures a warm kernel instead -- worth up to 1.9x at batch 16 here.
+
+    Sizing the selection set is the way to get the cold regime *inside* a CUDA
+    graph. Evicting with a memset between calls also works but cannot be used
+    here: b12x's planned API does ~320 us of host work per call, so it has to be
+    graph-replayed to be measured at all, and an eviction big enough to clear
+    L2 costs more than every kernel under test put together.
+    """
+    per_sel = batch * TOPK * d * 2
+    l2 = torch.cuda.get_device_properties(0).L2_cache_size
+    return max(20, min(int(2 * l2 / per_sel) + 1, 256))
 
 
 def graph_us(fs, reps=30):
@@ -121,8 +137,8 @@ def bench_b12x(batch, d, sels):
 
 def main():
     torch.manual_seed(0)
-    print(f"cache {ROWS} rows, topk {TOPK}, heads {HEADS}, "
-          f"{INNER} distinct selections per graph\n")
+    print(f"cache {ROWS} rows, topk {TOPK}, heads {HEADS}; the selection set is "
+          f"sized per shape to overrun L2\n")
     for d in (576, 512):
         f32 = torch.randn(ROWS, d, device=DEV) * 0.05
         kv = f32.to(torch.bfloat16)
@@ -133,9 +149,10 @@ def main():
         print(f"{'batch':>6s} {'gather':>9s} {'ours':>9s} {'ours fp8':>9s} "
               f"{'b12x':>9s} {'fp8 GB/s':>9s}")
         for batch in (1, 4, 16, 32):
+            n_sel = n_selections(batch, d)
             q = torch.randn(batch, HEADS, d, device=DEV, dtype=torch.bfloat16) * 0.05
             sels = [torch.randint(0, ROWS, (batch, TOPK), device=DEV,
-                                  dtype=torch.int32) for _ in range(INNER)]
+                                  dtype=torch.int32) for _ in range(n_sel)]
             sl = torch.full((batch,), TOPK, device=DEV, dtype=torch.int32)
             ceil_us = gather_ceiling(kv, batch, sels)
             ours = bench_ours(kv, q, sels, sl)
