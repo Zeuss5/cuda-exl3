@@ -88,6 +88,27 @@ trellis decode is data-independent so the timings are real), and prints an
 export block if anything beats the defaults by more than 2%. `bench_gemm.py
 --synthetic k,n,bits` does the same for a single shape.
 
+## 1c. Discard the first rounds of any sweep
+
+The MLA autotuner runs once per distinct shape, and on GB10 a fresh boot logs
+about 26 `evicted` tune events at roughly 15 ms each *during the first
+requests*, not at startup -- the shapes only exist once traffic arrives. That
+warm-up outlasts a two-round sweep, so the first pass measures tuning, not
+serving. Reported in #1 with a worked example: the winning arm of an A/B read
+25-45% worse on the first pass (prefill 1,373 -> 698 tok/s) and 1,483 tok/s from
+the same engine minutes later. Some of what was first reported as boot-to-boot
+variance was this.
+
+Run at least five rounds and discard the first two.
+
+This is a GB10-specific hazard in degree, not in kind. On a 188-SM part the same
+tuning costs 61-85 ms per shape and completes at startup -- measured there as 76
+tune events before the first request and zero during serving -- so a single
+warm-up pass is enough. The difference is 48 SMs making each trial slower while
+the trial count stays the same. If you are comparing two builds, check where the
+tune events land in your own logs (`CUDA_EXL3_MLA_TUNE_VERBOSE=1`) before
+trusting the first numbers out of either.
+
 ## 2. Sizing: two nodes, not one
 
 `brandonmusic/GLM-5.3-Flash-tr3-4bpw` is 164 GB of safetensors against ~121 GiB
