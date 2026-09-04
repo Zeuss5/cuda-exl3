@@ -732,6 +732,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
         if (it == cache.end()) {
             std::pair<int, int> best{B >= 64 ? 512 : 32, 1};
             float best_ms_report = 0.f;
+            int ring_report = 0;
             if (mla_tuning_enabled() &&
                 at::cuda::currentStreamCaptureStatusMayInitCtx() ==
                     at::cuda::CaptureStatus::None) {
@@ -806,24 +807,43 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                     return sel_ring.empty() ? sel : sel_ring[r % sel_ring.size()];
                 };
 
-                int reps = 1;
-                cudaEvent_t beg, end;
-                cudaEventCreate(&beg); cudaEventCreate(&end);
+                // Rotating the selection makes the cache *rows* cold, and that
+                // is not the same as a cold cache: everything else the kernel
+                // touches stays resident, and back-to-back reps pipeline. At
+                // batch 1 that leaves the candidates within a microsecond of one
+                // another -- flat inside the timer's resolution -- so the winner
+                // was chosen by noise. Six of twelve picks flipped between runs
+                // with identical reported times, and chunk 16 was being picked
+                // where it is the worst candidate under eviction by 16%.
+                //
+                // So clear the cache between candidate reps, and bracket events
+                // around the kernel alone so the clearing is not what is timed.
+                // Traffic, not footprint, is what evicts, so a modest buffer is
+                // memset repeatedly rather than allocating twice L2 -- at server
+                // startup the KV cache is already placed and a 256 MB transient
+                // is a poor thing to demand.
+                int evict_passes = 0;
+                at::Tensor evict_buf;
                 if (!many) {
-                    mla_decode(q, kv, pick_sel(0), seqlens, scale, v_head_dim,
-                               chunks.front(), shapes.front(), kv_scale);
-                    cudaEventRecord(beg);
-                    for (int r = 0; r < 8; ++r)
-                        mla_decode(q, kv, pick_sel(r), seqlens, scale, v_head_dim,
-                                   chunks.front(), shapes.front(), kv_scale);
-                    cudaEventRecord(end);
-                    cudaEventSynchronize(end);
-                    float probe = 0.f; cudaEventElapsedTime(&probe, beg, end);
-                    const float per_call_us = probe * 1000.f / 8.f;
-                    reps = per_call_us > 0.f ? (int) (400.f / per_call_us) : 40;
-                    reps = std::min(std::max(reps, 20), 400);
+                    const int64_t l2 = exl3_dev_l2();
+                    const int64_t span = std::min<int64_t>(l2, 32 << 20);
+                    evict_passes = (int) ((2 * l2 + span - 1) / span);
+                    evict_buf = at::empty({span}, at::TensorOptions()
+                                                      .dtype(at::kByte).device(q.device()));
                 }
-                const int trials = many ? 1 : 3;
+                auto stream = at::cuda::getCurrentCUDAStream();
+                auto evict = [&](int tag) {
+                    for (int i = 0; i < evict_passes; ++i)
+                        cudaMemsetAsync(evict_buf.data_ptr(), (tag + i) & 0xff,
+                                        evict_buf.numel(), stream);
+                };
+
+                const int reps = many ? 1 : 8;
+                const int trials = many ? 1 : 2;
+                std::vector<cudaEvent_t> ev_b(reps), ev_e(reps);
+                for (int i = 0; i < reps; ++i) {
+                    cudaEventCreate(&ev_b[i]); cudaEventCreate(&ev_e[i]);
+                }
                 float best_ms = 1e30f;
                 for (int c : chunks) {
                     for (int wd : shapes) {
@@ -832,26 +852,36 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                                    c, wd, kv_scale);
                         float ms = 1e30f;
                         for (int tr = 0; tr < trials; ++tr) {
-                            cudaEventRecord(beg);
-                            for (int r = 0; r < reps; ++r)
-                                mla_decode(q, kv, pick_sel(r), seqlens, scale,
-                                           v_head_dim, c, wd, kv_scale);
-                            cudaEventRecord(end);
-                            cudaEventSynchronize(end);
-                            float one = 0.f; cudaEventElapsedTime(&one, beg, end);
-                            ms = std::min(ms, one);
+                            for (int r = 0; r < reps; ++r) {
+                                if (evict_passes) evict(r + tr);
+                                cudaEventRecord(ev_b[r], stream);
+                                mla_decode(q, kv, pick_sel(r + tr * reps), seqlens,
+                                           scale, v_head_dim, c, wd, kv_scale);
+                                cudaEventRecord(ev_e[r], stream);
+                            }
+                            cudaEventSynchronize(ev_e[reps - 1]);
+                            float sum = 0.f;
+                            for (int r = 0; r < reps; ++r) {
+                                float one = 0.f;
+                                cudaEventElapsedTime(&one, ev_b[r], ev_e[r]);
+                                sum += one;
+                            }
+                            ms = std::min(ms, sum);
                         }
                         if (ms < best_ms) { best_ms = ms; best = {c, wd}; }
                     }
                 }
-                cudaEventDestroy(beg); cudaEventDestroy(end);
-                best_ms_report = best_ms * 1000.f / (float) (reps * trials > 0 ? reps : 1);
+                for (int i = 0; i < reps; ++i) {
+                    cudaEventDestroy(ev_b[i]); cudaEventDestroy(ev_e[i]);
+                }
+                ring_report = (int) sel_ring.size();
+                best_ms_report = best_ms * 1000.f / (float) reps;
             }
             if (exl3_env("CUDA_EXL3_MLA_TUNE_VERBOSE")) {
                 printf("[cuda-exl3] mla tune B=%d H=%d topk=%d D=%d kv=%s "
-                       "-> chunk=%d shape=%d (%.1f us/call)\n",
+                       "-> chunk=%d shape=%d ring=%d (%.1f us/call, evicted)\n",
                        B, H, topk, D, kv8 ? "fp8" : "bf16", best.first, best.second,
-                       best_ms_report);
+                       ring_report, best_ms_report);
                 fflush(stdout);
             }
             it = cache.emplace(key, best).first;
