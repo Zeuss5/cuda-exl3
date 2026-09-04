@@ -131,14 +131,25 @@ def main():
 
     print(f"{a.experts} experts / {a.experts // a.tp} local at TP={a.tp}, top-{a.topk}, "
           f"hidden {a.hidden}, inter {a.inter}, {a.bits}-bit")
+    # The TP arrangement only exists when the intermediate slices 128-aligned.
+    # It usually does not at TP=3, which is the whole reason EP is on the table:
+    # 2048/3 is not an integer, let alone a multiple of 128. Say so and carry on
+    # with the EP rows rather than dying on the reference.
+    sliceable = a.inter % (128 * a.tp) == 0
     print(f"{'M':>6} {'arr':>4} {'bm':>4} {'live/blk':>11} {'ms/layer':>9} "
           f"{'ms/step':>9}   EP/TP")
+    if not sliceable:
+        print(f"  (no TP row: intermediate {a.inter} does not slice {a.tp} ways on a "
+              f"128 boundary -- {a.inter / a.tp:.2f} per rank. Pad to "
+              f"{((a.inter + 128 * a.tp - 1) // (128 * a.tp)) * 128 * a.tp} to get one.)")
     for M in ms_list:
-        torch.manual_seed(a.seed)
-        step, bm, live, blk = build(a, M, False, 0)
-        tp_ms = _time(step, a.reps)
-        print(f"{M:6d} {'TP':>4} {bm:4d} {live:5d}/{blk:<5d} {tp_ms:9.4f} "
-              f"{tp_ms * a.layers:9.2f}")
+        tp_ms = None
+        if sliceable:
+            torch.manual_seed(a.seed)
+            step, bm, live, blk = build(a, M, False, 0)
+            tp_ms = _time(step, a.reps)
+            print(f"{M:6d} {'TP':>4} {bm:4d} {live:5d}/{blk:<5d} {tp_ms:9.4f} "
+                  f"{tp_ms * a.layers:9.2f}")
         eps = []
         for r in range(a.ranks):
             torch.manual_seed(a.seed)
@@ -146,8 +157,9 @@ def main():
             ms = _time(step, a.reps)
             eps.append((ms, live, blk, bm))
         for ms, live, blk, bm in eps:
-            print(f"{'':>6} {'EP':>4} {bm:4d} {live:5d}/{blk:<5d} {ms:9.4f} "
-                  f"{ms * a.layers:9.2f}   {ms / tp_ms:.2f}x")
+            rel = f"   {ms / tp_ms:.2f}x" if tp_ms else ""
+            print(f"{'':>6} {'EP' if sliceable else 'EP*':>4} {bm:4d} {live:5d}/{blk:<5d} "
+                  f"{ms:9.4f} {ms * a.layers:9.2f}{rel}")
         if a.ranks > 1:
             lo, hi = min(e[0] for e in eps), max(e[0] for e in eps)
             print(f"{'':>6} {'':>4} {'':>4} {'spread over ranks':>11} "
