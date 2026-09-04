@@ -350,10 +350,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         I = layer.exl3_inter
         out_dtype = x.dtype
 
-        block_m = self._block_m(M * T, E)
-        # pad_sorted_ids makes sorted_ids a whole number of blocks; without it
-        # expert_ids covers more blocks than sorted_ids has entries and the
-        # gather reads past the end.
         # Under expert parallel this layer holds only its own slice of the
         # experts, but topk_ids stay global, and moe_align_block_size wants the
         # global count: it buckets by global id and only then maps through
@@ -364,6 +360,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # the global count is the local one, which is why this hid for so long.
         emap = getattr(layer, "expert_map", None)
         e_global = int(emap.numel()) if emap is not None else E
+        # The block size wants the global count for the same reason. `rows` here
+        # is every (token, expert) pair, but only E_local/E_global of them are
+        # this rank's, so local occupancy is rows*(E_local/E_global)/E_local =
+        # rows/E_global -- the local count would overstate it by the EP factor
+        # and buy a block one or two tiers too large, which is pure padding.
+        block_m = self._block_m(M * T, e_global)
+        # pad_sorted_ids makes sorted_ids a whole number of blocks; without it
+        # expert_ids covers more blocks than sorted_ids has entries and the
+        # gather reads past the end.
         sorted_ids, expert_ids, n_rows = moe_align_block_size(
             topk_ids, block_m, e_global, expert_map=emap, pad_sorted_ids=True
         )
