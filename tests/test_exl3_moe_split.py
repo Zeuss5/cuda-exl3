@@ -75,3 +75,40 @@ def test_split_leaves_accumulator_zeroed(gemm, rows, block_m):
 def test_default_is_on(gemm):
     """Split-k is enabled; pick_split's wave gate decides per shape."""
     assert int(gemm.exl3_get_moe_acc_cap()) > 0
+
+
+@pytest.mark.parametrize("rows,block_m", [(256, 16), (512, 32)])
+@pytest.mark.parametrize("cap", [0, 1 << 24], ids=["unsplit", "split"])
+def test_unowned_blocks_read_as_zero(gemm, rows, block_m, cap):
+    """Blocks marked -1 must come back zeroed, not merely unread.
+
+    Without expert parallel a -1 block is only padding and nothing looks at it,
+    which is why `test_split_matches_unsplit` above masks those rows out. Under
+    expert parallel the same marker covers every block routed to an expert
+    another rank owns, and those rows are real (token, expert) pairs:
+    exl3_moe_combine gathers them unconditionally and the result goes into an
+    all-reduce. The gemm allocates with at::empty, so "skip the block" used to
+    mean "return whatever the allocator last put there", and multiplying by a
+    zero routing weight does not launder it -- NaN * 0 is NaN.
+
+    The poison below is what a warm server does for free: run once, fill the
+    result with NaN, drop it, and the caching allocator hands the same block
+    back to the next same-shaped at::empty.
+    """
+    trellis, svh, a, eids, nr = _operands(rows, block_m)
+    run = lambda: gemm.exl3_moe_gemm(a, trellis, svh, svh, eids, nr, [I, I], CB,
+                                     block_m, torch.bfloat16)
+    prev = int(gemm.exl3_get_moe_acc_cap())
+    try:
+        gemm.exl3_set_moe_acc_cap(cap)
+        poison = run()
+        poison.fill_(float("nan"))
+        del poison
+        out = run()
+    finally:
+        gemm.exl3_set_moe_acc_cap(prev)
+
+    dead = (eids < 0).repeat_interleave(block_m)
+    assert dead.any(), "fixture must mark at least one block unowned"
+    assert torch.isfinite(out[dead]).all(), "unowned rows carry NaN into the all-reduce"
+    assert int(torch.count_nonzero(out[dead])) == 0, "unowned rows are not zeroed"

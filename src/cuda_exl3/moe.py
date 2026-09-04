@@ -354,8 +354,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # pad_sorted_ids makes sorted_ids a whole number of blocks; without it
         # expert_ids covers more blocks than sorted_ids has entries and the
         # gather reads past the end.
+        # Under expert parallel this layer holds only its own slice of the
+        # experts, but topk_ids stay global, and moe_align_block_size wants the
+        # global count: it buckets by global id and only then maps through
+        # expert_map, marking every block this rank does not own with -1. Pass
+        # the local count and the global ids land in the wrong buckets; pass no
+        # map and the -1 never appears, so the kernels' `e < 0` guards -- which
+        # exist precisely for this -- never fire. Without EP the map is None and
+        # the global count is the local one, which is why this hid for so long.
+        emap = getattr(layer, "expert_map", None)
+        e_global = int(emap.numel()) if emap is not None else E
         sorted_ids, expert_ids, n_rows = moe_align_block_size(
-            topk_ids, block_m, E, pad_sorted_ids=True
+            topk_ids, block_m, e_global, expert_map=emap, pad_sorted_ids=True
         )
         sorted_ids = sorted_ids.int()
         expert_ids = expert_ids.int()

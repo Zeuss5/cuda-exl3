@@ -134,6 +134,41 @@ docker build -f docker/Dockerfile.sparse-mla \
   -t glm53-exl3-spark .
 ```
 
+## 3a. Two things upstream of this plugin that stop it booting
+
+Neither is in these kernels; both were hit bringing GLM-5.3-Flash up on 2x GB10
+(issue #2), and both cost a day if you meet them cold.
+
+**vLLM's sparse-attention indexer picks a top-k kernel GB10 cannot run.** With
+`select_k = index_topk / index_kpool = 2048 / 4 = 512`,
+`sparse_attn_indexer_kpool.py` calls `torch.ops._C.persistent_topk`, which fails
+at startup:
+
+```
+persistent_topk would oversubscribe and the FilteredTopK fallback requires
+>=128KB smem per block (have 101376). total_ctas=85 > num_sms*occupancy=48
+(TopK=512, vec_size=4, ctas_per_group=85, smem=49152)
+```
+
+48 SMs is the whole problem: the CTA count the kernel wants does not fit the
+part, and the fallback wants more shared memory than sm_121 offers. Skip the
+persistent path and let it fall through to `top_k_per_row_decode`, in both
+`sparse_attn_indexer_kpool.py` and `sparse_attn_indexer.py`. This is vLLM's
+top-k machinery, not ours -- we only consume the indices it produces -- and its
+GB10 fallback does not currently exist.
+
+**Built-in MTP needs `--block-size 256`.** Enabling `mtp` (formerly
+`glm5_next_mtp`) with fp8 KV otherwise dies in DeepGEMM `attention.hpp:320`: on
+arch 12 with an fp8 cache `block_kv` must be exactly 64, and with
+`index_kpool = 4` that means a 256-token page. Without MTP the default block
+size is fine. Note this is a different constraint from the one our own backend
+reports through `get_supported_kernel_block_sizes()` ([64, 256]) -- they agree
+at 256, which is why that is the value to use.
+
+Measured cost of the MTP arm on 2 nodes: the KV pool drops 22% (2.55M -> 1.99M
+tokens at `--gpu-memory-utilization 0.85`) and single-stream goes 14.6 -> 30.3
+tok/s at 70% acceptance, 3.3 tokens/step.
+
 ## 4. What actually limits a Spark, and what this plugin does about it
 
 On GB10 the wall is **weight streaming, not MMA**. The Reederey87 kit measures
