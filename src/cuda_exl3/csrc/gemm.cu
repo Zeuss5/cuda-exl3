@@ -221,31 +221,15 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
         // find out how many there are.
         if (n_rows && m0 >= *n_rows) return;
         int e = expert_ids[blockIdx.y];
-        // moe_align_block_size marks blocks that belong to no expert with -1.
-        // Under expert parallel that also covers every block routed to an
-        // expert another rank owns, and those rows are real (token, expert)
-        // pairs: the combine gathers them and the result goes into an
-        // all-reduce. The split path accumulates into a zeroed workspace, so
-        // contributing nothing is already the right answer there. The unsplit
-        // path writes C directly, so simply returning would leave the rows
-        // holding whatever the allocator last put there -- and a zero routing
-        // weight does not launder it, because NaN * 0 is still NaN. Zero the
-        // tile instead. Only the skipped tiles pay, so there is no memset over
-        // the whole output.
-        if (e < 0)
-        {
-            if constexpr (!SPLIT)
-            {
-                for (int i = t; i < BM * BN; i += Cfg::NTHREADS)
-                {
-                    const int r = i / BN;
-                    const int gr = m0 + r;
-                    if (gr < m)
-                        C[(size_t) gr * ldc + n_off + n0 + (i - r * BN)] = (OUT_T) 0;
-                }
-            }
-            return;
-        }
+        // moe_align_block_size marks blocks that belong to no expert with -1,
+        // which under expert parallel also covers every block routed to an
+        // expert another rank owns. Nothing downstream reads these rows: the
+        // glu transform and exl3_moe_combine both skip them on the same
+        // predicate, so the rank contributes nothing and the all-reduce takes
+        // the owner's value. Leaving them unwritten is what makes that cheap --
+        // zeroing them here cost a full-width store per dead row, and under EP
+        // three quarters of the rows are dead.
+        if (e < 0) return;
         Bq += (size_t) e * b_expert_stride;
         svh += (size_t) e * svh_expert_stride;
     }
@@ -474,19 +458,7 @@ __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict_
         int blk_m = row / block_m;
         if (n_rows && blk_m * block_m >= *n_rows) return;
         int e = expert_ids[blk_m];
-        if (e < 0)
-        {
-            // Same story as the gemm's own `e < 0`: these are rows for experts
-            // another rank owns, and the combine will gather them regardless.
-            // The accumulator is already zero here and must stay untouched --
-            // had128_warp_acc re-zeroes what it reads, so consuming a block the
-            // gemm never wrote would break the invariant the comment above
-            // describes. Write the zeros straight to C and leave acc alone.
-            const size_t z = (size_t) row * ldc + n_off + blk * HAD_N;
-            for (int i = (int) (threadIdx.x & 31); i < HAD_N; i += 32)
-                C[z + i] = (OUT_T) 0;
-            return;
-        }
+        if (e < 0) return;
         svh += (size_t) e * svh_expert_stride;
     }
 

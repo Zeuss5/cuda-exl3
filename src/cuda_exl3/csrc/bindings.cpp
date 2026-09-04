@@ -16,7 +16,9 @@ void exl3_moe_glu_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor&
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
                          int64_t block_m);
 at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
-                            const at::Tensor& topk_weights, int64_t num_tokens);
+                            const at::Tensor& topk_weights, int64_t num_tokens,
+                            const std::optional<at::Tensor>& expert_ids,
+                            int64_t block_m);
 at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          const at::Tensor& suh_unused, const at::Tensor& svh,
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
@@ -57,7 +59,7 @@ TORCH_LIBRARY(cuda_exl3_C, m)
         "ScalarType out_dtype) -> Tensor");
     m.def(
         "exl3_moe_combine(Tensor rows_out, Tensor sorted_ids, Tensor topk_weights, "
-        "int num_tokens) -> Tensor");
+        "int num_tokens, Tensor? expert_ids=None, int block_m=0) -> Tensor");
     m.def(
         "mla_decode(Tensor q, Tensor kv, Tensor sel, Tensor seqlens, float scale, "
         "int v_head_dim, int split_chunk, int heads_per_block, float kv_scale) -> Tensor");

@@ -199,7 +199,9 @@ template <typename T_>
 __global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
                                         const int* __restrict__ inv,
                                         const float* __restrict__ w,
-                                        T_* __restrict__ out, int top_k, int H)
+                                        T_* __restrict__ out, int top_k, int H,
+                                        const int* __restrict__ expert_ids,
+                                        int block_m)
 {
     int token = blockIdx.x;
     for (int h = threadIdx.x; h < H; h += blockDim.x)
@@ -208,6 +210,13 @@ __global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
         for (int k = 0; k < top_k; ++k)
         {
             int r = inv[token * top_k + k];
+            // Under expert parallel this pair may be routed to an expert another
+            // rank owns. Every producer already skips those rows -- the gemm and
+            // the glu transform both return on e < 0 -- so the row was never
+            // written and must not be read: this rank simply contributes nothing
+            // and the all-reduce takes the owner's value. Reading it and scaling
+            // by the routing weight would not do, because NaN * 0 is NaN.
+            if (expert_ids && expert_ids[r / block_m] < 0) continue;
             acc += w[token * top_k + k] * (float) rows_out[(size_t) r * H + h];
         }
         out[(size_t) token * H + h] = (T_) acc;
@@ -215,7 +224,9 @@ __global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
 }
 
 at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
-                            const at::Tensor& topk_weights, int64_t num_tokens)
+                            const at::Tensor& topk_weights, int64_t num_tokens,
+                            const std::optional<at::Tensor>& expert_ids,
+                            int64_t block_m)
 {
     const at::cuda::OptionalCUDAGuard guard(rows_out.device());
     TORCH_CHECK(sorted_ids.scalar_type() == at::kInt, "exl3_moe_combine: sorted_ids int32");
@@ -231,16 +242,26 @@ at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted
     exl3_moe_build_inv_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(
         sorted_ids.data_ptr<int>(), inv.data_ptr<int>(), rows, M * top_k);
 
+    const int* eids = nullptr;
+    if (expert_ids.has_value() && expert_ids->numel())
+    {
+        TORCH_CHECK(expert_ids->scalar_type() == at::kInt,
+                    "exl3_moe_combine: expert_ids int32");
+        TORCH_CHECK(block_m > 0, "exl3_moe_combine: block_m must be positive");
+        eids = expert_ids->data_ptr<int>();
+    }
+
     at::Tensor out = at::empty({M, H}, rows_out.options());
     int threads = H < 1024 ? ((H + 31) / 32) * 32 : 1024;
     if (rows_out.scalar_type() == at::kHalf)
         exl3_moe_combine_kernel<half><<<M, threads, 0, stream>>>(
             (const half*) rows_out.data_ptr(), inv.data_ptr<int>(), w.data_ptr<float>(),
-            (half*) out.data_ptr(), top_k, H);
+            (half*) out.data_ptr(), top_k, H, eids, (int) block_m);
     else
         exl3_moe_combine_kernel<__nv_bfloat16><<<M, threads, 0, stream>>>(
             (const __nv_bfloat16*) rows_out.data_ptr(), inv.data_ptr<int>(),
-            w.data_ptr<float>(), (__nv_bfloat16*) out.data_ptr(), top_k, H);
+            w.data_ptr<float>(), (__nv_bfloat16*) out.data_ptr(), top_k, H,
+            eids, (int) block_m);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

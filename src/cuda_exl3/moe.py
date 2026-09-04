@@ -404,4 +404,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # (token, k) pair appears exactly once among the live rows, so inverting
         # sorted_ids gives a direct gather -- no atomics, no (M*top_k, H) scratch,
         # and no device sync, so it stays CUDA-graph safe.
-        return ops.exl3_moe_combine(rows_out, sorted_ids, topk_weights, M)
+        # expert_ids/block_m let the combine skip pairs routed to experts this
+        # rank does not own: those rows were never written by the gemm, so they
+        # must not be read.
+        return ops.exl3_moe_combine(rows_out, sorted_ids, topk_weights, M,
+                                    expert_ids, block_m)

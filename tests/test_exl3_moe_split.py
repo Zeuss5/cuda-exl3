@@ -79,17 +79,17 @@ def test_default_is_on(gemm):
 
 @pytest.mark.parametrize("rows,block_m", [(256, 16), (512, 32)])
 @pytest.mark.parametrize("cap", [0, 1 << 24], ids=["unsplit", "split"])
-def test_unowned_blocks_read_as_zero(gemm, rows, block_m, cap):
-    """Blocks marked -1 must come back zeroed, not merely unread.
+def test_unowned_rows_never_reach_the_combine(gemm, rows, block_m, cap):
+    """A pair routed to an expert this rank does not own must contribute nothing.
 
     Without expert parallel a -1 block is only padding and nothing looks at it,
     which is why `test_split_matches_unsplit` above masks those rows out. Under
     expert parallel the same marker covers every block routed to an expert
-    another rank owns, and those rows are real (token, expert) pairs:
-    exl3_moe_combine gathers them unconditionally and the result goes into an
-    all-reduce. The gemm allocates with at::empty, so "skip the block" used to
-    mean "return whatever the allocator last put there", and multiplying by a
-    zero routing weight does not launder it -- NaN * 0 is NaN.
+    another rank owns, and those are real (token, expert) pairs, so the combine
+    reaches them and the result goes into an all-reduce. The gemm deliberately
+    leaves them unwritten -- zeroing every dead row cost a full-width store, and
+    under EP most rows are dead -- so the combine must skip them instead.
+    Scaling by a zero routing weight is not enough: NaN * 0 is NaN.
 
     The poison below is what a warm server does for free: run once, fill the
     result with NaN, drop it, and the caching allocator hands the same block
@@ -104,11 +104,19 @@ def test_unowned_blocks_read_as_zero(gemm, rows, block_m, cap):
         poison = run()
         poison.fill_(float("nan"))
         del poison
-        out = run()
+        rows_out = run()
     finally:
         gemm.exl3_set_moe_acc_cap(prev)
 
     dead = (eids < 0).repeat_interleave(block_m)
     assert dead.any(), "fixture must mark at least one block unowned"
-    assert torch.isfinite(out[dead]).all(), "unowned rows carry NaN into the all-reduce"
-    assert int(torch.count_nonzero(out[dead])) == 0, "unowned rows are not zeroed"
+
+    # Route every token at top_k=1 straight through the unowned rows.
+    dead_idx = torch.nonzero(dead).flatten()[:8]
+    M = dead_idx.numel()
+    sorted_ids = torch.full((rows,), rows, dtype=torch.int32, device="cuda")
+    sorted_ids[dead_idx] = torch.arange(M, dtype=torch.int32, device="cuda")
+    w = torch.ones((M, 1), dtype=torch.float32, device="cuda")
+    out = gemm.exl3_moe_combine(rows_out, sorted_ids, w, M, eids, block_m)
+    assert torch.isfinite(out).all(), "unowned rows carried NaN into the all-reduce"
+    assert int(torch.count_nonzero(out)) == 0, "unowned rows contributed a value"
