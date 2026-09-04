@@ -108,32 +108,6 @@ __device__ __forceinline__ void shuffle_had_f4x32(float& h0, float& h1, float& h
 // `lane` is the caller's lane id; scale pointers address the same 128 elements.
 // Input-transform variant: reads activations in their native dtype, writes fp16.
 template <typename IN_T>
-__device__ __forceinline__ half4 had128_warp_in_frag(const IN_T* __restrict__ in,
-                                                     const half* __restrict__ scale_pre,
-                                                     int lane)
-{
-    // Same transform as had128_warp_in, but the caller keeps the fragment. Lane
-    // L holds output elements 4L..4L+3 of the 128-block, so a caller staging a
-    // BK-wide slice can have exactly the lanes covering that slice write their
-    // 8 bytes straight into the A tile -- no scratch buffer, no extra shared.
-    half4 v = ActVec<IN_T>::load(in, lane);
-    half4 s = ((const half4*) scale_pre)[lane];
-    v.x = __hmul2(v.x, s.x);
-    v.y = __hmul2(v.y, s.y);
-    float v0 = __half2float(__low2half(v.x));
-    float v1 = __half2float(__high2half(v.x));
-    float v2 = __half2float(__low2half(v.y));
-    float v3 = __half2float(__high2half(v.y));
-    float s0 = v0 + v1, d0 = v0 - v1;
-    float s1 = v2 + v3, d1 = v2 - v3;
-    float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
-    shuffle_had_f4x32(h0, h1, h2, h3, lane);
-    v.x = __floats2half2_rn(h0 * EXL3_HAD128_RSCALE, h1 * EXL3_HAD128_RSCALE);
-    v.y = __floats2half2_rn(h2 * EXL3_HAD128_RSCALE, h3 * EXL3_HAD128_RSCALE);
-    return v;
-}
-
-template <typename IN_T>
 __device__ __forceinline__ void had128_warp_in(const IN_T* __restrict__ in,
                                                half* __restrict__ out,
                                                const half* __restrict__ scale_pre,
