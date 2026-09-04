@@ -753,15 +753,47 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 // the grid optimum. Size the window to the kernel instead:
                 // probe, run enough reps to fill ~400 us, and take the best of
                 // three so one scheduling hiccup cannot decide it.
+                // Which cache regime should the tuner measure? It times one
+                // selection repeatedly, so from the second rep the rows are
+                // L2-resident, and the warm and cold optima differ -- on a 24 MB
+                // L2 the warm winner was chunk=48 and the cold one chunk=96.
+                //
+                // Warm is the better model of decode, which is the surprise. A
+                // sequence's top-k list changes by about one row in 2048 per
+                // step as its context grows, so consecutive steps re-touch
+                // ~99.95% of the same rows; one selection at topk=2048 is 2 MB,
+                // 8% of a GB10's L2 and 2% of this card's. A benchmark that
+                // replays independent random selections is measuring a regime
+                // decode does not run in -- prefill and many-independent-sequence
+                // batches are colder, but those take the `many` path.
+                //
+                // So the ring is opt-in rather than default. Set
+                // CUDA_EXL3_MLA_TUNE_RING=N to tune against N rotating
+                // selections; 0 (the default) keeps the warm model.
+                std::vector<at::Tensor> sel_ring;
+                if (!many) {
+                    const char* e = exl3_env("CUDA_EXL3_MLA_TUNE_RING");
+                    int nsel = e && *e ? atoi(e) : 0;
+                    if (nsel < 0) nsel = 0;
+                    nsel = std::min(nsel, 64);
+                    sel_ring.reserve(nsel);
+                    for (int i = 0; i < nsel; ++i)
+                        sel_ring.push_back(
+                            at::randint(0, kv.size(0), {B, topk}, sel.options()));
+                }
+                auto pick_sel = [&](int r) -> const at::Tensor& {
+                    return sel_ring.empty() ? sel : sel_ring[r % sel_ring.size()];
+                };
+
                 int reps = 1;
                 cudaEvent_t beg, end;
                 cudaEventCreate(&beg); cudaEventCreate(&end);
                 if (!many) {
-                    mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
+                    mla_decode(q, kv, pick_sel(0), seqlens, scale, v_head_dim,
                                chunks.front(), shapes.front(), kv_scale);
                     cudaEventRecord(beg);
                     for (int r = 0; r < 8; ++r)
-                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
+                        mla_decode(q, kv, pick_sel(r), seqlens, scale, v_head_dim,
                                    chunks.front(), shapes.front(), kv_scale);
                     cudaEventRecord(end);
                     cudaEventSynchronize(end);
@@ -775,13 +807,14 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 for (int c : chunks) {
                     for (int wd : shapes) {
                         if (c > topk && c != chunks.front()) continue;
-                        mla_decode(q, kv, sel, seqlens, scale, v_head_dim, c, wd, kv_scale);
+                        mla_decode(q, kv, pick_sel(0), seqlens, scale, v_head_dim,
+                                   c, wd, kv_scale);
                         float ms = 1e30f;
                         for (int tr = 0; tr < trials; ++tr) {
                             cudaEventRecord(beg);
                             for (int r = 0; r < reps; ++r)
-                                mla_decode(q, kv, sel, seqlens, scale, v_head_dim,
-                                           c, wd, kv_scale);
+                                mla_decode(q, kv, pick_sel(r), seqlens, scale,
+                                           v_head_dim, c, wd, kv_scale);
                             cudaEventRecord(end);
                             cudaEventSynchronize(end);
                             float one = 0.f; cudaEventElapsedTime(&one, beg, end);

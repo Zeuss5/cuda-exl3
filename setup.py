@@ -79,7 +79,7 @@ def _fallback_include_dir():
             inc = os.path.join(nv, entry, "include")
             if all(os.path.exists(os.path.join(inc, h)) for h in missing):
                 print(f"[cuda-exl3] toolkit lacks {', '.join(missing)}; "
-                      f"adding {inc} with -idirafter")
+                      f"adding {inc} to CPATH")
                 return inc
     print(f"[cuda-exl3] warning: {', '.join(missing)} not found anywhere; "
           f"set CPATH if the build fails")

@@ -97,6 +97,9 @@ def run_child(env, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["splitk", "blockm"])
+    ap.add_argument("--trials", type=int, default=3,
+                    help="repeats per split-k combination; the verdict uses the "
+                         "best of them and an interleaved baseline")
     ap.add_argument("--inter", type=int, default=2048,
                     help="MoE expert intermediate width per rank (GLM-5.3-Flash "
                          "is 2048; divide by the TP size for a sharded run)")
@@ -116,21 +119,34 @@ def main():
     out = {}
 
     if a.only in (None, "splitk"):
-        base = run_child({}, [])
-        print(f"split-k sweep (baseline {base:.0f} us for the whole set)")
-        best, best_env = base, None
-        for tgt, bud, gain in itertools.product((1.5, 3.0, 6.0), (0.15, 0.30, 0.60),
-                                                (1.0, 2.0, 4.0)):
-            env = {"CUDA_EXL3_SPLIT_TARGET": tgt, "CUDA_EXL3_SPLIT_BUDGET": bud,
-                   "CUDA_EXL3_L2_GAIN": gain}
-            us = run_child(env, [])
-            if us < best:
-                best, best_env = us, env
-        if best_env and best < base * 0.98:
-            print(f"  best {best:.0f} us ({100*(base-best)/base:.1f}% better)")
-            out.update(best_env)
+        # Run-to-run drift on this sweep was measured at 2.2% on a GB10 against
+        # a 2% decision threshold, so a single reading flipped the verdict one
+        # run in four and emitted a bogus export. Every combination is measured
+        # N times and the baseline is re-measured interleaved with them, so
+        # drift moves both sides together instead of only the candidate.
+        combos = [{"CUDA_EXL3_SPLIT_TARGET": t, "CUDA_EXL3_SPLIT_BUDGET": b,
+                   "CUDA_EXL3_L2_GAIN": g}
+                  for t, b, g in itertools.product((1.5, 3.0, 6.0),
+                                                   (0.15, 0.30, 0.60),
+                                                   (1.0, 2.0, 4.0))]
+        base_runs, results = [], {i: [] for i in range(len(combos))}
+        for _ in range(a.trials):
+            base_runs.append(run_child({}, []))
+            for i, env in enumerate(combos):
+                results[i].append(run_child(env, []))
+        base = min(base_runs)
+        print(f"split-k sweep ({a.trials} trials; baseline {base:.0f} us, "
+              f"spread {min(base_runs):.0f}-{max(base_runs):.0f})")
+        i_best = min(results, key=lambda i: min(results[i]))
+        best = min(results[i_best])
+        if best < base * 0.95:
+            print(f"  best {best:.0f} us ({100*(base-best)/base:.1f}% better, "
+                  f"beyond the {100*(max(base_runs)-min(base_runs))/base:.1f}% "
+                  f"drift seen here)")
+            out.update(combos[i_best])
         else:
-            print("  defaults are within 2% of the best combination -- keep them")
+            print(f"  best candidate is {100*(base-best)/base:.1f}% from the "
+                  f"defaults, inside the noise -- keep them")
 
     if a.only in (None, "blockm"):
         print(f"\nMoE block_m ladder (4096 tokens, top-8 of 288 experts, "
