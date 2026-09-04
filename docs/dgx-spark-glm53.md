@@ -139,10 +139,10 @@ docker build -f docker/Dockerfile.sparse-mla \
 Neither is in these kernels; both were hit bringing GLM-5.3-Flash up on 2x GB10
 (issue #2), and both cost a day if you meet them cold.
 
-**vLLM's sparse-attention indexer picks a top-k kernel GB10 cannot run.** With
-`select_k = index_topk / index_kpool = 2048 / 4 = 512`,
-`sparse_attn_indexer_kpool.py` calls `torch.ops._C.persistent_topk`, which fails
-at startup:
+**vLLM's sparse-attention indexer may pick a top-k kernel that will not start.**
+With `select_k = index_topk / index_kpool = 2048 / 4 = 512`,
+`sparse_attn_indexer_kpool.py` calls `torch.ops._C.persistent_topk`, which can
+fail at startup:
 
 ```
 persistent_topk would oversubscribe and the FilteredTopK fallback requires
@@ -150,12 +150,17 @@ persistent_topk would oversubscribe and the FilteredTopK fallback requires
 (TopK=512, vec_size=4, ctas_per_group=85, smem=49152)
 ```
 
-48 SMs is the whole problem: the CTA count the kernel wants does not fit the
-part, and the fallback wants more shared memory than sm_121 offers. Skip the
-persistent path and let it fall through to `top_k_per_row_decode`, in both
-`sparse_attn_indexer_kpool.py` and `sparse_attn_indexer.py`. This is vLLM's
-top-k machinery, not ours -- we only consume the indices it produces -- and its
-GB10 fallback does not currently exist.
+48 SMs is what provokes it: the CTA count the kernel wants does not fit the
+part, and its fallback wants more shared memory than sm_121 offers.
+
+Correction to an earlier version of this guide, which said the kernel *cannot*
+run on GB10: it can. It is slower than the `top_k_per_row_decode` path below
+roughly 16K rows of candidates, with the crossover at about 64K tokens of
+context, so falling through to `top_k_per_row_decode` is the right default at
+ordinary context lengths and the wrong one at very long ones. Skip the
+persistent path in both `sparse_attn_indexer_kpool.py` and
+`sparse_attn_indexer.py` if you meet the error above. This is vLLM's top-k
+machinery, not ours -- we only consume the indices it produces.
 
 **Built-in MTP needs `--block-size 256`.** Enabling `mtp` (formerly
 `glm5_next_mtp`) with fp8 KV otherwise dies in DeepGEMM `attention.hpp:320`: on

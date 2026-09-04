@@ -685,9 +685,23 @@ int mla_tune_bucket(int B) {
     return b;
 }
 
+// topk was keyed exactly, which was wrong for the same reason B is bucketed.
+// The indexer returns min(index_topk, context), so during a chunked prefill the
+// count grows chunk by chunk and every chunk minted a fresh key and re-tuned --
+// measured on a GB10 as 1728 eviction-kernel launches inside a 6.5 s prefill,
+// 2.6% of the window, by @NNNtrance in #1. Round up to a multiple of 256: the
+// chunk is only a split size, so any value stays correct and a coarser key
+// costs at most a slightly worse pick, while the number of distinct keys a
+// prefill can mint is bounded by index_topk / 256.
+int mla_tune_topk_bucket(int topk) {
+    constexpr int Q = 256;
+    return ((topk + Q - 1) / Q) * Q;
+}
+
 uint64_t mla_tune_key(int B, int H, int topk, int D, bool kv8) {
     uint64_t h = 1469598103934665603ull;
-    for (uint64_t v : {(uint64_t) mla_tune_bucket(B), (uint64_t) H, (uint64_t) topk,
+    for (uint64_t v : {(uint64_t) mla_tune_bucket(B), (uint64_t) H,
+                       (uint64_t) mla_tune_topk_bucket(topk),
                        (uint64_t) D, (uint64_t) kv8}) {
         h ^= v; h *= 1099511628211ull;
     }
