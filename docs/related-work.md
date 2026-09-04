@@ -100,8 +100,30 @@ capture, which is the only way decode runs.
 **So the transferable idea is the GEMV formulation, not the fusion.** Taken in
 f4987cf, in the cheapest form that captures it: rather than restructuring into a
 GEMV, just stop fetching the padding rows, since cp.async zero-fills a row it is
-not given. Worth +2.0 to +2.2% of decode throughput and -1.2 to -2.6% of TTFT end
-to end. Decode has
+not given. Worth +2.0 to +2.2% of decode throughput and -1.2 to -2.6% of TTFT
+here, and +1.6 to +4.5% on GB10, where the MoE is a larger share of a step.
+
+### Do not build the GEMV rewrite
+
+Measured after f4987cf, TP=4 serving shapes, the gate/up gemm against a plain
+gather of the same experts' weights:
+
+    M    live experts   w13 MB   gemm    achieved   gather ceiling   of ceiling
+    8              60    125.8   84.7us  1523 GB/s      1422 GB/s        107%
+    16            114    239.1  183.2us  1339           1451              92%
+    64            252    528.5  424.8us  1287           1460              88%
+    256           287    601.9  477.0us  1360           1460              93%
+
+The decode path is at the memory system's limit -- over it at M=8, where 125.8 MB
+of weights fits the 128 MB L2 and the column-block re-reads hit cache. A GEMV
+would be competing for 7-12%, part of which is the A and output traffic charged
+against it rather than inefficiency, in exchange for reverse-engineering the mma
+fragment layout inside the trellis tile. Not worth it on this part.
+
+That also means MoE decode is finished as a kernel target here. What is left in a
+decode step is attention and the collectives; what is left in prefill is the
+all-reduce, at 38% of the budget, which is NCCL over host memory because these
+cards have no peer-to-peer. Decode has
 about one row per expert against our 16-row `mma` tile, and the padding is
 33.6 MB per layer of pure traffic against 314.6 MB of weights. Removing it is
 worth roughly 9%, and the access pattern will support it: a gather of 50
