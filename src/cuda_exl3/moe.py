@@ -30,6 +30,11 @@ TILE = 16
 # Placeholder for the unused A operand when the input transform is fused.
 _EMPTY_H = torch.empty(0, dtype=torch.half)
 
+# CUDA_EXL3_MOE_FUSE_IN=0/1 forces the fused input transform off or on, for
+# measuring the crossover on a part it has not been measured on.
+_FUSE_IN_ENV = _env.getenv("CUDA_EXL3_MOE_FUSE_IN")
+_FUSE_IN_OVERRIDE = None if not _FUSE_IN_ENV else _FUSE_IN_ENV not in ("0", "", "false")
+
 
 # vLLM has two MoE weight-loading protocols and which one runs depends on the
 # version. Older builds call `layer.load_weights(...)` once with every expert
@@ -390,7 +395,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # At decode that tensor was almost entirely padding -- block_m rows per
         # expert where only about one is routed -- so writing it cost far more
         # than the rows that were actually used.
-        if xc.dtype == torch.bfloat16:
+        # Fuse only while the row padding is thick enough to pay for it. The
+        # fused gemm transforms just the rows it actually uses, but it re-does
+        # them once per column tile; the standalone kernel transforms every
+        # padded row exactly once and writes the result. So the trade is
+        # (real rows x column tiles) of arithmetic against (padded rows) of
+        # traffic, and it turns over at a padding ratio, not a token count.
+        #
+        # Measured crossovers, 42 MoE layers, ms/step, fused vs not:
+        #   RTX PRO 6000, 188 SMs:  M=64 +5.8%, M=128 +5.5%, M=192 +2.8%,
+        #                           M=256 -0.0%, M=512 -13.8%, M=2048 -61.5%
+        #   GB10, 48 SMs (#4):      M=8 +5.0%, M=512 +3.9%, M=2048 -43.7%
+        # The faster part turns over sooner: more bandwidth makes the saved
+        # write worth less while the duplicated arithmetic costs the same. A
+        # token-count gate would therefore need a different constant per device,
+        # but the padding ratio at the turn is ~2.25 here and lower on GB10, so
+        # one conservative ratio is safe on both.
+        fuse_in = xc.dtype == torch.bfloat16 and rows >= 3 * M * T
+        if _FUSE_IN_OVERRIDE is not None:
+            fuse_in = _FUSE_IN_OVERRIDE and xc.dtype == torch.bfloat16
+        if fuse_in:
             inter = ops.exl3_moe_gemm(
                 _EMPTY_H.to(x.device), layer.w13_trellis.data, layer.w13_suh.data,
                 layer.w13_svh.data, expert_ids, n_rows, [I, I], layer.exl3_cb,
