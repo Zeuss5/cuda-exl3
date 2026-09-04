@@ -23,6 +23,10 @@
 
 namespace cuda_exl3 {
 
+// Routing fan-out per token. GLM-5.3-Flash uses 8; exl3_moe_combine stages this
+// many row indices and weights per block in shared memory.
+static constexpr int MAX_TOPK = 32;
+
 template <typename IN_T>
 __global__ void exl3_had_in_kernel(const IN_T* __restrict__ x, half* __restrict__ a_had,
                                    const half* __restrict__ suh, int m, int k, int groups)
@@ -212,20 +216,41 @@ __global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
                                         int block_m)
 {
     int token = blockIdx.x;
+
+    // The per-(token, k) facts -- the gathered row, its routing weight, and
+    // whether the block that produced it belongs to this rank -- do not depend
+    // on h, but the loop below re-reads all three once per h a thread owns. At
+    // H = 4096 with 1024 threads that is four times per thread, and the
+    // liveness test is a dependent chain (load inv -> integer divide -> load
+    // expert_ids) that a decode-sized launch has no parallelism to hide: the
+    // grid is one block per token, so at M = 8 only 8 of the SMs are busy.
+    // Stage the three facts once instead. expert_ids == nullptr keeps the
+    // pre-EP behaviour exactly, and the result is bit-identical either way.
+    __shared__ int s_row[MAX_TOPK];
+    __shared__ float s_w[MAX_TOPK];
+    if ((int) threadIdx.x < top_k)
+    {
+        int r = inv[token * top_k + threadIdx.x];
+        bool live = (expert_ids == nullptr) || (expert_ids[r / block_m] >= 0);
+        s_row[threadIdx.x] = live ? r : -1;
+        s_w[threadIdx.x] = w[token * top_k + threadIdx.x];
+    }
+    __syncthreads();
+
     for (int h = threadIdx.x; h < H; h += blockDim.x)
     {
         float acc = 0.0f;
         for (int k = 0; k < top_k; ++k)
         {
-            int r = inv[token * top_k + k];
+            int r = s_row[k];
             // Under expert parallel this pair may be routed to an expert another
             // rank owns. Every producer already skips those rows -- the gemm and
             // the glu transform both return on e < 0 -- so the row was never
             // written and must not be read: this rank simply contributes nothing
             // and the all-reduce takes the owner's value. Reading it and scaling
             // by the routing weight would not do, because NaN * 0 is NaN.
-            if (expert_ids && expert_ids[r / block_m] < 0) continue;
-            acc += w[token * top_k + k] * (float) rows_out[(size_t) r * H + h];
+            if (r < 0) continue;
+            acc += s_w[k] * (float) rows_out[(size_t) r * H + h];
         }
         out[(size_t) token * H + h] = (T_) acc;
     }
@@ -258,6 +283,7 @@ at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted
         TORCH_CHECK(block_m > 0, "exl3_moe_combine: block_m must be positive");
         eids = expert_ids->data_ptr<int>();
     }
+    TORCH_CHECK(top_k <= MAX_TOPK, "exl3_moe_combine: top_k > 32 is not supported");
 
     at::Tensor out = at::empty({M, H}, rows_out.options());
     int threads = H < 1024 ? ((H + 31) / 32) * 32 : 1024;
