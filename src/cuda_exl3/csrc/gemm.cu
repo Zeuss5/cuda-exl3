@@ -762,9 +762,16 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
                       k, n, ldc, n_off, n_tiles_full, acc, split, smap, stream,        \
                       expert_ids, b_expert_stride, svh_expert_stride, n_rows);         \
     else                                                                               \
+        /* n_rows is not optional here. Without it the unsplit kernel has no live-row \
+           bound, and the surplus tail of expert_ids is not reliably -1: the alignment \
+           marks it -1, then expert_map[expert_ids] indexes with -1, which is negative \
+           indexing -- it returns the local id of the LAST global expert. On the rank  \
+           owning the top of the range that is a real expert, so that rank runs a full \
+           gemm over every surplus block: 206 of 540 at M=2048, 38% of the grid, and   \
+           the step waits for it. Reported and diagnosed by @NNNtrance in #1. */       \
         launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
                       k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,            \
-                      expert_ids, b_expert_stride, svh_expert_stride);
+                      expert_ids, b_expert_stride, svh_expert_stride, n_rows);
 
 // BK=64 borrows Marlin's shape: an A row is then exactly 128 B = 32 banks, so the
 // XOR swizzle is conflict-free with no padding at all. It needs k % 64 == 0

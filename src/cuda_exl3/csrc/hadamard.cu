@@ -111,10 +111,20 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
     // An empty sorted_ids means the rows are already in place (the second
     // projection consumes the first one's output), so the gather is the
     // identity and no index array needs building.
+    // Retire a block that belongs to no expert before doing anything else. This
+    // has to come above the padding branch, not below it: the gemm skips the
+    // whole block, so nobody reads these rows and even writing zeros to them is
+    // wasted bandwidth. Under expert parallel most blocks are another rank's,
+    // and at small batch most rows are padding, so that was the bulk of this
+    // kernel's traffic. Reported by @NNNtrance in #1.
+    int e = expert_ids[row / block_m];
+    if (e < 0) return;
+
     int idx = sorted_ids ? sorted_ids[row] : row;
     if (idx >= m_valid)
     {
-        // Padding row: emit zeros so the matmul result is zero too.
+        // Padding row inside a live block: the gemm does compute this row, so it
+        // needs zeros to carry a zero through.
         for (int g = 0; g < groups; ++g)
             ((half4*) (a_had + (long long) g * rows * k + dst))[lane] =
                 half4{__float2half2_rn(0.f), __float2half2_rn(0.f)};
@@ -122,8 +132,6 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
     }
 
     int token = idx / top_k;
-    int e = expert_ids[row / block_m];
-    if (e < 0) return;                  // block belongs to no expert
     const IN_T* src = x + (long long) token * k + blk * 128;
 
     for (int g = 0; g < groups; ++g)
