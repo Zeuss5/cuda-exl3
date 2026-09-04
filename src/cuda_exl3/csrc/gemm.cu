@@ -182,7 +182,15 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     const int* __restrict__ expert_ids,  // MoE: one expert per BM-row block
     int64_t b_expert_stride,             // uint16 elements between experts
     int64_t svh_expert_stride,
-    const int* __restrict__ n_rows)      // MoE: live row count, device-side
+    const int* __restrict__ n_rows,      // MoE: live row count, device-side
+    // Fused combine. When sorted_ids is non-null this gemm finishes the MoE by
+    // itself: each routed row is scaled by its routing weight and accumulated
+    // into its token's row of C, so C is (tokens, n) rather than (rows, n) and
+    // the separate combine kernel -- plus the (rows, n) tensor it read -- go
+    // away entirely.
+    const int* __restrict__ moe_sorted_ids,
+    const float* __restrict__ moe_weights,
+    int moe_top_k, int moe_m_valid)
 {
     using Cfg = GemmCfg<BITS, CB, BM, BN, BK, NWARPS, STAGES, WARP_N_>;
 
@@ -423,9 +431,19 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     {
         int grow = m0 + r;
         if (grow >= m) continue;
-        had128_warp_out<OUT_T>(sh_c + r * Cfg::C_STRIDE,
-                               C + (size_t) grow * ldc + n_off + n0,
-                               svh + n_off + n0, lane);
+        if (moe_sorted_ids)
+        {
+            const int idx = moe_sorted_ids[grow];
+            // Padding rows carry zeros and belong to no token; nothing to add.
+            if (idx >= moe_m_valid) continue;
+            had128_warp_out_acc<OUT_T>(sh_c + r * Cfg::C_STRIDE,
+                                       C + (size_t) (idx / moe_top_k) * ldc + n_off + n0,
+                                       svh + n_off + n0, lane, moe_weights[idx]);
+        }
+        else
+            had128_warp_out<OUT_T>(sh_c + r * Cfg::C_STRIDE,
+                                   C + (size_t) grow * ldc + n_off + n0,
+                                   svh + n_off + n0, lane);
     }
 }
 
@@ -600,7 +618,9 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
             ShardMap smap, cudaStream_t stream, const int* expert_ids = nullptr,
             int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
-            const int* n_rows = nullptr)
+            const int* n_rows = nullptr, const int* moe_sorted_ids = nullptr,
+            const float* moe_weights = nullptr, int moe_top_k = 0,
+            int moe_m_valid = 0)
 {
     using Cfg = cuda_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
     auto fn = cuda_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
@@ -612,7 +632,9 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
     fn<<<grid, Cfg::NTHREADS, Cfg::SMEM, stream>>>(A, Bq, C, svh, m, k, n, ldc, n_off,
                                                   n_tiles_full, acc, kt_per_split, smap,
                                                   expert_ids, b_expert_stride,
-                                                  svh_expert_stride, n_rows);
+                                                  svh_expert_stride, n_rows,
+                                                  moe_sorted_ids, moe_weights,
+                                                  moe_top_k, moe_m_valid);
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +760,9 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
                int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
                ShardMap smap, cudaStream_t stream, int bm_override = 0,
                const int* expert_ids = nullptr, int64_t b_expert_stride = 0,
-               int64_t svh_expert_stride = 0, const int* n_rows = nullptr)
+               int64_t svh_expert_stride = 0, const int* n_rows = nullptr,
+               const int* moe_sorted_ids = nullptr, const float* moe_weights = nullptr,
+               int moe_top_k = 0, int moe_m_valid = 0)
 {
     // fp16 accumulation is opt-in and only used where it can pay for itself: no
     // split-k (which reduces in fp32 anyway) and a batch large enough for the
@@ -771,7 +795,8 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
            the step waits for it. Reported and diagnosed by @NNNtrance in #1. */       \
         launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
                       k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,            \
-                      expert_ids, b_expert_stride, svh_expert_stride, n_rows);
+                      expert_ids, b_expert_stride, svh_expert_stride, n_rows,          \
+                      moe_sorted_ids, moe_weights, moe_top_k, moe_m_valid);
 
 // BK=64 borrows Marlin's shape: an A row is then exactly 128 B = 32 banks, so the
 // XOR swizzle is conflict-free with no padding at all. It needs k % 64 == 0
@@ -811,7 +836,10 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                    cudaStream_t stream, const int* expert_ids = nullptr,
                    int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
                    int force_bm = 0, const int* n_rows = nullptr,
-                   bool split_k = false, int bits_for_split = 0)
+                   bool split_k = false, int bits_for_split = 0,
+                   const int* moe_sorted_ids = nullptr,
+                   const float* moe_weights = nullptr,
+                   int moe_top_k = 0, int moe_m_valid = 0)
 {
 #define VE3_CASE(B_, C_)                                                        \
     if (bits == B_ && cb == C_)                                                 \
@@ -823,7 +851,8 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                 launch_bm<B_, C_, OUT_T>(A, B, C, S, m, k, n, ldc, n_off,       \
                                  n_tiles_full, acc, sp_, smap, stream, bm_,     \
                                  expert_ids, b_expert_stride, svh_expert_stride, \
-                                 n_rows);                                        \
+                                 n_rows, moe_sorted_ids, moe_weights, moe_top_k, \
+                                 moe_m_valid);                                   \
                 if (sp_ > 1)                                                    \
                     launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream,  \
                                            expert_ids, n_rows, bm_,              \
@@ -1074,7 +1103,10 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          const at::Tensor& suh_unused, const at::Tensor& svh,
                          const at::Tensor& expert_ids, const at::Tensor& n_rows,
                          at::IntArrayRef group_n, int64_t cb, int64_t block_m,
-                         at::ScalarType out_dtype)
+                         at::ScalarType out_dtype,
+                         const std::optional<at::Tensor>& sorted_ids,
+                         const std::optional<at::Tensor>& topk_weights,
+                         int64_t num_tokens, int64_t top_k)
 {
     const at::cuda::OptionalCUDAGuard guard(a_had.device());
     TORCH_CHECK(trellis.is_contiguous() && trellis.dim() == 4,
@@ -1095,7 +1127,27 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                 (long long) groups * rows * k, " for ", rows, " rows");
 
     auto opts = at::TensorOptions().dtype(out_dtype).device(a_had.device());
-    at::Tensor out = at::empty({rows, n_total}, opts);
+    // Fused combine: the output is per token, not per routed row, and the rows
+    // accumulate into it, so it starts at zero. That is one (tokens, n) memset
+    // against the (rows, n) tensor plus a whole extra kernel it replaces.
+    const bool fuse_combine = sorted_ids.has_value() && sorted_ids->numel()
+                              && topk_weights.has_value();
+    const int* moe_sid = nullptr;
+    const float* moe_w = nullptr;
+    at::Tensor w_f32;
+    if (fuse_combine)
+    {
+        TORCH_CHECK(sorted_ids->scalar_type() == at::kInt,
+                    "exl3_moe_gemm: sorted_ids must be int32");
+        TORCH_CHECK(num_tokens > 0 && top_k > 0,
+                    "exl3_moe_gemm: fused combine needs num_tokens and top_k");
+        moe_sid = sorted_ids->data_ptr<int>();
+        w_f32 = topk_weights->to(at::kFloat).contiguous();
+        moe_w = w_f32.data_ptr<float>();
+    }
+    at::Tensor out = fuse_combine ? at::zeros({num_tokens, n_total}, opts)
+                                  : at::empty({rows, n_total}, opts);
+    const int moe_m_valid = fuse_combine ? (int) (num_tokens * top_k) : 0;
 
     ShardMap smap{};
     smap.n_groups = groups;
@@ -1148,12 +1200,14 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     if (out_dtype == at::kHalf)
         dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, rows, k, n_total,
                             n_total, 0, n_tiles_full, acc, split, smap, stream, eids,
-                            b_stride, n_total, (int) block_m, nrows);
+                            b_stride, n_total, (int) block_m, nrows, false, 0,
+                            moe_sid, moe_w, (int) top_k, moe_m_valid);
     else
         dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
                                      rows, k, n_total, n_total, 0, n_tiles_full, acc,
                                      split, smap, stream, eids, b_stride, n_total,
-                                     (int) block_m, nrows);
+                                     (int) block_m, nrows, false, 0,
+                                     moe_sid, moe_w, (int) top_k, moe_m_valid);
     return out;
 }
 

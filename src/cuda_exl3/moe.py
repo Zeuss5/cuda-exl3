@@ -396,16 +396,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         a2 = torch.empty((1, rows, I), dtype=torch.half, device=x.device)
         ops.exl3_moe_glu_had_in(inter, a2, layer.w2_suh.data, expert_ids, n_rows,
                                 block_m)
-        rows_out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data, layer.w2_suh.data,
-                                     layer.w2_svh.data, expert_ids, n_rows, [H],
-                                     layer.exl3_cb, block_m, out_dtype)
+        # The down projection finishes the MoE: its epilogue scales each routed
+        # row by the routing weight and accumulates it into the token's row, so
+        # there is no (rows, H) tensor and no combine kernel. That kernel ran one
+        # block per token -- eight blocks at decode -- and was pure latency.
+        out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data, layer.w2_suh.data,
+                                layer.w2_svh.data, expert_ids, n_rows, [H],
+                                layer.exl3_cb, block_m, out_dtype,
+                                sorted_ids, topk_weights, M, T)
 
-        # Combine the routed rows back into per-token outputs. Fused: each
-        # (token, k) pair appears exactly once among the live rows, so inverting
-        # sorted_ids gives a direct gather -- no atomics, no (M*top_k, H) scratch,
-        # and no device sync, so it stays CUDA-graph safe.
-        # expert_ids/block_m let the combine skip pairs routed to experts this
-        # rank does not own: those rows were never written by the gemm, so they
-        # must not be read.
-        return ops.exl3_moe_combine(rows_out, sorted_ids, topk_weights, M,
-                                    expert_ids, block_m)
+        return out

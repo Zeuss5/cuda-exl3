@@ -8,6 +8,7 @@
 // gemm epilogue.
 #pragma once
 
+#include <type_traits>
 #include <cuda_bf16.h>
 
 #include "exl3_common.cuh"
@@ -260,4 +261,49 @@ __device__ __forceinline__ void had128_warp_out(const half* __restrict__ in,
     v.x = __hmul2(v.x, s.x);
     v.y = __hmul2(v.y, s.y);
     ActVec<OUT_T>::store(out, lane, v);
+}
+
+// Same transform, but scaled by a routing weight and accumulated into a token's
+// row instead of written to a routed row. This is what lets the down projection
+// finish the MoE by itself: the separate combine kernel read back a (rows,
+// hidden) tensor that nothing else wanted, and at decode it ran on one block per
+// token -- 8 blocks on a 188-SM part, pure latency. Accumulating here removes
+// both the kernel and the tensor.
+//
+// top_k rows land on the same token, so this has to be atomic. bf16/half pair
+// atomics are one instruction per two elements and the contention is only top_k
+// deep, which is why this is cheaper than the round trip it replaces.
+template <typename OUT_T>
+__device__ __forceinline__ void had128_warp_out_acc(const half* __restrict__ in,
+                                                    OUT_T* __restrict__ out,
+                                                    const half* __restrict__ svh,
+                                                    int lane, float w)
+{
+    half4 v = ((const half4*) in)[lane];
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1, d0 = v0 - v1;
+    float s1 = v2 + v3, d1 = v2 - v3;
+    float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
+    shuffle_had_f4x32(h0, h1, h2, h3, lane);
+    half4 sc = ((const half4*) svh)[lane];
+    const float sw = EXL3_HAD128_RSCALE * w;
+    float o0 = h0 * sw * __half2float(__low2half(sc.x));
+    float o1 = h1 * sw * __half2float(__high2half(sc.x));
+    float o2 = h2 * sw * __half2float(__low2half(sc.y));
+    float o3 = h3 * sw * __half2float(__high2half(sc.y));
+    if constexpr (std::is_same<OUT_T, __nv_bfloat16>::value)
+    {
+        __nv_bfloat162* dst = (__nv_bfloat162*) out;
+        atomicAdd(dst + lane * 2,     __floats2bfloat162_rn(o0, o1));
+        atomicAdd(dst + lane * 2 + 1, __floats2bfloat162_rn(o2, o3));
+    }
+    else
+    {
+        __half2* dst = (__half2*) out;
+        atomicAdd(dst + lane * 2,     __floats2half2_rn(o0, o1));
+        atomicAdd(dst + lane * 2 + 1, __floats2half2_rn(o2, o3));
+    }
 }
