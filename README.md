@@ -247,6 +247,53 @@ because the EXL3 input transform is a *block-diagonal* Hadamard over 128-element
 blocks and every split dim here is 128-divisible; `svh` and the output Hadamard
 are linear, so they commute with the all-reduce. Weights land at ~7 GiB/GPU.
 
+### Pin the ranks to the GPUs' socket
+
+Not a plugin setting, but it was worth 10% of TTFT here and it took four rounds
+of chasing a phantom kernel regression to find, so it is written down.
+
+These cards have no peer-to-peer: `cudaDeviceCanAccessPeer` is 0 for every pair,
+so NCCL connects all four ranks `via SHM/direct` and every all-reduce byte goes
+out to host memory and back. On a dual-socket host that makes socket placement
+part of the collective's bandwidth, and the GPUs here report `numa_node = -1` --
+the firmware never tags them -- so Linux puts NCCL's shared-memory buffers on
+whichever socket the process happened to land on. Nothing in the NCCL log
+differs between a good start and a bad one: same four channels, same ring, same
+chunk size.
+
+All-reduce, 8192 x 4096 bf16, three process starts each:
+
+| placement       | run 1 | run 2 | run 3 |
+|-----------------|-------|-------|-------|
+| whatever Linux picks | 31.2 | 27.8 | 37.3 GB/s |
+| pinned to the GPUs' socket | 37.3 | 37.3 | 37.3 |
+| pinned to the far socket | 27.9 | 27.8 | 27.9 |
+
+The all-reduce is 38% of the prefill budget (see *What prefill is bound by*), so
+that 34% swing lands directly on TTFT. GLM-5.3-Flash, 8000 in / 1000 out, TP 4:
+
+| placement | TTFT at 1 | TTFT at 16 | out tok/s at 16 |
+|-----------|-----------|------------|-----------------|
+| unpinned, 6 starts | 778-875 ms (12.5% spread) | 4607-5104 ms | 495-531 |
+| pinned, 2 starts | 777-785 ms (1.1%) | 4590-4591 ms | 529-531 |
+
+So pinning does not only raise the mean by ~6%, it removes the lottery: the
+unpinned worst case is 11% off the pinned figure, and an unpinned A/B has ~12%
+of noise in it, which is enough to invent a regression that is not there.
+
+Find the socket the GPUs are on (`nvidia-smi topo -m` gives the CPU affinity
+when the firmware provides it; otherwise measure it, as above) and pin both CPUs
+and memory to it:
+
+```bash
+docker run --cpuset-cpus=0-29 --cpuset-mems=0 ...   # this host: socket 0
+# or, without docker:
+numactl --cpunodebind=0 --membind=0 vllm serve ...
+```
+
+A host with working GPU P2P, or a single-socket host, does not have this
+problem.
+
 ### MoE throughput
 
 Qwen3.5-35B-A3B (256 experts, top-8, 4-bit, `mcg`), one GPU, greedy decode:
