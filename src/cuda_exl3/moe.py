@@ -32,6 +32,9 @@ _EMPTY_H = torch.empty(0, dtype=torch.half)
 
 # CUDA_EXL3_MOE_FUSE_IN=0/1 forces the fused input transform off or on, for
 # measuring the crossover on a part it has not been measured on.
+_SMS = torch.cuda.get_device_properties(0).multi_processor_count \
+    if torch.cuda.is_available() else 1
+
 _FUSE_IN_ENV = _env.getenv("CUDA_EXL3_MOE_FUSE_IN")
 _FUSE_IN_OVERRIDE = None if not _FUSE_IN_ENV else _FUSE_IN_ENV not in ("0", "", "false")
 
@@ -411,7 +414,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # token-count gate would therefore need a different constant per device,
         # but the padding ratio at the turn is ~2.25 here and lower on GB10, so
         # one conservative ratio is safe on both.
-        fuse_in = xc.dtype == torch.bfloat16 and rows >= 3 * M * T
+        # ...and only where split-k would not have been chosen anyway. Fusing
+        # pins split to 1 (the split path has no fused transform and no A tensor
+        # to fall back on), and split-k exists exactly to fill the machine when
+        # the grid is small -- which is the same small-M corner. Serving proved
+        # the collision: at one token the grid is 128 blocks on 188 SMs, so
+        # pinning split cost 16% of decode throughput at concurrency 1, more than
+        # the fusion was worth anywhere.
+        n_blocks = (2 * I // 128) * max(rows // block_m, 1)
+        fuse_in = (xc.dtype == torch.bfloat16
+                   and rows >= 3 * M * T
+                   and n_blocks >= 2 * _SMS)
         if _FUSE_IN_OVERRIDE is not None:
             fuse_in = _FUSE_IN_OVERRIDE and xc.dtype == torch.bfloat16
         if fuse_in:
