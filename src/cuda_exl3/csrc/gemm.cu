@@ -1281,9 +1281,17 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     // hardware with a different SM count / launch cost.
     int64_t moe_acc_cap = moe_acc_cap_elems();
     int split = 1;
+    // The fused input transform exists only on the unsplit kernel -- the split
+    // path reduces through a separate epilogue that would need its own copy of
+    // it -- and when it is on there is no A tensor at all to fall back to. So
+    // fusing pins split to 1. This is not hypothetical: pick_split splits
+    // exactly when the grid is too small to fill the machine, which is the same
+    // small-M corner the fusion is gated to, and a dummy batch of one token
+    // during cuda-graph capture took the split branch with a null A.
+    const bool fused_a_pin = fuse_x.has_value() && fuse_x->numel();
     float* acc = nullptr;
     int64_t acc_elems = (int64_t) rows * n_total;
-    if (acc_elems <= moe_acc_cap)
+    if (!fused_a_pin && acc_elems <= moe_acc_cap)
         split = pick_split(rows, k, n_total, bits, (int) block_m, true,
                            (int) expert_ids.size(0));
     if (split > 1)
