@@ -56,10 +56,43 @@ reverted in 76598b2): fusing the transform into the GEMM re-ran it once per
 column tile, 16 times over. A phase-separated cooperative kernel computes it
 once, syncs, and every later phase reads it.
 
-Risks to settle before building it: cooperative launches interact badly with
-stream capture in some drivers and vLLM captures decode into a CUDA graph; the
-grid must be resident, which caps occupancy; and it only pays where rows per
-expert is small, so it is an added decode path, not a replacement.
+### Measured before building it
+
+**Cuda-graph capture: fine.** A `grid.sync()` kernel stream-captures and replays
+correctly here, so the design is usable where it would help. That was the risk
+that could have killed it outright.
+
+**The cooperative packaging is a loss on this card, and should not be copied.**
+Three phases over 42 layers, a grid-synced kernel against three ordinary
+launches:
+
+  elements     3 kernels    1 cooperative    per boundary
+    16384       0.324 ms       0.512 ms        -1.5 us
+   262144       0.303          0.518           -1.7 us
+  4194304       1.034          1.354           -2.5 us
+
+A grid barrier costs 1.5-2.5 us *more* than a kernel boundary. Launches are
+cheap, especially inside a graph, while a grid barrier serialises on the slowest
+of ~1500 resident blocks and pins the grid to `resident x SMs`.
+
+This also explains a measurement that had puzzled us: the non-GEMM kernels cost
+1.17 ms per step and cuda graphs did not recover it. That was never boundary
+overhead -- it is the work of writing and reading the intermediates, which a
+cooperative kernel does not avoid either, since its phases communicate through
+global memory (work items are per expert and group, so phase 3 needs all of
+phase 2).
+
+**It may still be right on GB10.** A grid barrier's cost scales with the number
+of resident blocks, and 48 SMs is a quarter of the blocks to synchronise. The
+reported 1.73x may be real there and simply not transfer to a 188-SM part.
+
+**So the transferable idea is the GEMV formulation, not the fusion.** Decode has
+about one row per expert against our 16-row `mma` tile, and the padding is
+33.6 MB per layer of pure traffic against 314.6 MB of weights. Removing it is
+worth roughly 9%, and the access pattern will support it: a gather of 50
+scattered experts runs at 1438 GB/s against a 1451 GB/s contiguous copy, so the
+memory system delivers 98.5% of stream for this pattern and our own 1326 GB/s is
+kernel-side.
 
 ## Recipe-level items, none of which are kernel work
 
