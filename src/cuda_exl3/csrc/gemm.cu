@@ -167,7 +167,7 @@ struct GemmCfg
 // all 188 SMs busy. Unlike shrinking BN it adds blocks without multiplying the
 // number of times A is re-read.
 template <int BITS, int CB, int BM, int BN, int BK, int NWARPS, int STAGES, bool SPLIT,
-          typename OUT_T, int WARP_N_, bool H_ACC>
+          typename OUT_T, int WARP_N_, bool H_ACC, bool FUSE_A = false>
 __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     const half* __restrict__ A,        // (groups, m, k), Hadamard-transformed
     const uint16_t* __restrict__ Bq,   // (k/16, n/16, 16*BITS) trellis
@@ -190,7 +190,16 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     // away entirely.
     const int* __restrict__ moe_sorted_ids,
     const float* __restrict__ moe_weights,
-    int moe_top_k, int moe_m_valid)
+    int moe_top_k, int moe_m_valid,
+    // Fused input transform. When fuse_x is non-null the A operand is not a
+    // pre-transformed tensor but the raw token activations: this kernel gathers
+    // the routed row and applies suh + the 128-block Hadamard on the way into
+    // shared memory. That deletes the (2, rows, hidden) tensor the separate
+    // transform kernel used to write and this kernel used to read back.
+    const __nv_bfloat16* __restrict__ fuse_x,
+    const half* __restrict__ fuse_suh,
+    const int* __restrict__ fuse_sorted_ids,
+    int fuse_top_k, int fuse_m_valid)
 {
     using Cfg = GemmCfg<BITS, CB, BM, BN, BK, NWARPS, STAGES, WARP_N_>;
 
@@ -213,10 +222,11 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     const int kt_begin = SPLIT ? (int) blockIdx.z * kt_per_split : 0;
     const int kt_end = SPLIT ? min(kt_begin + kt_per_split, kt_total) : kt_total;
 
+    int fuse_e = 0;
     // Pick this block's shard, and with it the activation slice to read.
     int grp = 0;
     while (grp + 1 < smap.n_groups && (int) blockIdx.x >= smap.nblk_end[grp]) ++grp;
-    A += (size_t) grp * m * k;
+    if constexpr (!FUSE_A) A += (size_t) grp * m * k;
 
     // MoE: every row of a BM block belongs to the same expert (the caller pads
     // each expert's token run out to a multiple of BM), so the expert -- and
@@ -240,6 +250,7 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
         if (e < 0) return;
         Bq += (size_t) e * b_expert_stride;
         svh += (size_t) e * svh_expert_stride;
+        fuse_e = e;
     }
 
     // ---- global -> shared staging -----------------------------------------
@@ -249,15 +260,60 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
         int4* sh_b = sh + Cfg::SH_A_I4;
 
         // A tile: BM rows x BK halfs, XOR-swizzled so ldmatrix is conflict-free
-#pragma unroll
-        for (int i = t; i < BM * Cfg::A_COLS; i += Cfg::NTHREADS)
+        if constexpr (FUSE_A)
         {
-            int row = i / Cfg::A_COLS;
-            int c = i % Cfg::A_COLS;
-            int grow = m0 + row;
-            int cw = Cfg::A_SWIZZLE ? (c ^ (row & (Cfg::A_COLS - 1))) : c;
-            const int4* src = ((const int4*) A) + (size_t) grow * (k / 8) + k0 / 8 + c;
-            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + cw, src, grow < m);
+            // Transform on the way in. One warp does a whole 128-block per row,
+            // then only the lanes covering this BK slice store their fragment --
+            // lane L holds elements 4L..4L+3, so the slice starting at
+            // (k0 % 128) is held by a contiguous run of BK/4 lanes. Two adjacent
+            // lanes fill one int4, hence the >> 1 and the (lane & 1) half.
+            constexpr int LPS = BK / 4;                 // lanes covering one slice
+            const int sel = (k0 % 128) / BK;
+            const int lo = sel * LPS;
+            const half* suh_row = fuse_suh
+                                + ((size_t) fuse_e * smap.n_groups + grp) * k
+                                + (k0 / 128) * 128;
+            for (int row = warp; row < BM; row += NWARPS)
+            {
+                const int grow = m0 + row;
+                const __nv_bfloat16* src = nullptr;
+                if (grow < m)
+                {
+                    const int idx = fuse_sorted_ids[grow];
+                    if (idx < fuse_m_valid)
+                        src = fuse_x + (size_t) (idx / fuse_top_k) * k + (k0 / 128) * 128;
+                }
+                half4 v;
+                if (src)
+                    v = had128_warp_in_frag<__nv_bfloat16>(src, suh_row, lane);
+                else
+                {
+                    // Padding row, or a row past the live count: the matmul must
+                    // see zeros so the result is zero too.
+                    v.x = __floats2half2_rn(0.f, 0.f);
+                    v.y = v.x;
+                }
+                if (lane >= lo && lane < lo + LPS)
+                {
+                    const int c = (lane - lo) >> 1;
+                    const int cw = Cfg::A_SWIZZLE ? (c ^ (row & (Cfg::A_COLS - 1))) : c;
+                    half* dst = (half*) (sh_a + row * Cfg::A_STRIDE + cw) + (lane & 1) * 4;
+                    *((half4*) dst) = v;
+                }
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int i = t; i < BM * Cfg::A_COLS; i += Cfg::NTHREADS)
+            {
+                int row = i / Cfg::A_COLS;
+                int c = i % Cfg::A_COLS;
+                int grow = m0 + row;
+                int cw = Cfg::A_SWIZZLE ? (c ^ (row & (Cfg::A_COLS - 1))) : c;
+                const int4* src = ((const int4*) A) + (size_t) grow * (k / 8) + k0 / 8 + c;
+                cp_async16_pred(sh_a + row * Cfg::A_STRIDE + cw, src, grow < m);
+            }
         }
 
         // B tiles: KSTEPS x NTILES packed 16x16 trellis tiles
@@ -613,18 +669,20 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
 }
 
 template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_,
-          bool H_ACC = false, int BK = BK_>
+          bool H_ACC = false, int BK = BK_, bool FUSE_A = false>
 void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
             ShardMap smap, cudaStream_t stream, const int* expert_ids = nullptr,
             int64_t b_expert_stride = 0, int64_t svh_expert_stride = 0,
             const int* n_rows = nullptr, const int* moe_sorted_ids = nullptr,
             const float* moe_weights = nullptr, int moe_top_k = 0,
-            int moe_m_valid = 0)
+            int moe_m_valid = 0, const __nv_bfloat16* fuse_x = nullptr,
+            const half* fuse_suh = nullptr, const int* fuse_sorted_ids = nullptr,
+            int fuse_top_k = 0, int fuse_m_valid = 0)
 {
     using Cfg = cuda_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
     auto fn = cuda_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
-                                            WARP_N_, H_ACC>;
+                                            WARP_N_, H_ACC, FUSE_A>;
     raise_smem((const void*) fn, Cfg::SMEM);
     int kt_total = k / BK;
     int kt_per_split = (kt_total + split - 1) / split;
@@ -634,7 +692,9 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
                                                   expert_ids, b_expert_stride,
                                                   svh_expert_stride, n_rows,
                                                   moe_sorted_ids, moe_weights,
-                                                  moe_top_k, moe_m_valid);
+                                                  moe_top_k, moe_m_valid,
+                                                  fuse_x, fuse_suh, fuse_sorted_ids,
+                                                  fuse_top_k, fuse_m_valid);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +822,10 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
                const int* expert_ids = nullptr, int64_t b_expert_stride = 0,
                int64_t svh_expert_stride = 0, const int* n_rows = nullptr,
                const int* moe_sorted_ids = nullptr, const float* moe_weights = nullptr,
-               int moe_top_k = 0, int moe_m_valid = 0)
+               int moe_top_k = 0, int moe_m_valid = 0,
+               const __nv_bfloat16* fuse_x = nullptr, const half* fuse_suh = nullptr,
+               const int* fuse_sorted_ids = nullptr, int fuse_top_k = 0,
+               int fuse_m_valid = 0)
 {
     // fp16 accumulation is opt-in and only used where it can pay for itself: no
     // split-k (which reduces in fp32 anyway) and a batch large enough for the
@@ -793,10 +856,18 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
            owning the top of the range that is a real expert, so that rank runs a full \
            gemm over every surplus block: 206 of 540 at M=2048, 38% of the grid, and   \
            the step waits for it. Reported and diagnosed by @NNNtrance in #1. */       \
-        launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
-                      k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,            \
+        if (fuse_x)                                                               \
+            launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT, true>(A, Bq, C,   \
+                      svh, m, k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,    \
                       expert_ids, b_expert_stride, svh_expert_stride, n_rows,          \
-                      moe_sorted_ids, moe_weights, moe_top_k, moe_m_valid);
+                      moe_sorted_ids, moe_weights, moe_top_k, moe_m_valid,             \
+                      fuse_x, fuse_suh, fuse_sorted_ids, fuse_top_k, fuse_m_valid);    \
+        else                                                                           \
+            launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT, false>(A, Bq, C,  \
+                      svh, m, k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,    \
+                      expert_ids, b_expert_stride, svh_expert_stride, n_rows,          \
+                      moe_sorted_ids, moe_weights, moe_top_k, moe_m_valid,             \
+                      nullptr, nullptr, nullptr, 0, 0);
 
 // BK=64 borrows Marlin's shape: an A row is then exactly 128 B = 32 banks, so the
 // XOR swizzle is conflict-free with no padding at all. It needs k % 64 == 0
@@ -839,7 +910,11 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                    bool split_k = false, int bits_for_split = 0,
                    const int* moe_sorted_ids = nullptr,
                    const float* moe_weights = nullptr,
-                   int moe_top_k = 0, int moe_m_valid = 0)
+                   int moe_top_k = 0, int moe_m_valid = 0,
+                   const __nv_bfloat16* fuse_x = nullptr,
+                   const half* fuse_suh = nullptr,
+                   const int* fuse_sorted_ids = nullptr,
+                   int fuse_top_k = 0, int fuse_m_valid = 0)
 {
 #define VE3_CASE(B_, C_)                                                        \
     if (bits == B_ && cb == C_)                                                 \
@@ -852,7 +927,8 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                                  n_tiles_full, acc, sp_, smap, stream, bm_,     \
                                  expert_ids, b_expert_stride, svh_expert_stride, \
                                  n_rows, moe_sorted_ids, moe_weights, moe_top_k, \
-                                 moe_m_valid);                                   \
+                                 moe_m_valid, fuse_x, fuse_suh, fuse_sorted_ids,  \
+                                 fuse_top_k, fuse_m_valid);                       \
                 if (sp_ > 1)                                                    \
                     launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream,  \
                                            expert_ids, n_rows, bm_,              \
@@ -1106,14 +1182,19 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          at::ScalarType out_dtype,
                          const std::optional<at::Tensor>& sorted_ids,
                          const std::optional<at::Tensor>& topk_weights,
-                         int64_t num_tokens, int64_t top_k)
+                         int64_t num_tokens, int64_t top_k,
+                         const std::optional<at::Tensor>& fuse_x,
+                         const std::optional<at::Tensor>& fuse_suh)
 {
     const at::cuda::OptionalCUDAGuard guard(a_had.device());
     TORCH_CHECK(trellis.is_contiguous() && trellis.dim() == 4,
                 "exl3_moe_gemm: trellis must be contiguous (experts, k/16, n/16, 16*bits)");
     TORCH_CHECK(svh.dim() == 2, "exl3_moe_gemm: svh must be (experts, n)");
 
-    const int k = (int) a_had.size(-1);
+    // With the input transform fused, a_had is empty and k comes from the
+    // trellis; the activations are (tokens, k) and gathered inside the kernel.
+    const bool fused_a = fuse_x.has_value() && fuse_x->numel();
+    const int k = fused_a ? (int) fuse_x->size(-1) : (int) a_had.size(-1);
     const int rows = (int) expert_ids.size(0) * (int) block_m;
     const int n_tiles_full = (int) trellis.size(2);
     const int n_total = n_tiles_full * 16;
@@ -1122,9 +1203,10 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
 
     TORCH_CHECK((int) trellis.size(1) * 16 == k, "exl3_moe_gemm: trellis k mismatch");
     TORCH_CHECK((int) svh.size(1) == n_total, "exl3_moe_gemm: svh n mismatch");
-    TORCH_CHECK(a_had.numel() >= (long long) groups * rows * k,
-                "exl3_moe_gemm: a_had holds ", a_had.numel(), " elements, need ",
-                (long long) groups * rows * k, " for ", rows, " rows");
+    if (!fused_a)
+        TORCH_CHECK(a_had.numel() >= (long long) groups * rows * k,
+                    "exl3_moe_gemm: a_had holds ", a_had.numel(), " elements, need ",
+                    (long long) groups * rows * k, " for ", rows, " rows");
 
     auto opts = at::TensorOptions().dtype(out_dtype).device(a_had.device());
     // Fused combine: the output is per token, not per routed row, and the rows
@@ -1148,6 +1230,27 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     at::Tensor out = fuse_combine ? at::zeros({num_tokens, n_total}, opts)
                                   : at::empty({rows, n_total}, opts);
     const int moe_m_valid = fuse_combine ? (int) (num_tokens * top_k) : 0;
+
+    // Fused input transform: A is the raw token activations and the kernel
+    // gathers and transforms on the way into shared memory, so the caller never
+    // materialises the (groups, rows, k) tensor.
+    const __nv_bfloat16* fx = nullptr;
+    const half* fsuh = nullptr;
+    const int* fsid = nullptr;
+    if (fused_a)
+    {
+        TORCH_CHECK(fuse_x->scalar_type() == at::kBFloat16,
+                    "exl3_moe_gemm: fused input transform needs bf16 activations");
+        TORCH_CHECK(fuse_suh.has_value() && sorted_ids.has_value(),
+                    "exl3_moe_gemm: fused input transform needs suh and sorted_ids");
+        TORCH_CHECK(top_k > 0 && num_tokens > 0,
+                    "exl3_moe_gemm: fused input transform needs num_tokens and top_k");
+        fx = (const __nv_bfloat16*) fuse_x->data_ptr();
+        fsuh = (const half*) fuse_suh->data_ptr();
+        fsid = sorted_ids.has_value() && sorted_ids->numel()
+                   ? sorted_ids->data_ptr<int>() : nullptr;
+    }
+    const int fuse_m_valid = fx ? (int) (num_tokens * top_k) : 0;
 
     ShardMap smap{};
     smap.n_groups = groups;
@@ -1191,7 +1294,7 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
 
     const int64_t b_stride = (int64_t) trellis.size(1) * n_tiles_full * trellis.size(3);
     auto stream = at::cuda::getCurrentCUDAStream();
-    const half* A = (const half*) a_had.data_ptr();
+    const half* A = fused_a ? nullptr : (const half*) a_had.data_ptr();
     const uint16_t* B = (const uint16_t*) trellis.data_ptr();
     const half* S = (const half*) svh.data_ptr();
     const int* eids = expert_ids.data_ptr<int>();
@@ -1201,13 +1304,15 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
         dispatch_gemm<half>(bits, cb, A, B, (half*) out.data_ptr(), S, rows, k, n_total,
                             n_total, 0, n_tiles_full, acc, split, smap, stream, eids,
                             b_stride, n_total, (int) block_m, nrows, false, 0,
-                            moe_sid, moe_w, (int) top_k, moe_m_valid);
+                            moe_sid, moe_w, (int) top_k, moe_m_valid,
+                            fx, fsuh, fsid, (int) top_k, fuse_m_valid);
     else
         dispatch_gemm<__nv_bfloat16>(bits, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
                                      rows, k, n_total, n_total, 0, n_tiles_full, acc,
                                      split, smap, stream, eids, b_stride, n_total,
                                      (int) block_m, nrows, false, 0,
-                                     moe_sid, moe_w, (int) top_k, moe_m_valid);
+                                     moe_sid, moe_w, (int) top_k, moe_m_valid,
+                                     fx, fsuh, fsid, (int) top_k, fuse_m_valid);
     return out;
 }
 

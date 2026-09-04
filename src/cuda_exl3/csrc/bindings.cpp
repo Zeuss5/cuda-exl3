@@ -26,7 +26,9 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          at::ScalarType out_dtype,
                          const std::optional<at::Tensor>& sorted_ids,
                          const std::optional<at::Tensor>& topk_weights,
-                         int64_t num_tokens, int64_t top_k);
+                         int64_t num_tokens, int64_t top_k,
+                         const std::optional<at::Tensor>& fuse_x,
+                         const std::optional<at::Tensor>& fuse_suh);
 at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                       const at::Tensor& sel, const at::Tensor& seqlens,
                       double scale, int64_t v_head_dim, int64_t split_chunk,
@@ -60,7 +62,8 @@ TORCH_LIBRARY(cuda_exl3_C, m)
         "exl3_moe_gemm(Tensor a_had, Tensor trellis, Tensor suh, Tensor svh, "
         "Tensor expert_ids, Tensor n_rows, int[] group_n, int cb, int block_m, "
         "ScalarType out_dtype, Tensor? sorted_ids=None, Tensor? topk_weights=None, "
-        "int num_tokens=0, int top_k=0) -> Tensor");
+        "int num_tokens=0, int top_k=0, Tensor? fuse_x=None, "
+        "Tensor? fuse_suh=None) -> Tensor");
     m.def(
         "exl3_moe_combine(Tensor rows_out, Tensor sorted_ids, Tensor topk_weights, "
         "int num_tokens, Tensor? expert_ids=None, int block_m=0) -> Tensor");

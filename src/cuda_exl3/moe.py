@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 
 TILE = 16
 
+# Placeholder for the unused A operand when the input transform is fused.
+_EMPTY_H = torch.empty(0, dtype=torch.half)
+
 
 # vLLM has two MoE weight-loading protocols and which one runs depends on the
 # version. Older builds call `layer.load_weights(...)` once with every expert
@@ -381,13 +384,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         xc = x.contiguous()
         ops = torch.ops.cuda_exl3_C
 
-        # gate/up: two transforms per routed row, one per shard's suh
-        a13 = torch.empty((2, rows, H), dtype=torch.half, device=x.device)
-        ops.exl3_moe_had_in(xc, a13, layer.w13_suh.data, sorted_ids, expert_ids,
-                            n_rows, block_m, T, M * T)
-        inter = ops.exl3_moe_gemm(a13, layer.w13_trellis.data, layer.w13_suh.data,
-                                  layer.w13_svh.data, expert_ids, n_rows, [I, I],
-                                  layer.exl3_cb, block_m, out_dtype)
+        # gate/up: two transforms per routed row, one per shard's suh. The gemm
+        # does the gather and the transform itself on the way into shared memory,
+        # so the (2, rows, hidden) tensor that used to carry them never exists.
+        # At decode that tensor was almost entirely padding -- block_m rows per
+        # expert where only about one is routed -- so writing it cost far more
+        # than the rows that were actually used.
+        if xc.dtype == torch.bfloat16:
+            inter = ops.exl3_moe_gemm(
+                _EMPTY_H.to(x.device), layer.w13_trellis.data, layer.w13_suh.data,
+                layer.w13_svh.data, expert_ids, n_rows, [I, I], layer.exl3_cb,
+                block_m, out_dtype, sorted_ids, None, M, T, xc, layer.w13_suh.data)
+        else:
+            a13 = torch.empty((2, rows, H), dtype=torch.half, device=x.device)
+            ops.exl3_moe_had_in(xc, a13, layer.w13_suh.data, sorted_ids, expert_ids,
+                                n_rows, block_m, T, M * T)
+            inter = ops.exl3_moe_gemm(a13, layer.w13_trellis.data, layer.w13_suh.data,
+                                      layer.w13_svh.data, expert_ids, n_rows, [I, I],
+                                      layer.exl3_cb, block_m, out_dtype)
 
         # down: SwiGLU folded into the input transform. Doing it separately
         # materialised a (rows, I) tensor that the transform then read straight
