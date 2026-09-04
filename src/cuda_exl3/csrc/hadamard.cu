@@ -92,7 +92,7 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
                                        const int* __restrict__ expert_ids,
                                        const int* __restrict__ n_rows,
                                        int rows, int k, int groups, int block_m,
-                                       int top_k, int m_valid)
+                                       int top_k, int m_valid, bool skip_padding)
 {
     int blocks_per_row = k / 128;
     long long total = (long long) rows * blocks_per_row;
@@ -123,8 +123,12 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
     int idx = sorted_ids ? sorted_ids[row] : row;
     if (idx >= m_valid)
     {
-        // Padding row inside a live block: the gemm does compute this row, so it
-        // needs zeros to carry a zero through.
+        // Padding row. When the gemm skips fetching these -- cp.async zero-fills
+        // a row it does not read -- writing zeros here is traffic nobody
+        // consumes. Both sides take the same decision from the caller and use
+        // the same predicate, sorted_ids[row] against m_valid, so they cannot
+        // disagree; if the gemm is going to read the row, it needs the zeros.
+        if (skip_padding) return;
         for (int g = 0; g < groups; ++g)
             ((half4*) (a_had + (long long) g * rows * k + dst))[lane] =
                 half4{__float2half2_rn(0.f), __float2half2_rn(0.f)};
@@ -142,7 +146,7 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
 void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh,
                      const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                      const at::Tensor& n_rows, int64_t block_m, int64_t top_k,
-                     int64_t m_valid)
+                     int64_t m_valid, bool skip_padding)
 {
     const at::cuda::OptionalCUDAGuard guard(x.device());
     TORCH_CHECK(out.scalar_type() == at::kHalf, "exl3_moe_had_in: out must be float16");
@@ -174,12 +178,12 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
         exl3_moe_had_in_kernel<half><<<(unsigned) blocks, threads, 0, stream>>>(
             (const half*) x.data_ptr(), (half*) out.data_ptr(), (const half*) suh.data_ptr(),
             sids, expert_ids.data_ptr<int>(), nr, rows, k, groups,
-            (int) block_m, (int) top_k, (int) m_valid);
+            (int) block_m, (int) top_k, (int) m_valid, skip_padding);
     else if (x.scalar_type() == at::kBFloat16)
         exl3_moe_had_in_kernel<__nv_bfloat16><<<(unsigned) blocks, threads, 0, stream>>>(
             (const __nv_bfloat16*) x.data_ptr(), (half*) out.data_ptr(),
             (const half*) suh.data_ptr(), sids, expert_ids.data_ptr<int>(), nr, rows, k,
-            groups, (int) block_m, (int) top_k, (int) m_valid);
+            groups, (int) block_m, (int) top_k, (int) m_valid, skip_padding);
     else
         TORCH_CHECK(false, "exl3_moe_had_in: x must be float16 or bfloat16");
     C10_CUDA_KERNEL_LAUNCH_CHECK();

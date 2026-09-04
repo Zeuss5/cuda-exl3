@@ -8,7 +8,7 @@ void exl3_reserve(const at::Tensor& like, int64_t max_tokens, int64_t k, int64_t
 void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh,
                      const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                      const at::Tensor& n_rows, int64_t block_m, int64_t top_k,
-                     int64_t m_valid);
+                     int64_t m_valid, bool skip_padding);
 void exl3_reserve_acc(const at::Tensor& like, int64_t elems);
 void exl3_set_moe_acc_cap(int64_t elems);
 int64_t exl3_get_moe_acc_cap();
@@ -52,7 +52,8 @@ TORCH_LIBRARY(cuda_exl3_C, m)
     m.def("exl3_get_moe_acc_cap() -> int");
     m.def(
         "exl3_moe_had_in(Tensor x, Tensor(a!) out, Tensor suh, Tensor sorted_ids, "
-        "Tensor expert_ids, Tensor n_rows, int block_m, int top_k, int m_valid) -> ()");
+        "Tensor expert_ids, Tensor n_rows, int block_m, int top_k, int m_valid, "
+        "bool skip_padding=False) -> ()");
     m.def(
         "exl3_moe_glu_had_in(Tensor x, Tensor(a!) out, Tensor suh, Tensor expert_ids, "
         "Tensor n_rows, int block_m) -> ()");

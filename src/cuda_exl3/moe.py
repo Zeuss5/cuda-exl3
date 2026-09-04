@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 
 TILE = 16
 
+_SMS = torch.cuda.get_device_properties(0).multi_processor_count \
+    if torch.cuda.is_available() else 1
+
 
 # vLLM has two MoE weight-loading protocols and which one runs depends on the
 # version. Older builds call `layer.load_weights(...)` once with every expert
@@ -381,13 +384,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         xc = x.contiguous()
         ops = torch.ops.cuda_exl3_C
 
+        # A routed block is block_m rows but decode routes about one row per
+        # expert, so most rows are padding carrying zeros. The gemm can skip
+        # fetching them (cp.async zero-fills what it does not read) and then the
+        # transform need not write them. Worth +5 to +6.6% at M = 8 to 64, but a
+        # loss at one or two tokens: there the grid is too small to fill the
+        # machine, so the layer is latency-bound rather than bandwidth-bound and
+        # removing traffic buys nothing while the predicate still costs. Same
+        # grid-size test as elsewhere, and both sides must agree on it.
+        skip_pad = (2 * I // 128) * max(rows // block_m, 1) >= 2 * _SMS
+
         # gate/up: two transforms per routed row, one per shard's suh
         a13 = torch.empty((2, rows, H), dtype=torch.half, device=x.device)
         ops.exl3_moe_had_in(xc, a13, layer.w13_suh.data, sorted_ids, expert_ids,
-                            n_rows, block_m, T, M * T)
+                            n_rows, block_m, T, M * T, skip_pad)
         inter = ops.exl3_moe_gemm(a13, layer.w13_trellis.data, layer.w13_suh.data,
                                   layer.w13_svh.data, expert_ids, n_rows, [I, I],
-                                  layer.exl3_cb, block_m, out_dtype)
+                                  layer.exl3_cb, block_m, out_dtype,
+                                  sorted_ids if skip_pad else None, None, M, T)
 
         # down: SwiGLU folded into the input transform. Doing it separately
         # materialised a (rows, I) tensor that the transform then read straight

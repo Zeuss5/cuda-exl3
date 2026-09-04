@@ -242,6 +242,24 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
         svh += (size_t) e * svh_expert_stride;
     }
 
+    // Which of this thread's rows are real, worked out once. The staging loop
+    // runs k/BK times over the same BM*A_COLS elements and each thread always
+    // draws the same ones, so the test is loop-invariant per thread. Doing it
+    // inline cost a dependent global load per element ahead of every cp.async
+    // (-4% at one token); doing it once in shared needed a barrier before the
+    // pipeline prologue, which cost about as much again at that size. Registers
+    // need neither.
+    constexpr int A_ELEMS = (BM * Cfg::A_COLS + Cfg::NTHREADS - 1) / Cfg::NTHREADS;
+    bool real_row[A_ELEMS];
+#pragma unroll
+    for (int j = 0; j < A_ELEMS; ++j)
+    {
+        const int i = t + j * Cfg::NTHREADS;
+        const int grow = m0 + (i / Cfg::A_COLS);
+        real_row[j] = (i < BM * Cfg::A_COLS) && grow < m
+                      && (!moe_sorted_ids || moe_sorted_ids[grow] < moe_m_valid);
+    }
+
     // ---- global -> shared staging -----------------------------------------
     auto load_stage = [&](int stage, int k0) {
         int4* sh = smem + stage * Cfg::SH_STAGE_I4;
@@ -256,8 +274,15 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
             int c = i % Cfg::A_COLS;
             int grow = m0 + row;
             int cw = Cfg::A_SWIZZLE ? (c ^ (row & (Cfg::A_COLS - 1))) : c;
+            const bool real = real_row[(i - t) / Cfg::NTHREADS];
             const int4* src = ((const int4*) A) + (size_t) grow * (k / 8) + k0 / 8 + c;
-            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + cw, src, grow < m);
+            // A routed block is block_m rows, but decode routes about one row to
+            // each expert, so most rows are padding carrying zeros. cp.async
+            // with a zero source size zero-fills, which is exactly what those
+            // rows must hold, so skip the fetch. At 16 rows per block with one
+            // live row that is 15/16 of this tile's traffic, and the transform
+            // kernel no longer has to write them either.
+            cp_async16_pred(sh_a + row * Cfg::A_STRIDE + cw, src, real);
         }
 
         // B tiles: KSTEPS x NTILES packed 16x16 trellis tiles
@@ -431,7 +456,7 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     {
         int grow = m0 + r;
         if (grow >= m) continue;
-        if (moe_sorted_ids)
+        if (moe_weights)
         {
             const int idx = moe_sorted_ids[grow];
             // Padding rows carry zeros and belong to no token; nothing to add.
@@ -1130,24 +1155,27 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     // Fused combine: the output is per token, not per routed row, and the rows
     // accumulate into it, so it starts at zero. That is one (tokens, n) memset
     // against the (rows, n) tensor plus a whole extra kernel it replaces.
-    const bool fuse_combine = sorted_ids.has_value() && sorted_ids->numel()
-                              && topk_weights.has_value();
+    const bool have_sids = sorted_ids.has_value() && sorted_ids->numel();
+    const bool fuse_combine = have_sids && topk_weights.has_value();
     const int* moe_sid = nullptr;
     const float* moe_w = nullptr;
     at::Tensor w_f32;
-    if (fuse_combine)
+    if (have_sids)
     {
         TORCH_CHECK(sorted_ids->scalar_type() == at::kInt,
                     "exl3_moe_gemm: sorted_ids must be int32");
         TORCH_CHECK(num_tokens > 0 && top_k > 0,
-                    "exl3_moe_gemm: fused combine needs num_tokens and top_k");
+                    "exl3_moe_gemm: sorted_ids needs num_tokens and top_k");
         moe_sid = sorted_ids->data_ptr<int>();
+    }
+    if (fuse_combine)
+    {
         w_f32 = topk_weights->to(at::kFloat).contiguous();
         moe_w = w_f32.data_ptr<float>();
     }
     at::Tensor out = fuse_combine ? at::zeros({num_tokens, n_total}, opts)
                                   : at::empty({rows, n_total}, opts);
-    const int moe_m_valid = fuse_combine ? (int) (num_tokens * top_k) : 0;
+    const int moe_m_valid = have_sids ? (int) (num_tokens * top_k) : 0;
 
     ShardMap smap{};
     smap.n_groups = groups;
