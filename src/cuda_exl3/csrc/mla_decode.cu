@@ -731,6 +731,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
         auto it = cache.find(key);
         if (it == cache.end()) {
             std::pair<int, int> best{B >= 64 ? 512 : 32, 1};
+            float best_ms_report = 0.f;
             if (mla_tuning_enabled() &&
                 at::cuda::currentStreamCaptureStatusMayInitCtx() ==
                     at::cuda::CaptureStatus::None) {
@@ -773,22 +774,27 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 // -- the rows themselves are already in the cache tensor.
                 // CUDA_EXL3_MLA_TUNE_RING overrides the count; 0 restores the
                 // old warm behaviour for A/B.
-                // Rotate only when it can change the answer. If one selection's
-                // rows are a small fraction of L2 they stay resident whatever
-                // else runs, the warm and evicted curves coincide, and rotating
-                // only adds noise -- measured 1.00x either way at batch 1 on a
-                // 128 MB L2, and mixed results at batch 1 on a 24 MB one. The
-                // threshold is an eighth of L2, which turns rotation on exactly
-                // where both machines show the regimes diverging: batch 16 here
-                // (30% of L2, evicted optimum two chunk tiers away at 1.85x) and
-                // batch 4 on a GB10 (33%).
+                // Rotate always, sized so the rows overrun L2 twice over.
+                //
+                // This briefly had a gate -- rotate only when one selection was
+                // at least an eighth of L2 -- on the theory that below that the
+                // rows stay resident whatever else runs. That theory is exactly
+                // what the eviction experiment disproved: at batch 1 a selection
+                // is 8% of a 24 MB L2 and still loses 1.15-1.27x once traffic
+                // streams past it, and in a real step gigabytes do. The gate was
+                // generalised from this card measuring 1.00x either way at batch
+                // 1, which is a different thing entirely -- there the kernel is
+                // latency-bound on split-k merge traffic, not residency-bound.
+                //
+                // Measured with the gate removed: batch 1 goes 1.034x -> 1.007x
+                // of the evicted optimum here, and the gate was costing 15% on a
+                // 24 MB L2, where it switched rotation off at exactly the batch
+                // size that needed it most.
                 std::vector<at::Tensor> sel_ring;
                 if (!many) {
                     const int64_t per_sel = (int64_t) B * topk * D * (kv8 ? 1 : 2);
-                    const int64_t l2 = exl3_dev_l2();
-                    int nsel = per_sel * 8 >= l2
-                             ? (int) ((2.0 * (double) l2) / (double) per_sel) : 0;
-                    if (nsel) nsel = std::min(std::max(nsel, 8), 64);
+                    int nsel = (int) ((2.0 * (double) exl3_dev_l2()) / (double) per_sel);
+                    nsel = std::min(std::max(nsel, 8), 64);
                     const char* e = exl3_env("CUDA_EXL3_MLA_TUNE_RING");
                     if (e && *e) nsel = std::max(0, std::min(atoi(e), 256));
                     sel_ring.reserve(nsel);
@@ -839,6 +845,14 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                     }
                 }
                 cudaEventDestroy(beg); cudaEventDestroy(end);
+                best_ms_report = best_ms * 1000.f / (float) (reps * trials > 0 ? reps : 1);
+            }
+            if (exl3_env("CUDA_EXL3_MLA_TUNE_VERBOSE")) {
+                printf("[cuda-exl3] mla tune B=%d H=%d topk=%d D=%d kv=%s "
+                       "-> chunk=%d shape=%d (%.1f us/call)\n",
+                       B, H, topk, D, kv8 ? "fp8" : "bf16", best.first, best.second,
+                       best_ms_report);
+                fflush(stdout);
             }
             it = cache.emplace(key, best).first;
         }

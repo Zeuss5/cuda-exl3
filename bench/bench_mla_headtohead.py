@@ -157,7 +157,10 @@ def main():
             ceil_us = gather_ceiling(kv, batch, sels)
             ours = bench_ours(kv, q, sels, sl)
             ours8 = bench_ours(kv8, q, sels, sl)
-            theirs = bench_b12x(batch, d, sels)
+            try:
+                theirs = bench_b12x(batch, d, sels)
+            except ImportError:
+                theirs = None   # b12x is the comparison, not a dependency
             gb = batch * TOPK * d / ours8[0] / 1e3
             print(f"{batch:>6d} {ceil_us:>8.1f}u {ours[0]:>8.1f}u {ours8[0]:>8.1f}u "
                   f"{('%.1fu' % theirs[0]) if theirs else '     n/a':>9s} "
