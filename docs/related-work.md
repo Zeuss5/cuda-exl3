@@ -82,11 +82,26 @@ cooperative kernel does not avoid either, since its phases communicate through
 global memory (work items are per expert and group, so phase 3 needs all of
 phase 2).
 
-**It may still be right on GB10.** A grid barrier's cost scales with the number
-of resident blocks, and 48 SMs is a quarter of the blocks to synchronise. The
-reported 1.73x may be real there and simply not transfer to a 188-SM part.
+**And it is not right on GB10 either, once the graph is accounted for.** The
+block-count argument does hold: measured on 48 SMs (#1), a cooperative grid is
+288 blocks against ~1128 here, and *uncaptured* the cooperative arm wins there by
+up to 1.4 us per boundary -- the opposite sign to this card.
 
-**So the transferable idea is the GEMV formulation, not the fusion.** Decode has
+But both of those measurements were taken outside a CUDA graph, and vLLM captures
+decode. Capture removes 59% of the separate-launch arm's overhead and almost none
+of the cooperative arm's, and the sign flips back: +0.23 to +0.32 us per boundary
+on 48 SMs in a graph, equal at bandwidth-bound sizes.
+
+So the honest rule is not about SM count at all. **Inside a CUDA graph a kernel
+boundary is cheap enough that a grid barrier is never worth paying for**, on
+either part. The 1.73x is presumably real uncaptured; it does not survive
+capture, which is the only way decode runs.
+
+**So the transferable idea is the GEMV formulation, not the fusion.** Taken in
+f4987cf, in the cheapest form that captures it: rather than restructuring into a
+GEMV, just stop fetching the padding rows, since cp.async zero-fills a row it is
+not given. Worth +2.0 to +2.2% of decode throughput and -1.2 to -2.6% of TTFT end
+to end. Decode has
 about one row per expert against our 16-row `mma` tile, and the padding is
 33.6 MB per layer of pure traffic against 314.6 MB of weights. Removing it is
 worth roughly 9%, and the access pattern will support it: a gather of 50
