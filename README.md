@@ -862,6 +862,15 @@ without copying its source, and the 2x DGX Spark kit that
 `bench/bench_vs_spark_fat_gemm.py` measures against is built from a checkout the
 user supplies rather than redistributed here.
 
+Two other MIT-licensed projects run EXL3 GLM-5.3-Flash on DGX Sparks --
+`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks` and `vcruz305/vllm-exl3`. No code
+is taken from either. One idea is: `vcruz305/vllm-exl3`'s `p2b_moe.cu` is where
+the observation came from that MoE decode routes about one row to each expert,
+so a 16-row tile is mostly padding -- which is what `f4987cf` acts on, by a
+different mechanism than theirs. **[docs/related-work.md](docs/related-work.md)**
+records what each project does, what was taken, what was measured and rejected,
+and what this plugin already had.
+
 ## Where the time goes
 
 Profiled with the torch profiler and `ncu` (`bench/profile_workload.py`), 8k
