@@ -875,6 +875,51 @@ It costs no VRAM. The padded buffers are transient and reused by the caching
 allocator: peak activation is 1.04 GiB for the MoE model against 1.01 GiB for the
 dense one, and weights land at 17.79 GiB against a 19.58 GiB checkpoint.
 
+## Loading into a dim vLLM has padded
+
+vLLM pads dims that do not divide the tensor-parallel size -- the vocabulary, and
+the head count when a model's heads do not split evenly. EXL3 weights cannot be
+zero-extended, since a trellis is not a dense tensor, but they do not have to be:
+`svh` scales elementwise *after* the output Hadamard, so zeroing it on the pad
+makes those columns exactly zero whatever the trellis behind them holds. The
+decoder is total -- all 65,536 codes decode finite in every codebook, checked
+exhaustively -- so an uninitialised pad cannot turn that zero into a NaN.
+
+**The pad must be whole 128-column Hadamard blocks.** The block mixes across its
+columns before `svh` is applied, so a straddling pad corrupts the real columns
+beside it rather than merely being zero itself. Real output must end on a
+boundary and the padded total must be whole blocks; both are checked per rank,
+and the error says which failed and by how much. In practice that means padding
+constants move from `lcm(64, tp)` to `lcm(128, tp)`.
+
+A padded *input* dim is the mirror case: the producing layer's pad columns are
+already exact zeros, so those input positions carry zeros and `suh` there cannot
+reach the output -- but the row-parallel load must copy what exists and zero the
+rest rather than narrowing past the end of the checkpoint.
+
+Measured by @NNNtrance (#5) on three GB10 nodes, GLM-5.3-Flash at TP=3 with 64
+heads padded to 66, `turboderp/GLM-5.3-Flash-exl3` 4.05bpw full scope against a
+same-day control quantising only the routed experts:
+
+| | full scope | routed experts only | |
+|---|---|---|---|
+| single stream | 75.91 tok/s | 62.39 | **+21.7%** |
+| 8-way aggregate | 197.20 | 175.37 | +12.5% |
+| TTFT single stream | 0.280 s | 0.344 | -18.6% |
+| KV cache | 5,165,289 tok | 4,696,969 | **+10.0%** |
+| memory per rank | 58.3-59.1 GiB | 62.1-62.4 | -3.4 GiB |
+| MMLU (57 x 35) | 86.5 +/- 0.7 | 86.4 +/- 0.7 | equal |
+| draft acceptance | 61.9% | 64.4% | -2.4 pt |
+
+A post-load audit found 285 padded EXL3 sites on the rank that owns the padding,
+every pad a whole number of blocks and exactly zero. The step-time arithmetic
+isolates it: 88.2 -> 70.3 ms per decode step, and tokens per accepted step fell
+3%, which multiplies out to the +21.7% measured.
+
+Quantising the dense path is worth about 18 ms of every decode step there. It is
+also *smaller*: the full-scope checkpoint loads 21% faster and leaves 3.4 GiB
+more per rank, because 4-bit attention and a 6-bit head are less than bf16 ones.
+
 ## Two things chased and settled
 
 **The sparse-indexer logits reservation does not bind at ordinary context.**
