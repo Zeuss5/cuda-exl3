@@ -857,6 +857,22 @@ peak above what the weights and activations already set: measured, the KV pool i
 `=256`, byte for byte, with throughput unchanged. Worth revisiting only if
 serving very long context.
 
+**The KV page size is not costing anything here, but it would with a draft.**
+`_largest_kernel_block_within` returns the *smallest* block a backend advertises
+whenever there is no page budget, and this backend advertises `[64, 256]`, so the
+MLA group is handed 64. Forcing 256 measures slightly worse -- 5,024,972 KV
+tokens against 5,066,556, throughput unchanged -- so there is nothing to recover.
+
+That is worth recording because it is *not* what the same rule does to a
+speculative-decoding draft. On GB10 (#2) the draft's sliding-window group never
+reaches `unify`, takes its backend's smallest block of 16, and then accounts for
+53% of the blocks-per-request divisor while holding 0.6% of the memory; giving
+that group a 256-token page returned 82% more KV pool, +6% throughput at
+concurrency 8 and 20-30% off TTFT. We see none of that because we run no draft
+group. If speculative decoding is ever enabled here, check `blocks per request`
+in the boot log before anything else. Note also that matching the target's MLA
+page is the wrong instinct: at 3,328 their pool fell 7% *below* the 16 baseline.
+
 **The intermittent startup failure is not in this plugin.** Roughly half of
 server starts die during warm-up with
 `tvm.error.InternalError: CUDALaunch Error: CUDA_ERROR_ILLEGAL_ADDRESS`. The
