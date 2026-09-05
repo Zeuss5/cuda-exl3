@@ -844,6 +844,40 @@ It costs no VRAM. The padded buffers are transient and reused by the caching
 allocator: peak activation is 1.04 GiB for the MoE model against 1.01 GiB for the
 dense one, and weights land at 17.79 GiB against a 19.58 GiB checkpoint.
 
+## Two things chased and settled
+
+**The sparse-indexer logits reservation does not bind at ordinary context.**
+vLLM reserves `max(worst_decode_tokens * max_model_len * 4,
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB)` during memory profiling, and the recipe in
+docs/related-work.md reports right-sizing it returning ~26% of the KV pool. That
+is at 1M context, where the reservation runs to gigabytes. At 32k it is 2 MiB of
+decode logits against a 512 MiB flat cap, and the cap never raises the profiler's
+peak above what the weights and activations already set: measured, the KV pool is
+5,066,556 tokens at both `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=512` (default) and
+`=256`, byte for byte, with throughput unchanged. Worth revisiting only if
+serving very long context.
+
+**The intermittent startup failure is not in this plugin.** Roughly half of
+server starts die during warm-up with
+`tvm.error.InternalError: CUDALaunch Error: CUDA_ERROR_ILLEGAL_ADDRESS`. The
+traceback is `vllm/model_executor/layers/mhc.py` -> `kernels/mhc/tilelang.py`
+-> a TileLang JIT kernel -> TVM's CUDA module: no frame of this plugin appears
+in it, and the MHC layer is not something we provide or call.
+
+Two hypotheses were checked and rejected. TileLang's kernel cache guards itself
+with `threading.Lock`, which does nothing across vLLM's four TP worker
+*processes* -- but its publish step is atomic (`os.replace` / `os.rename`, with
+the duplicate-compile collision handled), so a torn artifact is not the
+mechanism. And an illegal address at kernel *launch* rather than at module load
+points at a fault inside the kernel rather than a corrupt one.
+
+There is no switch: `HAS_TILELANG_MHC` is true whenever `tilelang` imports, and
+the `forward_native` fallback is only reachable by making the package
+unimportable. `has_tilelang()` already carries a workaround for tilelang's
+`libcudart_stub.so` shadowing the real cudart and breaking flashinfer's
+all-reduce, so this path is known-fragile in these images. Until it is fixed
+upstream, retry the start; it is not a persistent failure.
+
 ## Not yet done
 
 Multi-node. Bit-exact determinism under split-k (see above).
