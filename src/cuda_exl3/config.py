@@ -97,6 +97,20 @@ class Exl3Config(QuantizationConfig):
         # stop a checkpoint loading, it should just not resolve.
         self.extra_packed_mapping: dict[str, list[str]] = {}
         raw = full_config.get("packed_modules_mapping")
+        # A published checkpoint cannot be edited, and whether the standalone
+        # quantization_config.json is even read depends on whether the inlined
+        # copy carried tensor_storage -- so the same mapping can also be given
+        # as JSON in CUDA_EXL3_PACKED_MAPPING, which always applies and needs no
+        # write access to the weights.
+        env_raw = _env.getenv("CUDA_EXL3_PACKED_MAPPING")
+        if env_raw:
+            try:
+                parsed = json.loads(env_raw)
+                if isinstance(parsed, dict):
+                    raw = {**(raw if isinstance(raw, dict) else {}), **parsed}
+            except ValueError as e:
+                logger.warning("EXL3: CUDA_EXL3_PACKED_MAPPING is not valid JSON "
+                               "(%s); ignoring it", e)
         if isinstance(raw, dict):
             for k, v in raw.items():
                 if isinstance(k, str) and isinstance(v, (list, tuple)) \

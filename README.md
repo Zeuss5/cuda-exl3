@@ -223,6 +223,7 @@ Worth setting in a deployment:
 | `CUDA_EXL3_ONLINE_BITS` | bit rate for on-the-fly quantization of an unquantized checkpoint |
 | `CUDA_EXL3_ONLINE_CACHE` | directory to keep the result of that, so it happens once |
 | `CUDA_EXL3_DEBUG_NAMES` | log which modules resolve to EXL3 vs unquantized |
+| `CUDA_EXL3_PACKED_MAPPING` | JSON of extra packed-module fusions, e.g. `{"in_proj_qkvbfg_a": ["qkv_proj", "conv1d"]}`, for a fusion the model class does not declare. Same effect as `packed_modules_mapping` in the checkpoint's quantization config, but applies to a published checkpoint you cannot edit |
 
 Overrides for the autotuners. Each defaults to searching; setting one pins it,
 which is mostly useful for bisecting a regression:
