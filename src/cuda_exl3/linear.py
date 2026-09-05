@@ -86,11 +86,39 @@ class Exl3LinearMethod(LinearMethodBase):
                 f"EXL3 {self.prefix}: input_size_per_partition={k} is not a multiple "
                 f"of {HAD_BLOCK}; this tensor-parallel split would break the Hadamard."
             )
-        if is_vocab and output_size != sum(i.out_features for i in self.infos):
-            raise ValueError(
-                f"EXL3 {self.prefix}: vLLM padded the vocab to {output_size} but the "
-                f"checkpoint stores {sum(i.out_features for i in self.infos)}; "
-                "EXL3 weights cannot be zero-extended."
+        # A padded output dim (vLLM pads the vocab so it shards evenly, and a
+        # padded head count does the same to q_b/o_proj). EXL3 weights cannot be
+        # zero-extended -- a trellis is not a dense tensor -- but they do not
+        # have to be: `svh` scales elementwise *after* the output Hadamard, so
+        # zeroing it on the pad makes those columns exactly zero whatever the
+        # trellis behind them holds. The decoder is total and bounded over all
+        # 65,536 codes (checked exhaustively: no code decodes to inf or NaN), so
+        # an uninitialised pad cannot produce a NaN through the zero.
+        #
+        # The condition is that the pad must not share a 128-column Hadamard
+        # block with real output: the block mixes across its columns before svh
+        # is applied, so a straddling pad would corrupt the real columns beside
+        # it rather than merely being zero itself. Real output therefore has to
+        # end on a block boundary.
+        self.n_real = sum(i.out_features for i in self.infos)
+        self.out_pad = 0
+        if is_vocab and output_size != self.n_real:
+            pad = output_size - self.n_real
+            if pad < 0 or self.n_real % HAD_BLOCK or output_size % HAD_BLOCK:
+                raise ValueError(
+                    f"EXL3 {self.prefix}: vLLM padded the vocab to {output_size} but "
+                    f"the checkpoint stores {self.n_real}, and the pad is not a whole "
+                    f"number of {HAD_BLOCK}-column Hadamard blocks "
+                    f"({self.n_real} % {HAD_BLOCK} = {self.n_real % HAD_BLOCK}, "
+                    f"{output_size} % {HAD_BLOCK} = {output_size % HAD_BLOCK}). "
+                    "A straddling pad corrupts the real columns sharing its block. "
+                    "Pad the vocab to a multiple of the block size instead."
+                )
+            self.out_pad = pad
+            logger.warning(
+                "EXL3 %s: vocab padded %d -> %d; the %d pad columns are %d whole "
+                "Hadamard blocks and are zeroed through svh.",
+                self.prefix, self.n_real, output_size, pad, pad // HAD_BLOCK,
             )
 
         # The layer's shard count need not equal the checkpoint tensor count: a
@@ -143,8 +171,10 @@ class Exl3LinearMethod(LinearMethodBase):
             weight_loader=loaders["suh"],
         )
         svh = ChannelQuantScaleParameter(
-            data=torch.empty(n_total, dtype=torch.half,
-                             device=torch.cuda.current_device()),
+            # Zeroed, not empty, when there is a pad: the loader never writes the
+            # pad columns and svh = 0 is exactly what makes them vanish.
+            data=(torch.zeros if self.out_pad else torch.empty)(
+                n_total, dtype=torch.half, device=torch.cuda.current_device()),
             output_dim=0,
             weight_loader=loaders["svh"],
         )

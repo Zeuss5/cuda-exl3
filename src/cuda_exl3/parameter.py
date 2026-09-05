@@ -60,4 +60,16 @@ class Exl3SuhParameter(PerTensorScaleParameter):
         # rank's input size is a multiple of 128.
         assert self.data.shape[0] == 1, "row-parallel EXL3 layers are never fused"
         shard_size = self.data.shape[1]
-        self.data[0].copy_(loaded_weight.narrow(0, self.tp_rank * shard_size, shard_size))
+        start = self.tp_rank * shard_size
+        # The layer's input dim may be padded (a padded head count upstream makes
+        # o_proj wider than the checkpoint), in which case the last rank's slice
+        # runs past the end of the checkpoint tensor. Copy what exists and leave
+        # the rest at zero: those input positions carry exact zeros, because the
+        # producing layer's pad columns were zeroed through its own svh, so what
+        # suh holds there cannot reach the output. Zero rather than garbage so a
+        # NaN cannot be introduced by a value nothing should read.
+        avail = max(0, min(shard_size, loaded_weight.shape[0] - start))
+        if avail < shard_size:
+            self.data[0].zero_()
+        if avail > 0:
+            self.data[0, :avail].copy_(loaded_weight.narrow(0, start, avail))
