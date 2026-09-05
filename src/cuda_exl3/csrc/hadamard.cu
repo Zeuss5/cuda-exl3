@@ -94,17 +94,20 @@ __global__ void exl3_moe_had_in_kernel(const IN_T* __restrict__ x,
                                        int rows, int k, int groups, int block_m,
                                        int top_k, int m_valid, bool skip_padding)
 {
-    int blocks_per_row = k / 128;
-    long long total = (long long) rows * blocks_per_row;
-    int warps_per_block = blockDim.x / 32;
-    long long w = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
-    if (w >= total) return;
-
-    int row = (int) (w / blocks_per_row);
+    // Row and 128-block come straight from the grid. They used to be recovered
+    // from a flat warp index with a 64-bit divide and modulo -- and there is no
+    // hardware 64-bit integer divide, so that was a software sequence per warp,
+    // once for every (row, 128-block) pair: 65k of them at M=256 and 1.1M at a
+    // 2048-token prefill chunk. The kernel was reading and writing at 57% of
+    // what the device delivers with nothing else to blame.
+    const int blocks_per_row = k / 128;
+    const int warps_per_block = blockDim.x / 32;
+    const int row = (int) blockIdx.x;
+    const int blk = (int) blockIdx.y * warps_per_block + (int) (threadIdx.x >> 5);
+    if (row >= rows || blk >= blocks_per_row) return;
     // Surplus rows from the worst-case padding are never read by the gemm
     // (it retires those blocks on the same count), so skip them entirely.
     if (n_rows && row >= *n_rows) return;
-    int blk = (int) (w % blocks_per_row);
     int lane = threadIdx.x & 31;
     long long dst = (long long) row * k + blk * 128;
 
@@ -167,20 +170,24 @@ void exl3_moe_had_in(const at::Tensor& x, at::Tensor& out, const at::Tensor& suh
                 "exl3_moe_had_in: expert_ids covers ", expert_ids.numel() * block_m,
                 " rows but sorted_ids has ", rows);
 
-    long long total_warps = (long long) rows * (k / 128);
+    // One block per (row, chunk of 128-blocks): the kernel then reads row and
+    // block straight from the grid instead of recovering them from a flat warp
+    // index with a 64-bit divide.
     const int threads = 256;
-    long long blocks = (total_warps + threads / 32 - 1) / (threads / 32);
+    const int bpr = k / 128;
+    dim3 blocks((unsigned) rows,
+                (unsigned) ((bpr + threads / 32 - 1) / (threads / 32)));
     auto stream = at::cuda::getCurrentCUDAStream();
     const int* nr = n_rows.numel() ? n_rows.data_ptr<int>() : nullptr;
     const int* sids = sorted_ids.numel() ? sorted_ids.data_ptr<int>() : nullptr;
 
     if (x.scalar_type() == at::kHalf)
-        exl3_moe_had_in_kernel<half><<<(unsigned) blocks, threads, 0, stream>>>(
+        exl3_moe_had_in_kernel<half><<<blocks, threads, 0, stream>>>(
             (const half*) x.data_ptr(), (half*) out.data_ptr(), (const half*) suh.data_ptr(),
             sids, expert_ids.data_ptr<int>(), nr, rows, k, groups,
             (int) block_m, (int) top_k, (int) m_valid, skip_padding);
     else if (x.scalar_type() == at::kBFloat16)
-        exl3_moe_had_in_kernel<__nv_bfloat16><<<(unsigned) blocks, threads, 0, stream>>>(
+        exl3_moe_had_in_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
             (const __nv_bfloat16*) x.data_ptr(), (half*) out.data_ptr(),
             (const half*) suh.data_ptr(), sids, expert_ids.data_ptr<int>(), nr, rows, k,
             groups, (int) block_m, (int) top_k, (int) m_valid, skip_padding);
