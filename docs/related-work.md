@@ -154,3 +154,28 @@ kernel-side.
 Both zero-pad GLM's 512-wide latent into the 576-wide GLM_NSA geometry to
 satisfy an existing sparse kernel. Ours runs `head_dim = 512` natively and is
 1.6-2.4x faster than b12x, which refuses 512 outright.
+
+## What is left in the MoE stage, and its ceiling
+
+`exl3_moe_had_in` was the last sub-roofline kernel in the stage (#5): 37-57% of
+achievable bandwidth on GB10, 57% here. Removing a 64-bit divide from its index
+math (a47da6e) took it to 63%, worth 10-18%.
+
+The rest is not bandwidth. Splitting the kernel against the same gather-and-write
+traffic with no transform at all:
+
+    M     live rows   had_in   gather only   transform   had_in GB/s   floor GB/s
+    64          512   20.4us        12.3us       8.1us           412          684
+    256        2048   40.1us        17.8us      22.3us           836         1886
+    1024       8192  127.9us        86.9us      41.0us          1049         1545
+
+The 128-point Hadamard is 32-56% of the kernel, so it is about half memory and
+half ALU, and the transform is five rounds of `__shfl_xor` over 32 lanes holding
+four elements each -- already close to minimal for a 128-point butterfly in that
+layout.
+
+That bounds the opportunity rather than opening one. A *free* transform would
+take M=256 from 40.1 to 17.8 us, and this kernel is 4% of a prefill chunk, so the
+ceiling on any further work here is about 2% of prefill and it is not reachable.
+Recorded so the next person does not rediscover the 57% figure and assume it is
+traffic to be removed.
