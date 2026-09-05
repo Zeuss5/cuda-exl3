@@ -210,11 +210,41 @@ everywhere, slower for small batches and narrow layers.
 
 ## Environment variables
 
+Every name also resolves under its old `VLLM_EXL3_` spelling, with a deprecation
+warning.
+
+Worth setting in a deployment:
+
 | variable | meaning |
 |---|---|
+| `CUDA_EXL3_TUNE_CACHE` | directory for the persisted MLA tuner cache. Unset, every process re-tunes: ~11 shapes before a server is up and more as the batch size moves, tens of milliseconds each. Keyed by device name and format tag in the filename, appended lock-free, safe to share between ranks and across restarts |
 | `CUDA_EXL3_BACKEND` | `native` (default), or `exllamav3` to run upstream's kernels as an oracle |
 | `CUDA_EXL3_DETERMINISTIC` | `1` disables split-k for bit-exact output |
+| `CUDA_EXL3_ONLINE_BITS` | bit rate for on-the-fly quantization of an unquantized checkpoint |
+| `CUDA_EXL3_ONLINE_CACHE` | directory to keep the result of that, so it happens once |
 | `CUDA_EXL3_DEBUG_NAMES` | log which modules resolve to EXL3 vs unquantized |
+
+Overrides for the autotuners. Each defaults to searching; setting one pins it,
+which is mostly useful for bisecting a regression:
+
+| variable | meaning |
+|---|---|
+| `CUDA_EXL3_MLA_TUNE` | `0` disables MLA decode tuning and takes the fallback shape |
+| `CUDA_EXL3_MOE_BLOCK_M` | pin the MoE row-block size instead of using the ladder |
+| `CUDA_EXL3_MOE_ACC_MAX_ELEMS` | cap on the MoE split-k accumulator; `0` forces the unsplit path |
+| `CUDA_EXL3_FORCE_BM` | pin the dense GEMM's row-block size |
+| `CUDA_EXL3_AUTOTUNE` | `0` disables the dense GEMM search |
+| `CUDA_EXL3_SPLIT_TARGET`, `CUDA_EXL3_SPLIT_BUDGET` | split-k wave and accumulator targets |
+
+Measurement knobs. These exist because comparing two *builds* produced most of
+the wrong numbers in this project's history -- forcing both arms inside one
+binary is the way to A/B a kernel change:
+
+| variable | meaning |
+|---|---|
+| `CUDA_EXL3_MOE_SKIP_PAD` | `0`/`1` forces the MoE padding-row skip off or on |
+| `CUDA_EXL3_MLA_TUNE_VERBOSE` | `1` logs each tune: shape, chosen chunk, ring size, cost |
+| `CUDA_EXL3_MLA_TUNE_RING` | selection-ring size for the tuner's eviction model; `0` restores warm-cache timing |
 
 ## Tests
 
