@@ -107,9 +107,22 @@ class Exl3LinearMethod(LinearMethodBase):
                 self.prefix, expected, output_size,
             )
 
+        # suh is (num_shards, k). The v2 loader knows that; the v1 path does not,
+        # and some vLLM versions have no weight_loader_v2 on ReplicatedLinear --
+        # the indexer's wq_b is one -- so a bare (k,) arrives and the copy
+        # asserts. Place it in row 0 when the shapes say that is what happened,
+        # and delegate in every other case so nothing else changes.
+        def _suh_loader(param, loaded_weight, *args, **kwargs):
+            dst = param.data
+            if (dst.dim() == 2 and dst.shape[0] == 1
+                    and tuple(loaded_weight.shape) == tuple(dst.shape[1:])):
+                dst[0].copy_(loaded_weight)
+                return
+            return weight_loader(param, loaded_weight, *args, **kwargs)
+
         loaders = (
             self._vocab_loaders(layer) if is_vocab else {"trellis": weight_loader,
-                                                         "suh": weight_loader,
+                                                         "suh": _suh_loader,
                                                          "svh": weight_loader}
         )
 
