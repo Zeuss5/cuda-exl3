@@ -1003,8 +1003,29 @@ Profiled with the torch profiler and `ncu` (`bench/profile_workload.py`), 8k
 context on one GPU:
 
 * **Prefill is 82% this GEMM**, running at ~292 TFLOPS -- about 71% of the fp16
-  compute peak. That is roughly what cuBLAS achieves on the same shapes, while
-  reading 2.9x fewer bytes.
+  compute peak, while reading 2.9x fewer bytes.
+
+  This used to say that was "roughly what cuBLAS achieves on the same shapes".
+  It is not, and the claim is withdrawn. Measured at 4096x4096 and 4096x11008,
+  the GEMM alone against `torch.matmul` bf16 on the same shapes:
+
+  | bits | M | this GEMM | cuBLAS | |
+  |---|---|---|---|---|
+  | 4 | 2048 | 290 TFLOPS | 352 | 1.22x slower |
+  | 4 | 8192 | 324 | 370 | 1.14x |
+  | 6 | 2048 | 277 | 353 | 1.27x |
+  | 6 | 8192 | 320 | 388 | 1.21x |
+
+  Adding the input transform, the whole dense path is 1.25-1.55x slower than
+  bf16 above about M=256. **Below it the trellis wins**, because there the layer
+  is bandwidth-bound and 4-6 bits of weight beat 16. The crossover is near
+  M=64-256 on this card.
+
+  That matters for a full-scope checkpoint, where attention and the head are
+  EXL3 too: it is a large decode win and a small prefill loss. Measured on GB10
+  (#5), the dense stage went -21.0 ms at decode and +17.3 ms at a 1792-token
+  prefill chunk. If a deployment is prefill-dominated, dense EXL3 is the wrong
+  trade and only the routed experts should be quantized.
 * **Decode at 8k context** (c=16) splits ~60% GEMM, ~25% attention, ~8% GDN. The
   GEMM there is at 84-98% of the memory-bandwidth limit.
 
