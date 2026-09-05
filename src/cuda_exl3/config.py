@@ -25,7 +25,14 @@ CB_3INST = 0
 CB_MCG = 1
 CB_MUL1 = 2
 
+# CUDA_EXL3_DEBUG_NAMES=1 logs every module's resolution. At warning level on
+# purpose: it is opt-in, and logger.info does not reach vLLM's default log
+# level, so at info it printed nothing and looked broken (reported in #5). The
+# running tallies are the point -- a mapping that silently leaves half the
+# attention stack in bf16 shows up as a bf16 count that keeps climbing.
 _DEBUG = bool(_env.getenv("CUDA_EXL3_DEBUG_NAMES"))
+_resolved: list[str] = []
+_unresolved: list[str] = []
 
 # Wrapper segments that different stacks nest in different orders.
 _WRAPPER_SEGMENTS = frozenset({"model", "language_model"})
@@ -450,6 +457,11 @@ class Exl3Config(QuantizationConfig):
 
         if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
             if infos is not None:
+                if _DEBUG:
+                    _resolved.append(prefix)
+                    logger.warning("EXL3: %s -> EXL3 (%d shard%s)  [%d exl3 / %d bf16]",
+                                   prefix, len(infos), "" if len(infos) == 1 else "s",
+                                   len(_resolved), len(_unresolved))
                 return Exl3LinearMethod(self, infos, prefix)
             # A linear layer with no EXL3 tensors is genuinely unquantized in
             # this checkpoint (e.g. the bf16 vision tower, or a checkpoint that
@@ -473,10 +485,12 @@ class Exl3Config(QuantizationConfig):
                         )
                         return Exl3OnlineLinearMethod(self, prefix, bits)
                     if _DEBUG:
-                        logger.info("EXL3 online: %s shape %sx%s unsupported",
+                        logger.warning("EXL3 online: %s shape %sx%s unsupported",
                                     prefix, k, n)
                 if _DEBUG:
-                    logger.info("EXL3: %s -> unquantized", prefix)
+                    _unresolved.append(prefix)
+                    logger.warning("EXL3: %s -> unquantized  [%d exl3 / %d bf16]",
+                                   prefix, len(_resolved), len(_unresolved))
                 return UnquantizedLinearMethod()
             return None
 
