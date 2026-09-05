@@ -89,3 +89,32 @@ def test_the_alignment_rule(n_real, padded, ok):
                 and n_real % HAD_BLOCK == 0
                 and padded % HAD_BLOCK == 0)
     assert accepted == ok
+
+
+def test_vocab_loaders_fill_a_prefix_when_the_rank_is_padded():
+    """The head's loaders must write the real rows and leave the pad.
+
+    They used to `copy_` the checkpoint slice into the whole parameter, which is
+    a shape mismatch the moment the parameter is the padded per-rank width --
+    the gate would pass and the load would then fail. Simulated here at the
+    shapes GLM-5.3-Flash produces at TP=3 with padding_size=384.
+    """
+    TILE = 16
+    real_rows, padded_rows = 51456, 51712       # rank 2: 402 x 128 real, 2 blocks pad
+    assert real_rows % HAD_BLOCK == 0 and padded_rows % HAD_BLOCK == 0
+
+    svh = torch.zeros(padded_rows, dtype=torch.half)
+    ckpt_svh = torch.arange(154880, dtype=torch.half)
+    start = 2 * 51712
+    n = real_rows
+    svh[:n].copy_(ckpt_svh.narrow(0, start, n))
+    assert torch.equal(svh[:n], ckpt_svh[start:start + n])
+    assert torch.all(svh[n:] == 0), "pad svh must stay zero"
+
+    k_tiles = 4096 // TILE
+    trellis = torch.zeros((k_tiles, padded_rows // TILE, 64), dtype=torch.int16)
+    ckpt_tr = torch.ones((k_tiles, 154880 // TILE, 64), dtype=torch.int16)
+    nt = n // TILE
+    trellis[:, :nt].copy_(ckpt_tr.narrow(1, start // TILE, nt))
+    assert torch.all(trellis[:, :nt] == 1)
+    assert trellis[:, nt:].shape[1] == (padded_rows - real_rows) // TILE == 16

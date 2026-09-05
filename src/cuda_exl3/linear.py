@@ -218,14 +218,21 @@ class Exl3LinearMethod(LinearMethodBase):
             si = layer.shard_indices
             return si.org_vocab_start_index, si.org_vocab_end_index
 
+        # This rank's slice of the *original* vocab. When vLLM pads the vocab so
+        # it shards evenly, the parameter is the padded per-rank width while the
+        # checkpoint only has the real rows, so both loaders fill a prefix and
+        # leave the pad -- svh zeroed at allocation, which is what makes the pad
+        # columns vanish, and the trellis behind them never read for a value.
         def load_trellis(param, loaded_weight):
             start, end = vocab_range()
-            lw = loaded_weight.narrow(1, start // TILE, (end - start) // TILE)
-            param.data.copy_(lw)
+            n = (end - start) // TILE
+            lw = loaded_weight.narrow(1, start // TILE, n)
+            param.data[:, :n].copy_(lw)
 
         def load_svh(param, loaded_weight):
             start, end = vocab_range()
-            param.data.copy_(loaded_weight.narrow(0, start, end - start))
+            n = end - start
+            param.data[:n].copy_(loaded_weight.narrow(0, start, n))
 
         def load_suh(param, loaded_weight):
             # input (hidden) dim is never vocab-sharded
