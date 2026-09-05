@@ -63,6 +63,7 @@
 #include <cuda_fp8.h>
 #include <type_traits>
 #include <map>
+#include <string>
 #include <algorithm>
 #include <vector>
 
@@ -669,9 +670,64 @@ namespace cuda_exl3 {
 // one. So time the candidates once per shape and remember the winner.
 namespace {
 
+// Where a persisted tuner cache lives, or empty if CUDA_EXL3_TUNE_CACHE is unset.
+//
+// The device name and a format tag go in the *filename*, so a different card or
+// a changed candidate grid cannot read another's entries: no header to parse and
+// no way to mix them. Bump TUNE_TAG whenever the search space changes -- a stale
+// entry is still a *valid* config (chunk and shape are only parameters, and the
+// kernel is correct for any of them), so the cost of missing a bump is a slower
+// pick, not a wrong answer.
+#define TUNE_TAG "v1"
+std::string mla_tune_cache_file() {
+    const char* dir = exl3_env("CUDA_EXL3_TUNE_CACHE");
+    if (!dir || !*dir) return {};
+    int dev = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&dev) != cudaSuccess) return {};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return {};
+    std::string name(prop.name);
+    for (char& c : name)
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
+            c = '_';
+    return std::string(dir) + "/mla-tune-" TUNE_TAG "-" + name + ".txt";
+}
+
+// The map is process-local, so without this every boot re-tunes and every new
+// batch shape costs a tune at runtime -- measured on a GB10 as 11 events before
+// the server is up and more as B moves, ~15 ms each, which is what pollutes the
+// first rounds of a serving A/B (@NNNtrance, #2). Persisting makes it a one-off
+// per (device, build).
 std::map<uint64_t, std::pair<int, int>>& mla_tune_cache() {
-    static std::map<uint64_t, std::pair<int, int>> c;
+    static std::map<uint64_t, std::pair<int, int>> c = [] {
+        std::map<uint64_t, std::pair<int, int>> m;
+        const std::string path = mla_tune_cache_file();
+        if (path.empty()) return m;
+        FILE* f = fopen(path.c_str(), "r");
+        if (!f) return m;
+        unsigned long long k; int chunk, wide;
+        while (fscanf(f, "%llu %d %d", &k, &chunk, &wide) == 3)
+            if (chunk > 0 && wide > 0) m[(uint64_t) k] = {chunk, wide};
+        fclose(f);
+        if (exl3_env("CUDA_EXL3_MLA_TUNE_VERBOSE"))
+            printf("[cuda-exl3] mla tune cache: %zu entries from %s\n",
+                   m.size(), path.c_str());
+        return m;
+    }();
     return c;
+}
+
+// Appended one short line at a time. O_APPEND is atomic on POSIX for writes this
+// small, so the tensor-parallel ranks share one file without a lock; a duplicate
+// key from two ranks is harmless, since either is a config the search could have
+// picked and the last one read simply wins.
+void mla_tune_cache_store(uint64_t key, std::pair<int, int> v) {
+    const std::string path = mla_tune_cache_file();
+    if (path.empty()) return;
+    FILE* f = fopen(path.c_str(), "a");
+    if (!f) return;
+    fprintf(f, "%llu %d %d\n", (unsigned long long) key, v.first, v.second);
+    fclose(f);
 }
 
 // Decode batches are small and the optimum moves between them, so they are
@@ -930,6 +986,7 @@ at::Tensor mla_decode(const at::Tensor& q, const at::Tensor& kv,
                 fflush(stdout);
             }
             it = cache.emplace(key, best).first;
+            mla_tune_cache_store(key, best);
         }
         if (chunk <= 0) chunk = it->second.first;
         if (wide <= 0) wide = it->second.second;
