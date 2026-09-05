@@ -92,6 +92,17 @@ class Exl3Config(QuantizationConfig):
         self.default_bits = full_config.get("bits")
         self.codebook_name = full_config.get("codebook", "mul1")
 
+        # Fusions the model class does not declare, supplied by the checkpoint.
+        # See _candidate_names. Read defensively: a malformed entry should not
+        # stop a checkpoint loading, it should just not resolve.
+        self.extra_packed_mapping: dict[str, list[str]] = {}
+        raw = full_config.get("packed_modules_mapping")
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(k, str) and isinstance(v, (list, tuple)) \
+                        and all(isinstance(x, str) for x in v):
+                    self.extra_packed_mapping[k] = list(v)
+
         storage = full_config.get("tensor_storage")
         if not storage:
             # vLLM hands us the summary block inlined into config.json, which
@@ -337,8 +348,20 @@ class Exl3Config(QuantizationConfig):
         """
         out: list[list[str]] = [[prefix]]
 
+        # vLLM fills packed_modules_mapping from the *model class*, so a fusion
+        # the model does not declare -- or declares under a different name than
+        # the checkpoint used -- cannot be resolved. A checkpoint may therefore
+        # carry supplementary entries of its own in its quantization config:
+        #
+        #   "packed_modules_mapping": {"in_proj_qkvbfg_a": ["qkv_proj", ...]}
+        #
+        # so a fusion peculiar to one model travels with the weights instead of
+        # requiring a patch to the model file. Checkpoint entries are merged
+        # under, never over, whatever the model declared.
         base, _, last = prefix.rpartition(".")
-        for packed_name, sub_names in self.packed_modules_mapping.items():
+        merged = dict(self.extra_packed_mapping)
+        merged.update(self.packed_modules_mapping)
+        for packed_name, sub_names in merged.items():
             if last == packed_name:
                 out.append([f"{base}.{s}" if base else s for s in sub_names])
 
