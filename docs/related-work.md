@@ -346,3 +346,41 @@ The KDA state is large enough to drive the attention block size, so anything
 that shrinks it 8x moves the whole page layout. That is what makes it worth
 revisiting where memory actually binds -- a 121.6 GiB unified Spark, or long
 context, where `#5`'s own TP=3 arm had 0.73 GiB left for KV. It is not this box.
+
+### Closed on both parts, at both ends
+
+`#5` re-ran the ruler on their three-node mesh and the item closes there too,
+with both of their original numbers corrected:
+
+* **Decode is latency-bound there as well, but the floor is five times ours.**
+  Flat at 72-85 us from 8 B to 32 KiB (8 KB: 74.7 us, 64 KB: 86.4 us) against
+  13.2 / 20.6 us here. Same shape, different fabric -- their collectives cross
+  an RDMA NIC and a host-staged plugin, ours a PCIe switch. At ~105 collectives
+  per decode step that fixed cost alone is ~7.9 ms of a 72-99 ms step, so the
+  lever there is the transport plugin's per-message latency, not a collective
+  kernel.
+* **Prefill is at the wire.** 16 MiB reaches 20.4 GB/s of bus bandwidth against
+  a measured 20.8 GB/s pair link -- **98%**. Their "28% of 50 GB/s" was stale
+  twice over: the 50 GB/s pair capacity had been retracted (the real ceiling is
+  PCIe Gen5 x4 per NIC) and the 13.9 GB/s had moved with their plugin patches.
+
+So the ranked-first prefill target dissolves, and the decode end belongs to
+their transport rather than to any kernel either of us would write.
+
+**One of their findings does not transfer, which is worth recording.** They see
+`NCCL_MAX_NCHANNELS=8` as a wash at decode sizes but decisive in the
+128 KiB-16 MiB band -- up to **11x at 1 MiB** (275 us against 1,388 us) -- which
+explains why their 4-6 stream runs lose 8-10% without it while 1 and 8 streams
+do not move. Swept here at default / 8 / 16 over the same band:
+
+    bytes        default      =8      =16
+    131072         34.3      34.0     33.7
+    524288         60.9      61.4     61.1
+    2097152       139.2     139.4    139.4
+    8388608       427.0     427.8    427.3
+    16777216      807.2     806.2    806.3
+
+Identical within noise everywhere. NCCL's default channel count is already right
+over a PCIe switch, so that knob is theirs alone and its mechanism is the
+multi-NIC mesh rather than anything generic. Both parts agree on `NCCL_PROTO`:
+auto beats every forced setting.
