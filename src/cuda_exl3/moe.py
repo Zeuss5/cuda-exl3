@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEM
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 from vllm.model_executor.utils import set_weight_attrs
 from cuda_exl3 import env as _env
+from cuda_exl3 import ops as _ops
 
 logger = init_logger(__name__)
 
@@ -424,6 +425,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # row by the routing weight and accumulates it into the token's row, so
         # there is no (rows, H) tensor and no combine kernel. That kernel ran one
         # block per token -- eight blocks at decode -- and was pure latency.
+        #
+        # That epilogue accumulates with atomics, so the order in which a
+        # token's top-k rows are summed varies run to run and the output is
+        # reproducible in value but not bit-exact -- the same trade split-k
+        # makes on the dense path. CUDA_EXL3_DETERMINISTIC promises bit-exact
+        # everywhere, so under it the down projection writes routed rows and
+        # the separate combine sums them in a fixed k order instead.
+        if _ops.DETERMINISTIC:
+            rows_out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data,
+                                         layer.w2_suh.data, layer.w2_svh.data,
+                                         expert_ids, n_rows, [H], layer.exl3_cb,
+                                         block_m, out_dtype, sorted_ids, None,
+                                         M, T)
+            return ops.exl3_moe_combine(rows_out, sorted_ids, topk_weights, M,
+                                        expert_ids, block_m)
+
         out = ops.exl3_moe_gemm(a2, layer.w2_trellis.data, layer.w2_suh.data,
                                 layer.w2_svh.data, expert_ids, n_rows, [H],
                                 layer.exl3_cb, block_m, out_dtype,

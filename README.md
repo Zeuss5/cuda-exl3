@@ -204,9 +204,36 @@ stride the kernel cannot recover -- hence the shard-map approach.
 
 ## Determinism
 
-Split-k reduces with fp32 atomics, so results are reproducible in value but not
-bit-exact run to run. `CUDA_EXL3_DETERMINISTIC=1` disables it: bit-exact
-everywhere, slower for small batches and narrow layers.
+Two things reduce with fp32 atomics, so results are reproducible in value but
+not bit-exact run to run: split-k on the dense path, and the MoE down
+projection's fused epilogue, which scales each routed row by its routing weight
+and accumulates it into the token's row. `CUDA_EXL3_DETERMINISTIC=1` disables
+both -- the down projection writes routed rows and `exl3_moe_combine` sums each
+token's top-k in a fixed order -- for bit-exact output, slower for small batches
+and narrow layers.
+
+Note this is the plugin's contribution only. A MoE model on multiple GPUs is
+still not bit-exact run to run with this set, because the TP all-reduce is not
+either.
+
+The MoE half of the flag also buys accuracy, which was not the intent but is
+worth knowing. The fused epilogue accumulates through **bf16** atomics, so it
+rounds once per routed row; `exl3_moe_combine` sums in fp32 and rounds once per
+token. Relative error against an fp64 reference:
+
+| top_k | fused epilogue | `exl3_moe_combine` |
+|---|---|---|
+| 1 | 2.38e-3 | 1.66e-3 |
+| 4 | 3.53e-3 | 1.66e-3 |
+| **8** (GLM-5.3-Flash) | **4.34e-3** | **1.67e-3** |
+| 16 | 5.51e-3 | 1.66e-3 |
+
+The combine is flat because 1.7e-3 is just the bf16 rounding of the stored
+result; the fused path grows as the partial sums round. Accumulating the fused
+path in fp32 would need the (tokens, n) fp32 buffer and the extra pass the
+fusion exists to remove, so this is a real trade rather than an oversight to
+fix -- and at the resolution we can measure it does not show, MMLU 86.32 +/- 0.75
+against 86.4 +/- 0.7 with the fused path live. Recorded so it is a decision.
 
 ## Environment variables
 
