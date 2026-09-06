@@ -384,3 +384,50 @@ Identical within noise everywhere. NCCL's default channel count is already right
 over a PCIe switch, so that knob is theirs alone and its mechanism is the
 multi-NIC mesh rather than anything generic. Both parts agree on `NCCL_PROTO`:
 auto beats every forced setting.
+
+### Correction: at production overlap there is no gap, and the item is smaller
+
+`#5` supplied the datum that places production between the two arms, from the
+DSA indexer's top-k on rank 0 over 7,168 query rows of a ~70K prefill:
+
+| statistic | median | p05 | p95 |
+|---|---|---|---|
+| selected keys per query row | 2,049 | 1,882 | 2,051 |
+| adjacent-row overlap, min-normalised | 0.926 | 0.79 | 1.00 |
+| adjacent-row Jaccard | 0.862 | — | — |
+
+**That is far less cache-friendly than the drifting arm above, not equally so.**
+0.926 means ~152 of 2,048 keys turn over per row, against the 2 the drifting arm
+used -- two orders of magnitude more -- so "production is near the drifting arm"
+did not follow from the overlap figure and had to be measured.
+
+Third arm, calibrated to that turnover, 1,792-row chunk (their steady chunk),
+sweeping context because the chunk's union is capped by it:
+
+    ctx    latent MB          arm        us  working set   vs L2
+    32768         38     drifting    2389.8          6 MiB   0.05x
+    32768         38   production    2410.8         36 MiB   0.28x
+    32768         38  independent    2393.0         36 MiB   0.28x
+    71680         83     drifting    2391.1          6 MiB   0.05x
+    71680         83   production    2426.2         77 MiB   0.60x
+    71680         83  independent    2434.7         79 MiB   0.62x
+    262144       302     drifting    2385.8          6 MiB   0.05x
+    262144       302   production    2422.8        187 MiB   1.46x
+    262144       302  independent    3474.0        288 MiB   2.25x
+
+**Production runs within 1.6% of the fully cache-resident arm even at 262K
+context, where its working set is 1.46x L2.** So the 1.21-1.26x gap measured
+earlier was a property of the independent arm, which is not a production
+selection pattern, and **the 21-26% I reported as the item's ceiling is not
+there**. At production overlap this kernel is compute-bound with the traffic
+essentially free, and the only lever is reducing its work.
+
+The mechanism is that footprint is the wrong quantity: what has to fit is the
+union over a key's *residence window*, not over the chunk. At 7.4% turnover a
+key survives ~13.5 rows, so the live set is about 4,096 keys:
+
+    4.5 MiB live -- 3.5% of a 128 MiB L2, 18.8% of a 24 MiB one
+
+which is why this transfers to the 48-SM part rather than being a large-L2
+artefact, and why the independent arm (no residence window at all, so its live
+set is its whole footprint) is the only one that ever touches HBM.

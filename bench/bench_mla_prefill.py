@@ -29,12 +29,19 @@ _ops._try_native()
 
 dev = "cuda"
 torch.manual_seed(0)
-D = int(sys.argv[1]) if len(sys.argv) > 1 else 576
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+D = int(_args[0]) if _args else 576
 DV = 512
 H = 16                      # 64 heads at TP=4
 TOPK = 2048                 # GLM index_topk
 CTX = 262144                # 288 MB of latent at D=576: not L2-resident anywhere
-DRIFT = 2                   # measured: a sequence's top-k moves ~1 row in 2048
+DRIFT = 2                   # a near-static selection: the cache-friendly bound
+# Measured by #5 from the DSA indexer's top-k on a ~70K prefill, 7168 query rows
+# pooled: 2049 selected keys per row (at the index_topk ceiling), adjacent-row
+# overlap 0.926 min-normalised, Jaccard 0.862. So ~152 of 2048 keys turn over
+# per row -- two orders of magnitude more than DRIFT above, which is what makes
+# the production arm worth running separately rather than inferring.
+PROD_TURNOVER = 0.074
 
 
 def ruler():
@@ -67,16 +74,31 @@ def timeit(f, reps=8):
     return a.elapsed_time(b) / reps * 1000          # us
 
 
-def selections(rows, kind):
+def selections(rows, kind, ctx=None):
+    ctx = ctx or CTX
     if kind == "independent":
-        return torch.randint(0, CTX, (rows, TOPK), device=dev, dtype=torch.int32)
+        return torch.randint(0, ctx, (rows, TOPK), device=dev, dtype=torch.int32)
+    if kind == "production":
+        # Row i keeps a random (1 - turnover) of row i-1 and redraws the rest
+        # from the context, which reproduces both the measured adjacent overlap
+        # and the way the union random-walks up to the context length.
+        sel = torch.empty((rows, TOPK), device=dev, dtype=torch.int32)
+        cur = torch.randperm(ctx, device=dev)[:TOPK].int()
+        sel[0] = cur
+        for i in range(1, rows):
+            m = torch.rand(TOPK, device=dev) < PROD_TURNOVER
+            cur = cur.clone()
+            cur[m] = torch.randint(0, ctx, (int(m.sum()),), device=dev,
+                                   dtype=torch.int32)
+            sel[i] = cur
+        return sel
     # Start from one selection and drift it: row i differs from row i-1 in
     # DRIFT positions, so the union over a chunk is topk + rows*DRIFT.
-    base = torch.randperm(CTX, device=dev)[:TOPK].int()
+    base = torch.randperm(ctx, device=dev)[:TOPK].int()
     sel = base.repeat(rows, 1)
     if DRIFT:
         pos = torch.randint(0, TOPK, (rows, DRIFT), device=dev)
-        new = torch.randint(0, CTX, (rows, DRIFT), device=dev, dtype=torch.int32)
+        new = torch.randint(0, ctx, (rows, DRIFT), device=dev, dtype=torch.int32)
         # cumulative: each row keeps every earlier row's replacements
         for r in range(1, rows):
             sel[r:, pos[r]] = new[r]
@@ -128,5 +150,41 @@ def main():
         print(f"{rows:>6d} {comp:>11.0f} {hbm:>9.0f} {act:>10.0f} {ratio:>13.2f}x")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--ctx" not in sys.argv:
     main()
+
+
+def ctx_sweep(gbs):
+    """Where production sits between the two arms, as a function of context.
+
+    The per-chunk working set is the union of the rows' selections, which for
+    the production turnover random-walks upward and is capped by the context
+    length. So whether the chunk is cache-resident is decided by the context,
+    not by the selection pattern -- and the two parts have very different L2.
+    """
+    l2 = torch.cuda.get_device_properties(0).L2_cache_size
+    rows = 1792                                    # #5's steady chunk
+    print()
+    print(f"# chunk of {rows} rows, turnover {PROD_TURNOVER:.3f}/row "
+          f"(adjacent overlap {1 - PROD_TURNOVER:.3f}), L2 = {l2 / 2**20:.0f} MiB")
+    print(f"{'ctx':>8s} {'latent MB':>10s} {'arm':>12s} {'us':>9s} "
+          f"{'working set':>12s} {'vs L2':>7s}")
+    for ctx in (32768, 71680, 262144):
+        kv = torch.randn(ctx, D, device=dev, dtype=torch.bfloat16) * 0.05
+        q = torch.randn(rows, H, D, device=dev, dtype=torch.bfloat16) * 0.05
+        sl = torch.full((rows,), TOPK, device=dev, dtype=torch.int32)
+        for kind in ("drifting", "production", "independent"):
+            sel = selections(rows, kind, ctx)
+            f = lambda: torch.ops.cuda_exl3_C.mla_decode(
+                q, kv, sel, sl, 1.0 / (D ** 0.5), DV, 64, 1, 1.0)
+            us = timeit(f)
+            ws = int(sel.unique().numel()) * D * 2
+            print(f"{ctx:>8d} {ctx * D * 2 / 1e6:>10.0f} {kind:>12s} {us:>9.1f} "
+                  f"{ws / 2**20:>10.0f} MiB {ws / l2:>6.2f}x")
+            del sel
+        del kv, q
+        torch.cuda.empty_cache()
+
+
+if __name__ == "__main__" and "--ctx" in sys.argv:
+    ctx_sweep(ruler())
