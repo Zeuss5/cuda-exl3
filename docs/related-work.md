@@ -284,3 +284,65 @@ What is not measured: where production actually sits between the two arms. The
 selected-key count `#5` says the trace does not carry is exactly the datum that
 would place it. Until then the honest statement is that the ceiling is bounded
 by 2749 us and the floor by 3175 us at 2048 rows, and the kernel is at 3992.
+
+## ReplaySSM: upstream vLLM, extended by tpurtell, and not our trade
+
+Worth naming precisely, because the recipe's "what differs from stock vLLM"
+reads as though ReplaySSM were new. It is not: stock vLLM already ships
+`model_executor/layers/mamba/ops/replayssm_config.py` and
+`selective_state_update_replayssm_output_only.py`, and `config/cache.py`
+describes the idea -- during decode, cache recent SSM inputs in a size-B ring
+buffer (default 16) and flush the checkpoint state to HBM only every B steps,
+instead of storing the full recurrent state every step.
+
+What upstream will not do is combine it with drafting. `validate_mamba_cached_kernel`
+in `config/vllm.py` rejects the combination outright:
+
+    raise ValueError("--use-replayssm does not support speculative decoding")
+
+alongside gates for Nemotron-H only, the Triton mamba backend only, and
+`mamba_cache_mode` in `none`/`align`.
+
+**tpurtell's `vllm-replayssm-spec.patch` is 4520 added lines that lift exactly
+that restriction and carry it past Mamba2 to KDA and GDN**, with four new Triton
+kernel files: `selective_state_update_replayssm_spec.py`,
+`fused_recurrent_replayssm.py`, `gdn_replayssm_spec_decode.py` and
+`kda_replayssm_spec_decode.py`. The KDA one is what makes it reach GLM-5.3.
+Unlike the B12x parts of that recipe this is real open code (Apache-2.0), and it
+is the only place in the patch set where there is an implementation to read
+rather than a configuration of something closed.
+
+The mechanism for drafting is compact rollback, stated in their own conv-window
+patch: *"Compact rollback stores one state slot, not one query token."* Baseline
+rollback keeps `num_spec + 1` state slots per request so a rejected draft can be
+undone; ReplaySSM keeps one and replays. With DFlash2 at k=7 that is 8 slots to
+1 across GLM-5.3-Flash's 34 KDA layers, and it is where their reported +6.6%
+capacity comes from. They also report 120/120 on a 32K/C4 rolling-batch stress,
+and that **baseline rollback stays their default because it is faster at C1**.
+
+### Why it is the wrong trade here
+
+Measured on this box, GLM-5.3-Flash tr3-4bpw, TP=4, `--max-model-len 16384`,
+`--gpu-memory-utilization 0.90`:
+
+    Available KV cache memory: 41.35 GiB (per rank)
+    GPU KV cache size: 3,844,778 tokens
+    Maximum concurrency for 16,384 tokens per request: 234.67x
+
+Against `--max-num-seqs 8`. **We have 29x more capacity than we are configured
+to use**, so a 6.6% capacity gain buys nothing at all, and it is bought with C1
+latency -- the number this path is judged on. The trade is upside-down here and
+no port is warranted.
+
+One detail from the same boot is worth keeping, because it is the reason the
+mamba state matters to page geometry at all:
+
+    Setting attention block size to 1664 tokens to ensure that attention page
+    size is >= mamba page size.
+    Padding mamba page size by 0.57% to ensure that mamba page size and
+    attention page size are exactly equal.
+
+The KDA state is large enough to drive the attention block size, so anything
+that shrinks it 8x moves the whole page layout. That is what makes it worth
+revisiting where memory actually binds -- a 121.6 GiB unified Spark, or long
+context, where `#5`'s own TP=3 arm had 0.73 GiB left for KV. It is not this box.
