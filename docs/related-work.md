@@ -431,3 +431,59 @@ key survives ~13.5 rows, so the live set is about 4,096 keys:
 which is why this transfers to the 48-SM part rather than being a large-L2
 artefact, and why the independent arm (no residence window at all, so its live
 set is its whole footprint) is the only one that ever touches HBM.
+
+## The head-group tax: TP=3 pays for 32 heads to use 22
+
+`#5` ran the falsification above on 48 SMs and it held -- production closes
+96.0-98.4% of the independent-to-drifting distance in all six cells, so item 6
+is closed at zero on both parts. The same run turned up something better: **22
+heads cost 13-16% more per head than 16 in the compute-only arm, and the sign
+flips in the bandwidth-bound arm**, so the penalty is in the compute path --
+exactly the region left as the only lever.
+
+Reproduced here, and it is larger on this card. The mechanism is in the
+launcher:
+
+    const int hpb = std::min(H, (wide >= 3 && H >= 16) ? 8 : 16);
+    const int hgroups = (H + hpb - 1) / hpb;
+
+Every head group independently gathers the same `topk` rows. 64 heads split
+three ways is 22 per rank, which needs two groups where TP=4's 16 needs one.
+
+Production-overlap selection, 1792 rows, 262K context, best chunk per cell:
+
+    H  wide  hpb  hgroups   best us   us/head
+    16     1   16        1    1287.9      80.5
+    16     3    8        2    2228.0     139.2
+    22     1   16        2    2330.7     105.9
+    32     1   16        2    2465.2      77.0
+
+**H=22 costs 1.810x H=16 for 1.375x the heads, and 95% of what H=32 costs for
+69% of the heads.** Time tracks head *groups*, not heads.
+
+The controlled pair is the middle two rows -- the same 16 heads at one group and
+at two:
+
+    one head group over 16 heads       1287.9 us
+    two head groups over the same 16   2228.0 us
+      -> duplicated per group            940.1 us   (73% of a group)
+      -> head-proportional               347.8 us
+
+So **73% of a head group's cost is work the other groups repeat**, and only 27%
+scales with heads. That model predicts the measured times within 1-4%:
+
+    H    groups  measured   model   gather staged once
+    16        1    1287.9  1287.9   1287.9   (1.00x)
+    22        2    2330.7  2358.4   1418.3   (1.64x)
+    32        2    2465.2  2575.8   1635.7   (1.51x)
+
+**Staging the gathered rows once per block and looping the head groups over them
+is worth 1.64x at TP=3 and 1.51x at TP=2, and nothing at TP=4** -- which is why
+it has been invisible here and why `#5` found it and we did not. It is the one
+lever left in this kernel, it is on the compute side as they said, and it is
+worth most on the part that has three ranks.
+
+Cost to build: the accumulators are per head group (`FragC acc[MTPW][NT]`), so
+looping groups inside a block either doubles that register footprint or spills
+to the shared tile. That is the real work, and the prize above is the budget for
+it.
