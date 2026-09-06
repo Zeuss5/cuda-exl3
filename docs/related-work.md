@@ -179,3 +179,55 @@ take M=256 from 40.1 to 17.8 us, and this kernel is 4% of a prefill chunk, so th
 ceiling on any further work here is about 2% of prefill and it is not reachable.
 Recorded so the next person does not rediscover the 57% figure and assume it is
 traffic to be removed.
+
+## The all-reduce, and why a custom one does not pay here
+
+`#5` ranks NCCL all-reduce first among prefill targets on GB10: 16.5% of the
+chunk at 13.9 GB/s of bus bandwidth against 50 GB/s of physical pair capacity.
+tpurtell's recipe ships a matching answer -- a B12x PCIe one-shot all-reduce
+behind `VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE`, default **384 KB**, used only
+inside a captured graph and falling through to PyNCCL above the cutoff. The
+kernels are closed, but the shape of the adapter is itself the finding: a small
+cutoff and a graph-only gate is what you build when the win is latency on small
+messages, not bandwidth on large ones.
+
+Measured here on 4x RTX PRO 6000 (`bench/bench_allreduce.py`), where
+`nvidia-smi topo -p2p r` reports NS for every pair, so vLLM's own
+`CustomAllreduce` is off and every collective is host-staged:
+
+    bytes        eager us   graph us   algBW    busBW
+    8192  (M=1)      13.2       13.6    0.6G     0.9G
+    65536 (M=8)      20.6       20.8    3.2G     4.7G
+    524288           61.1       61.3    8.6G    12.9G
+    67108864       3171.3     3170.2   21.2G    31.8G
+
+Neither `NCCL_ALGO` nor `NCCL_PROTO` improves on the default at any of these
+sizes -- the auto-selected protocol is already the best of Ring/Tree x LL/LL128,
+and forcing LL costs 1.9x at 512 KB.
+
+Then the two rulers that decide whether a replacement could do better:
+
+* PCIe copy engine, one GPU: **56.5 GB/s** each way.
+* Kernel-driven load/store to mapped host memory (`uint4`, best of 16-1024
+  blocks): 15.5 GB/s at 64 KB, 31.5 at 256 KB, 46.2 at 1 MB, 51.8 at 16 MB --
+  a fixed floor of about **3.5 us** per touch.
+* **GPU-to-GPU flag visibility through pinned host memory: 6.74 us one way,
+  13.49 us round trip** (single-thread spin on a `volatile` word, 2000 trips).
+
+That last number closes the item. A one-shot all-reduce at the decode shape
+(M=8, 64 KB) has to write its slot, make the write visible to three peers, and
+read theirs: 3.6 us + 6.74 us + 8.3 us is already **~15 us against NCCL's 20.8**,
+and that is the floor of an implementation that does not exist yet. At 8 KB
+NCCL's entire call is 13.6 us -- roughly twice the one-way visibility latency of
+the fabric, which is what any algorithm requiring every rank to see every other
+rank's contribution must pay.
+
+So on a no-P2P PCIe box the all-reduce is *latency*-bound at decode sizes and at
+the wire for large ones (31.8 GB/s of bus over a 56.5 GB/s link, with every byte
+crossing PCIe twice). NCCL is within about 1.4x of the floor at the size that
+matters and there is no 2-3x sitting there. The lever is fewer or larger
+all-reduces, or overlapping them with compute -- not a faster collective kernel.
+
+Credit: the cutoff-and-graph-gate design that prompted this measurement is
+tpurtell's, in `patches/b12x_pcie_all_reduce.py` of
+`tpurtell/glm-5.3-flash-ext3-2x-rtx` (Apache-2.0).
