@@ -920,6 +920,34 @@ Quantising the dense path is worth about 18 ms of every decode step there. It is
 also *smaller*: the full-scope checkpoint loads 21% faster and leaves 3.4 GiB
 more per rank, because 4-bit attention and a 6-bit head are less than bf16 ones.
 
+## Tensor-parallel degree on this card
+
+Measured, GLM-5.3-Flash 4bpw, same image and sweep, output tok/s:
+
+| conc | TP=2 | TP=4 |
+|---|---|---|
+| 1 | 77.19 | **103.09** |
+| 4 | 203.79 | **275.21** |
+| 8 | 286.03 | **417.44** |
+| 16 | 286.95 (KV-bound) | **552.77** |
+
+More ranks win at every concurrency, but not proportionally: doubling the cards
+buys 34% at concurrency 1, which is 67% of perfect scaling. The rest goes to the
+collectives, which are fully exposed on this hardware -- these cards have no
+peer-to-peer, so every all-reduce crosses host memory (see *Pin the ranks to the
+GPUs' socket*).
+
+**At 4bpw, TP=2 barely runs at all.** Weights are 80.72 GiB per rank against a
+budget of 80.5 GiB at `gpu-memory-utilization 0.90`, so it fails outright with
+"no available memory for the cache blocks"; the row above needed 0.97 and a 16k
+context, and still had a 382k-token KV pool against TP=4's 5.07M.
+
+That is worth knowing when reading two-GPU results for this model elsewhere: a
+lower bitrate is not an independent choice from the topology, it is what makes
+the topology possible. A ~3.25bpw checkpoint is ~65.6 GiB per rank and leaves
+~19 GiB for KV, which is the difference between a configuration that serves and
+one that will not start.
+
 ## Two things chased and settled
 
 **The sparse-indexer logits reservation does not bind at ordinary context.**
