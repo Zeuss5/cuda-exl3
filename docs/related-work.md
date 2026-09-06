@@ -487,3 +487,36 @@ Cost to build: the accumulators are per head group (`FragC acc[MTPW][NT]`), so
 looping groups inside a block either doubles that register footprint or spills
 to the shared tile. That is the real work, and the prize above is the budget for
 it.
+
+### Cross-part scale: the prize is 1.25x there, 1.62x here, and nobody serves it here
+
+`#5` verified the H=22 shape numerically (24/24 cells, worst max relative error
+5.2e-3 against a 5e-2 tolerance, minimum per-(row, head) cosine 0.999995), so
+the timings above rest on verified output. They then corrected the size of the
+prize, which matters more than the sign.
+
+Their drifting-arm ratio is 1.557-1.589x for 1.375x the heads against 1.810x
+here. Fitting the same two-group model to each -- normalise so H=16 at one
+group is 1, then `H=22 = 2*dup + (1-dup)*1.375`:
+
+    part                  SMs   H22/H16   duplicated   fused ceiling
+    RTX PRO 6000          188     1.810          70%           1.62x
+    GB10                   48     1.573          32%           1.25x
+
+**Only 32% of a head group is duplicated work on 48 SMs against 70% here.** The
+plausible reason is occupancy: with a quarter of the SMs the head groups
+serialise rather than run concurrently, so the repeated gather overlaps with
+compute that is already in flight instead of competing with it. Whatever the
+mechanism, it halves the prize on the part that would actually collect it.
+
+So the honest budget is **~1.25x on MLA at TP=3, about -1.7% of prefill wall
+there**, and the register constraint above caps it further if the fused variant
+has to run at NWARPS=16. The 1.62x this card would show is worth nothing,
+because TP=4 gives 16 heads and one group and never pays the tax at all.
+
+That is the state in which this item is being left: mechanism established and
+verified on both parts, prize sized on both parts, and the build not attempted.
+Anyone picking it up should get `-Xptxas -v` on a fused variant first, because
+whether 64 accumulator floats fit at NWARPS=8 decides which end of the range is
+reachable -- and should measure on 48 SMs, since that is where the gain is
+smaller and where it is the only part that benefits.
