@@ -231,3 +231,56 @@ all-reduces, or overlapping them with compute -- not a faster collective kernel.
 Credit: the cutoff-and-graph-gate design that prompted this measurement is
 tpurtell's, in `patches/b12x_pcie_all_reduce.py` of
 `tpurtell/glm-5.3-flash-ext3-2x-rtx` (Apache-2.0).
+
+## MLA at prefill: the ceiling is the kernel's own work, not the gather
+
+`#5` ranks MLA prefill sixth at 8.2% of a chunk and marks it **not measured** --
+"the trace does not carry the selected-key count". That is the whole difficulty:
+the kernel gathers `topk` latent rows per query row, and whether the traffic is
+`rows x topk` or the much smaller union of those selections depends on how much
+consecutive rows overlap.
+
+`bench/bench_mla_prefill.py` settles it the way arm C settled the MoE question --
+same shape twice, the only difference being overlap. `head_dim 576`, 16 heads
+(64 at TP=4), `topk 2048`, 262 144 rows of latent (302 MB, not L2-resident on
+either part), ruler in the same binary at **1522 GB/s**:
+
+    rows    selection        us  per-row GB/s  %ruler
+     256  independent     498.5          1212     80%
+     256     drifting     316.9          1906    125%
+    2048  independent    3991.6          1211     80%
+    2048     drifting    2748.9          1758    116%
+
+The drifting arm reads **125% of the ruler** on the per-row model, which is only
+possible if rows are being served from cache -- so the kernel does exploit
+overlap, and it is 1.45x faster when the overlap is there.
+
+The useful part is the decomposition. The drifting arm touches a few MB, so it
+is entirely resident and its time is the kernel's compute-and-issue floor with
+the traffic taken away; the independent arm has to move `rows x topk x D`:
+
+    rows  compute us    hbm us  actual us  vs the larger
+     256         317       397        498          1.26x
+     512         657       794        970          1.22x
+    1024        1302      1588       1920          1.21x
+    2048        2749      3175       3992          1.26x
+
+Two things follow, and the second matters more.
+
+**The kernel runs at 1.21-1.26x the larger of its two floors**, consistently
+across a 8x range of rows. That is imperfect overlap of traffic against work,
+and closing it is worth 21-26% of MLA prefill, i.e. about 1.7-2% of a prefill
+chunk on `#5`'s breakdown.
+
+**The compute floor is 87% of the traffic floor** (2749 vs 3175 us). So at
+prefill this kernel is not gather-bound the way it is at decode -- the two are
+nearly balanced, and a production selection pattern that overlaps heavily pushes
+it over into being bound by its own work. DSA top-k moves about one row in 2048
+per step, so production is nearer the drifting arm than the independent one,
+which would make MLA prefill **compute-bound**. That is the opposite of the
+assumption a traffic-only reading of the trace would produce.
+
+What is not measured: where production actually sits between the two arms. The
+selected-key count `#5` says the trace does not carry is exactly the datum that
+would place it. Until then the honest statement is that the ceiling is bounded
+by 2749 us and the floor by 3175 us at 2048 rows, and the kernel is at 3992.
