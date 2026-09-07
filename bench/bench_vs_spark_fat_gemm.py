@@ -6,7 +6,9 @@ sm_120 say nothing about each other.
 
 Their kernel is not vendored here. Point --fat-src at a checkout of
 https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark (Apache-2.0; the
-kernel itself descends from the MIT-licensed MiaAI-Lab kit) and --exl3-src at
+kernel itself descends from the MiaAI-Lab kit, which relicensed from MIT to
+AGPL-3.0 on 2026-09-07 -- copies taken before that date stay MIT, and this bench
+vendors none of it either way) and --exl3-src at
 https://github.com/turboderp-org/exllamav3, whose headers it includes.
 
 It only accepts K4 MCG trellis tensors, so the weights must be a 4-bit mcg

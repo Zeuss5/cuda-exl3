@@ -589,3 +589,41 @@ the double-precision `exp` and IEEE-rounded `__fdiv_rn` are immune to it, so the
 result is identical whether the file is compiled inside `exllamav3_ext` or
 standalone. That is a good habit for any kernel that has to match a reference
 across build flags, and it is cheap.
+
+### Provenance of the fat kernels, checked
+
+Because these three projects share lineage and copy between each other, it is
+worth having the provenance on record rather than assumed. Normalised
+comparison (comments stripped, whitespace collapsed, lines of >= 40 characters
+counted as substantive):
+
+    Mia fat_gemm   vs  vcruz305 fat_gemm    88 of 88 shared   -- a full copy
+    Mia fat_moe    vs  vcruz305 p2b_moe      0 of 177
+    Mia fat_moe    vs  this plugin's csrc    0 of 177
+    Mia fat_moe    vs  exllamav3_ext         3 of 263  -- OptionalCUDAGuard,
+                                                          getCurrentCUDAStream
+    Mia kernels    vs  this plugin's csrc   16 shared lines total, all of them
+                                            __syncthreads(), #pragma unroll,
+                                            lane arithmetic and includes
+
+The one full copy is `vcruz305`'s, and it is declared in their README in the
+strongest form available -- *"copied from Mia's AI Lab, with only include paths
+changed"*, plus `Copyright (c) 2026 Mia's AI Lab.` So that is attribution done
+properly, and the direction is from Mia outward.
+
+**`exl3_fat_moe.cu` is original work.** It is not derived from `p2b_moe`, not
+from this plugin, and not from exllamav3 beyond including its headers -- which
+is what "compiled into `exllamav3_ext`" means and is credited in their README
+under *EXL3 format / kernels: turboderp*. Their credits also cover the weights,
+base model, drafter, KLD panel and abliteration artifacts.
+
+Nothing here is copied from them either, which the same comparison shows in both
+directions.
+
+One licensing change that matters practically rather than ethically: the kit
+**relicensed from MIT to AGPL-3.0 on 2026-09-07**, retaining `LICENSE.MIT` for
+prior contributions. `vcruz305`'s existing copy was taken under MIT and is
+unaffected, but anything pulled from the kit *after* that date is AGPL, which
+for a plugin served over a network is a real obligation rather than a formality.
+`bench/bench_vs_spark_fat_gemm.py` points at a checkout and vendors nothing, so
+this plugin is unaffected either way.
