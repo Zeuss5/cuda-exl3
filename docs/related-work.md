@@ -520,3 +520,72 @@ Anyone picking it up should get `-Xptxas -v` on a fused variant first, because
 whether 64 accumulator floats fit at NWARPS=8 decides which end of the range is
 reachable -- and should measure on 48 SMs, since that is where the gain is
 smaller and where it is the only part that benefits.
+
+## MiaAI-Lab's fat MoE: one fusion we do not have, sized at 5-9% of the stage
+
+The kit gained `overlay/exl3_fat_moe.cu` (656 lines) beside the `exl3_fat_gemm`
+that `bench/bench_vs_spark_fat_gemm.py` already measures. Its contract is stated
+in the header, and lines up against ours almost exactly:
+
+    theirs                                          ours
+    exl3_fat_moe_gather   had128(x * suh)           exl3_moe_had_in
+    exl3_fat_moe_gateup   had, svh, clamp, SwiGLU,  exl3_moe_gemm(w13)
+                          down_suh, had  -> h2      + exl3_moe_glu_had_in
+    exl3_fat_moe_down     had(h2 @ W) * svh * w     exl3_moe_gemm(w2), fused combine
+
+The gather and the down projection are the same design on both sides -- their
+down kernel scatter-adds by route weight exactly as our fused combine does
+(5814c7f), which is the third time these two projects have converged
+independently.
+
+**The difference is the middle row.** Their gate/up epilogue does everything
+between the two GEMMs in one pass -- output Hadamard, `svh`, clamp, SwiGLU,
+`down_suh`, and the down projection's *input* Hadamard -- and writes `h2`
+directly, so the `(rows, 2I)` intermediate never exists. We materialise it and
+read it straight back in `exl3_moe_glu_had_in`.
+
+Two things make it work, and we have both already:
+
+* `FM_TILE_N = 128` is exactly one Hadamard block, so both transforms are
+  CTA-local. Our `BN_` is 128 with the comment *"must equal HAD_N: a block owns
+  whole Hadamard blocks"*.
+* The CTA owns the whole K range for its tile, so the epilogue sees complete
+  gate and up values. Our unsplit path does too, and at prefill `pick_split`
+  never splits because the grid already fills the machine.
+
+### What it is worth here
+
+`bench/bench_moe_intermediate.py`, 96 local experts, H=4096, I=2048, block_m 64,
+ruler 1524 GB/s in the same binary:
+
+    M      rows   gemm us   glu us    total  saved us  saving
+    512    4096     515.5     17.6    533.0      28.6     5.4%
+    2048  16384    2036.2    144.0   2180.2     188.1     8.6%
+
+Fusing removes four units of `rows x I x 2` bytes: the gate/up GEMM writes `I`
+columns instead of `2I`, and the whole glu kernel's read of `2I` and write of
+`I` disappear. On `#5`'s breakdown that stage is about 21% of a prefill chunk,
+so **8.6% of it is roughly 1.8% of prefill** -- the same order as the head-group
+tax, and unlike that one it pays on both parts rather than only at TP=3.
+
+Worth being precise about why: `exl3_moe_glu_had_in` moves 201 MB in 144 us,
+which is **92% of the measured ruler**. It is not a slow kernel. The fusion does
+not speed it up, it deletes it.
+
+### The cost, which is higher than the combine fusion was
+
+Our `w13` GEMM shards gate and up as `[I, I]` and a block owns 128 columns of
+*one* shard. SwiGLU needs `gate[i]` and `up[i]` together, so fusing means a
+block must run two B streams over the same column range, as theirs does
+(`NS = 2`). That halves the block count and doubles the accumulator, which is
+the same register question the MLA head-group fusion runs into. It is not an
+epilogue addition on top of the existing kernel.
+
+### Worth stealing regardless: their numerical-parity discipline
+
+Their SwiGLU computes `sigmoid` as `__fdiv_rn(1, 1 + (float) exp(-(double) g))`
+with a comment explaining that exllamav3 builds with `--use_fast_math`, and that
+the double-precision `exp` and IEEE-rounded `__fdiv_rn` are immune to it, so the
+result is identical whether the file is compiled inside `exllamav3_ext` or
+standalone. That is a good habit for any kernel that has to match a reference
+across build flags, and it is cheap.
