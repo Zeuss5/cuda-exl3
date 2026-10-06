@@ -1208,7 +1208,18 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     int split = 1;
     float* acc = nullptr;
     int64_t acc_elems = (int64_t) rows * n_total;
-    if (acc_elems <= moe_acc_cap)
+    // Never split a fused combine. The split kernel is
+    // launched without the routing weights and sorted ids, and its epilogue
+    // writes one output row per ROUTED row -- but a fused combine's `out` has
+    // one row per TOKEN. So the weights are never applied, the token rows get
+    // the wrong routed rows, and every routed row past num_tokens is written
+    // beyond the end of `out`. Measured on the 5090 at M=1, H=2048, 4 experts:
+    // relative error 0.96 against the per-row reference with split-k on, 3.5e-3
+    // with it off. Reachable only while the down projection's grid is smaller
+    // than the SM count -- (H/128) x expert blocks; GLM-5.3-Flash at H=4096 and
+    // top_k=8 never gets there on GB10 (256 >= 48 SMs) or the 5090 (>= 170) --
+    // which is why it does not show up when serving GLM-5.3-Flash.
+    if (acc_elems <= moe_acc_cap && !fuse_combine)
         split = pick_split(rows, k, n_total, bits, (int) block_m, true,
                            (int) expert_ids.size(0));
     if (split > 1)
