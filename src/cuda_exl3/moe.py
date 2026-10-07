@@ -55,11 +55,23 @@ def _exl3_moe_weight_loader(
     method = getattr(param, "_exl3_method", None)
     layer = getattr(param, "_exl3_layer", None)
     if method is None or layer is None:
+        # Not one of ours: create_weights installs this loader only on the
+        # parameters it registers. A plain tensor that reaches it anyway -- no
+        # MoE kwargs -- is loaded the way vLLM would have loaded it rather than
+        # dropped; quietly declining such a tensor is how the router's
+        # e_score_correction_bias went unloaded.
+        if shard_id is None and expert_id is None:
+            from vllm.model_executor.model_loader.weight_utils import (
+                default_weight_loader,
+            )
+
+            default_weight_loader(param, loaded_weight)
+            return True if return_success else None
         return False if return_success else None
 
-    # Models route non-expert tensors through the same weight_loader with no MoE
-    # kwargs at all. Nothing of ours belongs to that path, so decline quietly
-    # rather than raising a TypeError from a missing argument.
+    # Ours are per expert and per projection, so one that arrives without MoE
+    # kwargs cannot be placed: decline it rather than raise a TypeError from a
+    # missing argument.
     if shard_id is None or expert_id is None:
         return False if return_success else None
 
@@ -126,6 +138,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         H = hidden_size
         I = intermediate_size_per_partition
         dev = torch.cuda.current_device()
+        own: list[str] = []             # the parameters this method registers
 
         for name, dims in [
             ("w13_trellis", (E, H // TILE, 2 * I // TILE, TILE * self.w13_bits)),
@@ -136,6 +149,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter(name, p)
             set_weight_attrs(p, {**extra_weight_attrs})
+            own.append(name)
 
         for name, dims in [
             ("w13_suh", (E, 2, H)),      # gate and up have separate input scales
@@ -148,6 +162,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter(name, p)
             set_weight_attrs(p, {**extra_weight_attrs})
+            own.append(name)
 
         # The codebook multiplier is a compile-time constant of the codebook id,
         # but it is still a tensor in the checkpoint, so it needs somewhere to go.
@@ -159,8 +174,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
                 layer.register_parameter(name, p)
                 set_weight_attrs(p, {**extra_weight_attrs})
+                own.append(name)
 
-        for pname, p in list(layer.named_parameters(recurse=False)):
+        # Only our own parameters. The layer already carries others when this
+        # runs: RoutedExperts.__init__ assigns the router's
+        # e_score_correction_bias (DeepSeek-V3-style noaux_tc routing) to
+        # itself, which registers it here -- the same Parameter object as the
+        # model's gate.e_score_correction_bias. Given our loader, the bias was
+        # declined (it arrives without MoE kwargs) and never loaded, so routing
+        # ran without it; silently, as vLLM does not report unloaded parameters
+        # for quantized models. Foreign parameters keep the model's loader.
+        for pname in own:
+            p = getattr(layer, pname)
             p._exl3_name = pname
             p._exl3_method = self
             p._exl3_layer = layer
@@ -281,7 +306,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return 0
         return int(r)
 
+    def _warn_if_router_bias_unloaded(self, layer):
+        """Warn if the router's bias still reads all zeros after loading.
+
+        Not our parameter, but it lives on this layer and nothing else checks
+        it: vLLM does not report unloaded parameters for quantized models, and
+        an unloaded bias fails silently -- the layer runs, it just routes to
+        other experts. A checkpoint may genuinely store zeros, so this only
+        warns.
+        """
+        bias = getattr(layer, "e_score_correction_bias", None)
+        if not isinstance(bias, torch.Tensor) or bias.numel() == 0:
+            return
+        try:
+            unloaded = not bool(bias.detach().any())
+        except Exception:  # pragma: no cover - e.g. a meta tensor
+            return
+        if unloaded:
+            logger.warning(
+                "EXL3 %s: the router's e_score_correction_bias is all zeros after "
+                "loading. Unless the checkpoint stores zeros, it was not loaded "
+                "and experts are being selected without it.", self.prefix)
+
     def process_weights_after_loading(self, layer):
+        self._warn_if_router_bias_unloaded(layer)
+
         # The expert gemm splits k when its grid is too small to fill the GPU,
         # which needs an fp32 accumulator sized from the routed row count -- and
         # that is not known until the forward runs. The workspace refuses to grow
